@@ -41,6 +41,10 @@ class IncorrectParameter(RuntimeError):
 class TempTableAlreadyExists(RuntimeError):
     pass
 
+# Maximum rows to check when deteting column type until non null value is found
+MAX_TYPE_DETECTION_ROWS = 10000 
+
+
 
 class dbmerge:
     def __init__(self,
@@ -127,7 +131,7 @@ class dbmerge:
             self.schema = schema
             self.temp_schema = temp_schema
             self.source_schema = source_schema
-
+            self.source_table = None
 
             if dialect_name in ['sqlite']:
                 if schema is not None:
@@ -151,6 +155,9 @@ class dbmerge:
             self.insert_time = 0
             self.update_time = 0
             self.delete_time = 0
+            self.insert_sql = ''
+            self.update_sql = ''
+            self.delete_sql = ''
 
             self.source_table_name = source_table_name
             
@@ -196,7 +203,7 @@ class dbmerge:
                     raise IncorrectParameter(f"missing_mode='mark', but missing_mark_field is not set.")
                 
 
-            self.max_type_detection_rows = 10000
+            self.max_type_detection_rows = MAX_TYPE_DETECTION_ROWS
 
             self.unique_id=str(uuid.uuid4().hex[:8])
 
@@ -275,7 +282,7 @@ class dbmerge:
         3) Update rows, which exist in target table and which have different values (fields are compared).
         4) Delete or mark as deleted (update deletion mark) for the fields, which dont exist in source data
 
-        If your data comes in portions then you can set a missing_condition argument to define you portion of data.
+        If your data comes in portions then you can set a missing_condition argument to define your portion of data.
         E.g. if you load monthly data you can call the method like this:
             with dbmerge(data=data, engine=engine, table_name="YourTable",missing_mode='delete') as merge:
                 merge.exec(missing_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
@@ -283,7 +290,7 @@ class dbmerge:
         Args:
             missing_condition (ColumnElement, optional): 
                 If missing mode is 'delete' or 'mark', then you can set a condition to filter the target table. 
-                It should be an SQL alschemy binary exporession, which will be used in the where condtition of delete or mark deleted.
+                It should be an SQL alchemy binary exporession, which will be used in the where condition of delete or mark deleted.
             source_condition (ColumnElement, optional): If the data is loaded from source table or view, 
                 then you can set this parameter to use in the where() statement when selecting the data 
                 and inserting to temp table. 
@@ -568,6 +575,8 @@ class dbmerge:
 
         insert_stmt = insert(self.table).from_select(target_fields, select_stmt) #.returning(*pk_cols)
 
+        self.insert_sql = str(insert_stmt)
+
         result = self.conn.execute(insert_stmt)
         self.inserted_row_count = result.rowcount #if use returning, then rowcount will not work.
 
@@ -589,7 +598,7 @@ class dbmerge:
             delete_stmt = delete(self.table).where(and_(self.missing_condition,
                                                         not_(exists().where(delete_where_clause))))
                 
-
+        self.delete_sql = str(delete_stmt)
 
         result = self.conn.execute(delete_stmt)
         self.deleted_row_count = result.rowcount
@@ -621,6 +630,7 @@ class dbmerge:
                                 where(and_(self.missing_condition,
                                            not_(exists().where(update_where_clause)) ))
         
+        self.delete_sql = str(update_stmt)
         
         result = self.conn.execute(update_stmt)
         self.deleted_row_count = result.rowcount
@@ -678,8 +688,11 @@ class dbmerge:
             update_join_conditions.append(self.table.c[c]==select_stmt.c[c])
         update_where_clause = and_(*update_join_conditions)
 
+
         update_stmt = update(self.table).values(update_values).where(update_where_clause)
 
+        self.update_sql = str(update_stmt)
+        
         result = self.conn.execute(update_stmt)
 
         self.updated_row_count = result.rowcount

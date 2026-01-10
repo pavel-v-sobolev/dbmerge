@@ -6,6 +6,9 @@ build-backend = "hatchling.build"
 name = "dbmerge"
 version = "1.0.0a"
 description = "DBMerge is a python library for automatic merge of table data to an SQL database with insert/update/delete(or mark)."
+authors = [
+  { name="Pavel Sobolev", email="pavel-v-sobolev@yandex.ru" },
+]
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +16,25 @@ dependencies = [
     "sqlalchemy>=2.0.23",
     "alembic>=1.13.0",
 ]
+
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/pavel-v-sobolev/dbmerge"
+Issues = "https://github.com/pavel-v-sobolev/dbmerge/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -23,4 +45,5 @@ dev = [
     "mariadb>=1.1.5",
     "pytest>=7.1.1",
     "twine",
+    "build"
 ]
