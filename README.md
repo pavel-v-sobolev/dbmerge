@@ -43,7 +43,8 @@ data=[# some data for 2025-01
       {'Shop':'124','Product':'123','Date':date(2025,2,1),'Qty':1,'Price':110.50},
       {'Shop':'125','Product':'124','Date':date(2025,2,1),'Qty':1,'Price':90.20}]
 
-# key and data_types are only required if your table does not exist in the database.
+# key is required if your table does not exist in the database.
+# data_types will be needed for creating table in mariadb, because it requires setting string length.
 key = ['Shop','Product','Date']
 data_types = {'Shop':String(100),'Product':String(100)}
 
@@ -53,8 +54,9 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
     merge.exec()
 
 # OUTPUT:
-# INFO - Merged data into table "Facts". Temp data: 3 rows (4ms), 
-# Inserted: 0 rows (8ms), Updated: 0 rows (9ms), Deleted: no, Total time: 21ms
+# INFO - Merged data into table "Facts". Temp data: 6 rows (3ms), 
+# Inserted: 6 rows (5ms), Updated: 0 rows (6ms), Deleted: no, Total time: 13ms
+
 
 # Now lets assume you want to update data in 2025-02, including deletion.
 data=[{'Shop':'123','Product':'123','Date':date(2025,2,1),'Qty':2,'Price':52.10},
@@ -76,7 +78,10 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 ```
 
 # Documentation
-[Module documentation](DOCUMENTATION.md)
+[Module Documentation](DOCUMENTATION.md)
+
+# More examples
+[User Guide Python File](user_guide.py)
 
 
 # Database specific details:

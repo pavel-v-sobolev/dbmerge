@@ -692,7 +692,7 @@ class dbmerge:
         update_stmt = update(self.table).values(update_values).where(update_where_clause)
 
         self.update_sql = str(update_stmt)
-        
+
         result = self.conn.execute(update_stmt)
 
         self.updated_row_count = result.rowcount
@@ -796,7 +796,7 @@ class dbmerge:
             self.temp_table = None
 
 
-def drop_table_if_exists(table_name,engine,schema=None):
+def drop_table_if_exists(engine,table_name,schema=None):
 
     """
     Additional routine to drop table in DB if it exists. Use carefully.

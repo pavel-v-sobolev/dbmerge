@@ -18,8 +18,7 @@ logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
 
 engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
            'postgres':create_engine("""postgresql+psycopg2://postgres:@localhost:5432/dbmerge"""),
-           'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306""", 
-                                   pool_pre_ping=True)
+           'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306""")
           }
 
 
