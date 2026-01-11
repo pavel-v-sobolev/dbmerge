@@ -1,4 +1,4 @@
-# DBMerge python module documentation
+# DBMerge Python Module Documentation
 
 # dbmerge class 
 ## init method
@@ -11,7 +11,7 @@ Preferable way to do this is to use context:\
 E.g.:
 
 ```python
-with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
+with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
     merge.exec()
 
 ```

@@ -15,7 +15,7 @@ It was tested with PostgreSQL, MariaDB and SQLite.
 - Update rows, which exist in target table, but have different values. It is skipping update of rows which dont change the values.
 - It has various options for deletion of rows, which were not found in the source table, but exist in the target table. (Either keep, delete or mark with special boolean flag field).
 - It can handle data filtering in deletion part. E.g. handle subsets or period in the source data to check and delete/mark only inside this scope.
-- It handles creation missing table or table columns with detection of data types.
+- It handles creation of table or table columns, if they dont exist in the database.
 - It can use different data inputs: pandas DataFrame, list of dict or other database table or view.
 - It can put merged_on timestamp and inserted_on timestamp to indicate when your data was modified or first inserted.
 
@@ -43,12 +43,13 @@ data=[# some data for 2025-01
       {'Shop':'124','Product':'123','Date':date(2025,2,1),'Qty':1,'Price':110.50},
       {'Shop':'125','Product':'124','Date':date(2025,2,1),'Qty':1,'Price':90.20}]
 
-# key is required if your table does not exist in the database.
+# key is required if your table does not exist in the database. Otherwise module will read this info from the database.
 # data_types will be needed for creating table in mariadb, because it requires setting string length.
 key = ['Shop','Product','Date']
 data_types = {'Shop':String(100),'Product':String(100)}
 
-# object is created with context to make sure that all resources are freed and connection to db is closed
+# Object is created using the with expression (context) to make sure that all resources are freed and 
+# connection to db is closed when exiting the with block.
 with dbmerge(engine=engine, data=data, table_name="Facts", 
                   key=key, data_types=data_types) as merge:
     merge.exec()
@@ -63,11 +64,11 @@ data=[{'Shop':'123','Product':'123','Date':date(2025,2,1),'Qty':2,'Price':52.10}
       {'Shop':'125','Product':'124','Date':date(2025,2,1),'Qty':3,'Price':90.20}]
 
 # Pass the missing_condition as SQLAlchemy logical expression, 
-# to delete data only in 2025-02. 
-# (If you dont pass it, then whole table will be checked for missing values.)
-# Use the table attribute to access our target table as SQLAlchemy object.
+# to delete missing data in 2025-02.
+# (If you dont pass it, then whole target table will be checked vs your data for missing rows.)
 with dbmerge(engine=engine, data=data, table_name="Facts", 
              missing_mode='delete') as merge:
+    # Use the table attribute to access our target table as SQLAlchemy object.
     merge.exec(missing_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))
 
 # OUTPUT:
@@ -78,10 +79,10 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 ```
 
 # Documentation
-[Module Documentation](DOCUMENTATION.md)
+[Module Documentation](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md)
 
 # More examples
-[User Guide Python File](user_guide.py)
+[Examples Python File](https://github.com/pavel-v-sobolev/dbmerge/blob/main/user_guide.py)
 
 
 # Database specific details:

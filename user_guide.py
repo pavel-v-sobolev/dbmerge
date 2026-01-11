@@ -40,9 +40,10 @@ data=[{'Shop':'123','Product':'123','Date':date(2025,2,1),'Qty':2,'Price':52.10}
 
 # Pass the missing_condition as SQLAlchemy logical expression, 
 # to delete data only in 2025-02. 
-# Use the table attribute to access our target table as SQLAlchemy object.
+# (If you dont pass it, then whole target table will be checked vs your data for missing rows.)
 with dbmerge(engine=engine, data=data, table_name="Facts", 
              missing_mode='delete', merged_on_field='Merged On') as merge:
+    # Use the table attribute to access our target table as SQLAlchemy object.
     merge.exec(missing_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))
 
 # OUTPUT:
@@ -50,14 +51,15 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 # Inserted: 0 rows (5ms), Updated: 1 rows (5ms), Deleted: 1 rows (5ms), Total time: 19ms
 
 # CASE 2 - Loading some objects data. (e.g. shops)
-# Assume you received a dataset for one or several shops and you want to update these shops
+# Assume you received a dataset for one or several shops and you want to check missing rows
+# only for these shops.
 data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':2,'Price':50.10},
       {'Shop':'123','Product':'123','Date':date(2025,2,1),'Qty':2,'Price':52.10},
       {'Shop':'123','Product':'124','Date':date(2025,2,1),'Qty':1,'Price':80.20},
       {'Shop':'123','Product':'125','Date':date(2025,2,1),'Qty':13,'Price':70.10}]
 with dbmerge(engine=engine, data=data, table_name="Facts", 
              missing_mode='delete', merged_on_field='Merged On') as merge:
-      # Lets create missing condition so that in checks value of Shop in the target table
+      # Lets create missing condition so that in checks that value of Shop in the target table
       # is in values in the temp_table.
       # This means, that deletion will be only done for shops, loaded in the data.
       merge.exec(missing_condition=merge.table.c['Shop'].in_(select(merge.temp_table.c['Shop'])))

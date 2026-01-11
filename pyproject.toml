@@ -35,6 +35,8 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/pavel-v-sobolev/dbmerge"
 Issues = "https://github.com/pavel-v-sobolev/dbmerge/issues"
+Documentation = "https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md"
+Examples = "https://github.com/pavel-v-sobolev/dbmerge/blob/main/user_guide.py"
 
 [tool.setuptools.packages.find]
 where = ["src"]
