@@ -64,7 +64,7 @@ with dbmerge(data=data, engine=engine, table_name="YourTable",delete_mode='delet
 ```
 
 ### Arguments
-- **delete_condition** (ColumnElement, optional) - If missing mode is 'delete' or 'mark', then you can set a condition to filter the target table. It should be an SQL alchemy binary exporession, which will be used in the where condition of delete or mark deleted.
+- **delete_condition** (ColumnElement, optional) - If delete mode is 'delete' or 'mark', then you can set a condition to filter the target table. It should be an SQL alchemy binary exporession, which will be used in the where condition of delete or mark deleted.
 - **source_condition** (ColumnElement, optional): If the data is loaded from source table or view, then you can set this parameter to use in the where() statement when selecting the data and inserting to temp table. 
 - **commit_all_steps** (bool, optional): If set to True (default), then all steps will be commited (insert to temp, insert to target, update, delete). If False, then commit will be done only after all is finished.
 - **chunk_size** (int, optional): When data (from list or dataframe) is inserted to temp table, it will be split in chunks. Defaults to 10000 rows per chunk.
