@@ -63,13 +63,13 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 data=[{'Shop':'123','Product':'123','Date':date(2025,2,1),'Qty':2,'Price':52.10},
       {'Shop':'125','Product':'124','Date':date(2025,2,1),'Qty':3,'Price':90.20}]
 
-# Pass the missing_condition as SQLAlchemy logical expression, 
+# Pass the delete_condition as SQLAlchemy logical expression, 
 # to delete missing data in 2025-02.
 # (If you dont pass it, then whole target table will be checked vs your data for missing rows.)
 with dbmerge(engine=engine, data=data, table_name="Facts", 
-             missing_mode='delete') as merge:
+             delete_mode='delete') as merge:
     # Use the table attribute to access our target table as SQLAlchemy object.
-    merge.exec(missing_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))
+    merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))
 
 # OUTPUT:
 # INFO - Merged data into table "Facts". Temp data: 2 rows (3ms), 

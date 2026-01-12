@@ -31,8 +31,8 @@ data_types = {'Shop':String(100),'Product':String(100)}
 
 
 def clean_data(engine):
-    drop_table_if_exists('Facts',engine,schema='target')
-    drop_table_if_exists('Facts_source',engine,schema='source')
+    drop_table_if_exists(engine,'Facts',schema='target')
+    drop_table_if_exists(engine,'Facts_source',schema='source')
 
 
 @pytest.mark.parametrize("engine_name,test_pandas", [(engine_name,test_pandas) 
@@ -78,11 +78,11 @@ def test_empty_data_updates(engine_name,test_pandas):
     else:
         data = []
 
-    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',missing_mode='delete') as merge:
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',delete_mode='delete') as merge:
         merge.exec()
         assert merge.deleted_row_count==3, f'Incorrect row count from delete {merge.deleted_row_count}, should be 3'
     
-    with dbmerge(engine=engine, table_name="Facts_empty", schema='target', temp_schema='temp',missing_mode='delete',
+    with dbmerge(engine=engine, table_name="Facts_empty", schema='target', temp_schema='temp',delete_mode='delete',
                  source_table_name = 'Facts', source_schema = 'target', key=key) as merge:
         merge.exec()
         assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.deleted_row_count}, should be 0'    
@@ -102,7 +102,7 @@ def test_table_only_key_no_other_fields(engine_name,test_pandas):
         data = pd.DataFrame(data)
 
     with dbmerge(engine=engine, data=data, table_name="Facts",key=key, schema='target', temp_schema='temp',
-                  missing_mode='delete', data_types=data_types) as merge:
+                  delete_mode='delete', data_types=data_types) as merge:
         merge.exec()
         assert merge.inserted_row_count==2, f'Incorrect row count from insert {merge.inserted_row_count}, should be 2'
     
@@ -110,7 +110,7 @@ def test_table_only_key_no_other_fields(engine_name,test_pandas):
     if test_pandas:
         data = pd.DataFrame(data)
     with dbmerge(engine=engine, data=data, table_name="Facts",key=key, schema='target', temp_schema='temp',
-                  missing_mode='delete') as merge:
+                  delete_mode='delete') as merge:
         merge.exec()
         assert merge.deleted_row_count==1, f'Incorrect row count from delete {merge.deleted_row_count}, should be 1'
 
@@ -147,7 +147,7 @@ def test_insert_to_existing_table_and_test_new_field(engine_name,test_pandas):
 @pytest.mark.parametrize("engine_name,test_pandas", [(engine_name,test_pandas) 
                                                      for engine_name in engines for test_pandas in (True, False)])
 def test_change_data_and_mark_deleted_data(engine_name,test_pandas):
-    logger.debug("TEST CHANGE DATA AND DELETE DATA with missing_mode='mark'")
+    logger.debug("TEST CHANGE DATA AND DELETE DATA with delete_mode='mark'")
     engine = engines[engine_name]
     clean_data(engine)
 
@@ -165,8 +165,8 @@ def test_change_data_and_mark_deleted_data(engine_name,test_pandas):
         data = data.to_dict(orient='records')
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='temp',
-                  missing_mode='mark',merged_on_field='Merged On',inserted_on_field='Inserted On',
-                  missing_mark_field='Deleted') as merge:
+                  delete_mode='mark',merged_on_field='Merged On',inserted_on_field='Inserted On',
+                  delete_mark_field='Deleted') as merge:
         merge.exec()
         assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.inserted_row_count}, should be 0'
         assert merge.updated_row_count>0, f'Incorrect row count from update {merge.updated_row_count}, should be >0'
@@ -183,7 +183,7 @@ def test_date_range_with_deletion(engine_name,test_pandas):
     if not test_pandas:
         data = data.to_dict(orient='records')
 
-    with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='temp',
+    with dbmerge(engine=engine, data=data,  table_name="Facts", schema='target', temp_schema='temp',
                   data_types=data_types, key=key) as merge:
         merge.exec()
     
@@ -191,8 +191,8 @@ def test_date_range_with_deletion(engine_name,test_pandas):
     if not test_pandas:
         data = data.to_dict(orient='records')
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='temp',
-                  missing_mode='delete') as merge:
-        merge.exec(missing_condition=merge.table.c['Date'].between(date(2025,3,1),date(2025,4,15)))
+                  delete_mode='delete') as merge:
+        merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,3,1),date(2025,4,15)))
         assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.inserted_row_count}, should be ==0'
         assert merge.updated_row_count>0, f'Incorrect row count from update {merge.updated_row_count}, should be >0'
         assert merge.deleted_row_count>0, f'Incorrect row count from delete {merge.deleted_row_count}, should be >0'
@@ -200,7 +200,7 @@ def test_date_range_with_deletion(engine_name,test_pandas):
 
 @pytest.mark.parametrize("engine_name,test_pandas", [(engine_name,test_pandas) 
                                                      for engine_name in engines for test_pandas in (True, False)])
-def test_date_range_with_missing_mark(engine_name,test_pandas):
+def test_date_range_with_delete_mark(engine_name,test_pandas):
     logger.debug('TEST DATE RANGE WITH MISSING MARK')
     engine = engines[engine_name]
     clean_data(engine)
@@ -217,8 +217,8 @@ def test_date_range_with_missing_mark(engine_name,test_pandas):
     if not test_pandas:
         data = data.replace({np.nan: None}).to_dict(orient='records')
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
-                  missing_mode='mark',missing_mark_field='Deleted') as merge:
-        merge.exec(missing_condition=merge.table.c['Date'].between(date(2025,3,1),date(2025,4,15)))
+                  delete_mode='mark',delete_mark_field='Deleted') as merge:
+        merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,3,1),date(2025,4,15)))
         assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.inserted_row_count}, should be ==0'
         assert merge.updated_row_count>0, f'Incorrect row count from update {merge.updated_row_count}, should be >0'
         assert merge.deleted_row_count>0, f'Incorrect row count from delete {merge.deleted_row_count}, should be >0'
@@ -229,8 +229,8 @@ def test_date_range_with_missing_mark(engine_name,test_pandas):
     if not test_pandas:
         data = data.to_dict(orient='records')
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
-                  missing_mode='mark',missing_mark_field='Deleted') as merge:
-        merge.exec(missing_condition=merge.table.c['Date'].between(date(2025,3,1),date(2025,4,15)))
+                  delete_mode='mark',delete_mark_field='Deleted') as merge:
+        merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,3,1),date(2025,4,15)))
         assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.inserted_row_count}, should be ==0'
         assert merge.updated_row_count>=deleted_count,\
             f'Incorrect row count from update {merge.updated_row_count}, should be >={deleted_count}'
@@ -257,8 +257,8 @@ def test_a_set_from_temp_with_deletion(engine_name,test_pandas):
         data = data.replace({np.nan: None}).to_dict(orient='records')
 
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
-                  missing_mode='delete') as merge:
-        merge.exec(missing_condition=merge.table.c['Shop'].in_(select(merge.temp_table.c['Shop'])))
+                  delete_mode='delete') as merge:
+        merge.exec(delete_condition=merge.table.c['Shop'].in_(select(merge.temp_table.c['Shop'])))
         assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.inserted_row_count}, should be ==0'
         assert merge.updated_row_count>0, f'Incorrect row count from update {merge.updated_row_count}, should be >0'
         assert merge.deleted_row_count>0, f'Incorrect row count from delete {merge.deleted_row_count}, should be >0'
@@ -277,7 +277,7 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
     if not test_pandas:
         data = data.replace({np.nan: None}).to_dict(orient='records')
     
-    with dbmerge(data=data, engine=engine, table_name="Facts_source", schema='source', temp_schema='temp',
+    with dbmerge(engine=engine, data=data, table_name="Facts_source", schema='source', temp_schema='temp',
                   inserted_on_field='Inserted On', key=key, data_types=data_types) as merge:
         merge.exec()
         assert merge.inserted_row_count>0, f'Incorrect row count from insert {merge.inserted_row_count}, should be >0'
@@ -289,10 +289,10 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
 
     if not test_pandas:
         data = data.replace({np.nan: None}).to_dict(orient='records')
-    with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='temp', 
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp', 
                   key=key, data_types=data_types,
-                  missing_mode='mark',merged_on_field='Merged On',inserted_on_field='Inserted On',
-                  missing_mark_field='Deleted') as merge:
+                  delete_mode='mark',merged_on_field='Merged On',inserted_on_field='Inserted On',
+                  delete_mark_field='Deleted') as merge:
         merge.exec()
         assert merge.inserted_row_count>0, f'Incorrect row count from insert {merge.inserted_row_count}, should be >0'
         assert merge.updated_row_count==0, f'Incorrect row count from update {merge.updated_row_count}, should be 0'
@@ -302,9 +302,9 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
     with dbmerge(engine=engine, source_table_name='Facts_source', temp_schema='temp', 
                   source_schema='source',
                   table_name="Facts", schema='target',
-                  missing_mode='delete') as merge:
+                  delete_mode='delete') as merge:
         merge.exec(source_condition=merge.source_table.c['Date'].between(date(2025,1,1),date(2025,1,15)),
-                   missing_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,15)))
+                   delete_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,15)))
         assert merge.inserted_row_count>0, f'Incorrect row count from insert {merge.inserted_row_count}, should be >0'
         assert merge.updated_row_count>0, f'Incorrect row count from update {merge.updated_row_count}, should be >0'
         assert merge.deleted_row_count==0, f'Incorrect row count from delete {merge.deleted_row_count}, should be 0'
@@ -319,7 +319,7 @@ if __name__ == '__main__':
     # test_insert_to_existing_table_and_test_new_field()
     # test_change_data_and_mark_deleted_data() # stress test
     # test_date_range_with_deletion()
-    # test_date_range_with_missing_mark()
+    # test_date_range_with_delete_mark()
     # test_a_set_from_temp_with_deletion()
     #test_duplicates_and_na('postgres',True)
     #test_empty_data_updates('postgres',True)

@@ -21,11 +21,11 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 - **engine** (Engine): Database sqlalchemy engine. Module was tested with postgres, mariadb, sqlite. It should work with most of DBs, which support insert, update from select syntax and delete with where not exists syntax.
 - **table_name** (str): Target table name. This is where the data is merged.
 - **data** (list[dict] | pd.DataFrame | None, optional): Data to merge into the table. It can be list of dict e.g. [{'column1':'value1','column2':'value2'},] or a pandas DataFrame.
-- **missing_mode** (Literal['keep', 'delete', 'mark'], optional): Defines how to handle values, which exist in target table, but does not exist in data or source table.
-    - keep - do nothing (default)
+- **delete_mode** (Literal['no', 'delete', 'mark'], optional): Defines how to handle values, which exist in target table, but does not exist in data or source table.
+    - no - do nothing (default)
     - delete - delete missing rows from target table
-    - mark - set deletion mark to True or 1 in the missing_mark_field.
-- **missing_mark_field** (str, optional): Field used for setting deletion status for record. The field should be boolean or integer. When record is missing in the data or source table, it is set to True or 1.
+    - mark - set deletion mark to True or 1 in the delete_mark_field.
+- **delete_mark_field** (str, optional): Field used for setting deletion status for record. The field should be boolean or integer. When record is missing in the data or source table, it is set to True or 1.
 - **merged_on_field** (str | None, optional): Timestamp field name which is set to current datetime when the data is inserted/updated/marked.
 - **inserted_on_field** (str | None, optional): Timestamp field when the record was inserted. This field is not changed when data is updated or marked for deletion. 
 - **skip_update_fields** (list, optional): List of fields, that will be excluded from update. These fields will be written only when data is inserted.
@@ -54,17 +54,17 @@ Further steps are done base on data in the temp table to merge data to the targe
 3) Update rows, which exist in target table and which have different values (fields are compared).
 4) Delete or mark as deleted (update deletion mark) for the fields, which dont exist in source data
 
-If your data comes in portions then you can set a missing_condition argument to define your portion of data.
+If your data comes in portions then you can set a delete_condition argument to define your portion of data.
 E.g. if you load monthly data you can call the method like this:
 
 ```python
-with dbmerge(data=data, engine=engine, table_name="YourTable",missing_mode='delete') as merge:
-    merge.exec(missing_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
+with dbmerge(data=data, engine=engine, table_name="YourTable",delete_mode='delete') as merge:
+    merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
 
 ```
 
 ### Arguments
-- **missing_condition** (ColumnElement, optional) - If missing mode is 'delete' or 'mark', then you can set a condition to filter the target table. It should be an SQL alchemy binary exporession, which will be used in the where condition of delete or mark deleted.
+- **delete_condition** (ColumnElement, optional) - If missing mode is 'delete' or 'mark', then you can set a condition to filter the target table. It should be an SQL alchemy binary exporession, which will be used in the where condition of delete or mark deleted.
 - **source_condition** (ColumnElement, optional): If the data is loaded from source table or view, then you can set this parameter to use in the where() statement when selecting the data and inserting to temp table. 
 - **commit_all_steps** (bool, optional): If set to True (default), then all steps will be commited (insert to temp, insert to target, update, delete). If False, then commit will be done only after all is finished.
 - **chunk_size** (int, optional): When data (from list or dataframe) is inserted to temp table, it will be split in chunks. Defaults to 10000 rows per chunk.
@@ -74,7 +74,7 @@ These attributes will be available after exec method is finished
 - **count_data** - number of rows in your data
 - **inserted_row_count** - number of rows that were inserted into the target table 
 - **updated_row_count** - number of rows that were updated in the target table
-- **deleted_row_count** - number of rows that were deleted or marked as deleted with using missing_mark_field.
+- **deleted_row_count** - number of rows that were deleted or marked as deleted with using delete_mark_field.
 - **total_time** - total time in seconds for all database operations. insert to temp, insert to target, update, delete (or mark)
 - **data_insert_time** - time in seconds for inserting data to temporary table
 - **insert_time** - time in seconds for inserting data to target table

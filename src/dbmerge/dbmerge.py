@@ -51,8 +51,8 @@ class dbmerge:
                  engine: Engine, 
                  table_name: str, 
                  data: list[dict[str,Any]] | pd.DataFrame | None = None,
-                 missing_mode: Literal['keep', 'delete', 'mark']='keep',
-                 missing_mark_field: str = None,
+                 delete_mode: Literal['no', 'delete', 'mark']='no',
+                 delete_mark_field: str = None,
                  merged_on_field: str | None = None,
                  inserted_on_field: str | None = None,
                  skip_update_fields: list = [],
@@ -83,13 +83,13 @@ class dbmerge:
             data (list[dict] | pd.DataFrame | None, optional): Data to merge into the table.
                 It can be list of dict e.g. [{'column1':'value1','column2':'value2'},] 
                 or a pandas DataFrame.
-            missing_mode (Literal['keep', 'delete', 'mark'], optional): 
+            delete_mode (Literal['no', 'delete', 'mark'], optional): 
                 Defines how to handle values, which exist in target table, 
                 but does not exist in data or source table.
-                - keep - do nothing (default)
+                - no - do nothing (default)
                 - delete - delete missing rows from target table
-                - mark - set deletion mark to True or 1 in the missing_mark_field.
-            missing_mark_field (str, optional): Field used for setting deletion status for record.
+                - mark - set deletion mark to True or 1 in the delete_mark_field.
+            delete_mark_field (str, optional): Field used for setting deletion status for record.
                 The field should be boolean or integer. 
                 When record is missing in the data or source table, it is set to True or 1.
             merged_on_field (str | None, optional): Timestamp field name which is set to current datetime when the 
@@ -189,18 +189,18 @@ class dbmerge:
             self.inspector = inspect(self.engine)
             self.metadata = MetaData()
 
-            self.missing_mode = missing_mode
+            self.delete_mode = delete_mode
 
-            self.missing_mark_field = missing_mark_field
+            self.delete_mark_field = delete_mark_field
             self.merged_on_field = merged_on_field
             self.inserted_on_field = inserted_on_field
             
-            self.special_fields = [f for f in [self.missing_mark_field,self.merged_on_field,self.inserted_on_field]
+            self.special_fields = [f for f in [self.delete_mark_field,self.merged_on_field,self.inserted_on_field]
                                    if f is not None]
 
-            if self.missing_mode=='mark': 
-                if self.missing_mark_field is None:
-                    raise IncorrectParameter(f"missing_mode='mark', but missing_mark_field is not set.")
+            if self.delete_mode=='mark': 
+                if self.delete_mark_field is None:
+                    raise IncorrectParameter(f"delete_mode='mark', but delete_mark_field is not set.")
                 
 
             self.max_type_detection_rows = MAX_TYPE_DETECTION_ROWS
@@ -248,7 +248,7 @@ class dbmerge:
                     logger.info(f'Table "{self.table_full_name}" does not exist. Creating.')
                     self._check_given_types()    
                     if self.type_of_data in ['list of dict','pandas']: #data types from source table are already known
-                        self._detect_missing_data_types()
+                        self._detect_delete_data_types()
                     self._create_table()
                 else:
                     raise TableNotFoundError("Table not found {self.table_full_name} and can_create_table=False")
@@ -257,7 +257,7 @@ class dbmerge:
                     if can_create_columns:
                         self._check_given_types()
                         if self.type_of_data in ['list of dict','pandas']:
-                            self._detect_missing_data_types()
+                            self._detect_delete_data_types()
                         self._create_new_fields()
                     else:
                         self._remove_new_fields()
@@ -272,7 +272,7 @@ class dbmerge:
 
 
 
-    def exec(self, missing_condition: ColumnElement=None, source_condition: ColumnElement=None,
+    def exec(self, delete_condition: ColumnElement=None, source_condition: ColumnElement=None,
              commit_all_steps=True, chunk_size: int = 10000):
         """
         This method executes the merge operation, which contains the following steps:
@@ -282,13 +282,13 @@ class dbmerge:
         3) Update rows, which exist in target table and which have different values (fields are compared).
         4) Delete or mark as deleted (update deletion mark) for the fields, which dont exist in source data
 
-        If your data comes in portions then you can set a missing_condition argument to define your portion of data.
+        If your data comes in portions then you can set a delete_condition argument to define your portion of data.
         E.g. if you load monthly data you can call the method like this:
-            with dbmerge(data=data, engine=engine, table_name="YourTable",missing_mode='delete') as merge:
-                merge.exec(missing_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
+            with dbmerge(data=data, engine=engine, table_name="YourTable",delete_mode='delete') as merge:
+                merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
 
         Args:
-            missing_condition (ColumnElement, optional): 
+            delete_condition (ColumnElement, optional): 
                 If missing mode is 'delete' or 'mark', then you can set a condition to filter the target table. 
                 It should be an SQL alchemy binary exporession, which will be used in the where condition of delete or mark deleted.
             source_condition (ColumnElement, optional): If the data is loaded from source table or view, 
@@ -302,9 +302,9 @@ class dbmerge:
 
         """
 
-        if missing_condition is not None and not isinstance(missing_condition,ColumnElement):
-            raise IncorrectParameter('missing_condition argument should be sqlalchemy logical expression (ColumnElement type)')
-        self.missing_condition = missing_condition
+        if delete_condition is not None and not isinstance(delete_condition,ColumnElement):
+            raise IncorrectParameter('delete_condition argument should be sqlalchemy logical expression (ColumnElement type)')
+        self.delete_condition = delete_condition
 
         if source_condition is not None and not isinstance(source_condition,ColumnElement):
             raise IncorrectParameter('source_condition argument should be sqlalchemy logical expression (ColumnElement type)')
@@ -322,7 +322,7 @@ class dbmerge:
             if commit_all_steps:
                 self.conn.commit()
             
-            self._insert_missing_data()
+            self._insert_delete_data()
             inserted_msg = f'Inserted: {self.inserted_row_count} rows ({format_ms(self.insert_time)})'
             if commit_all_steps:
                 self.conn.commit()
@@ -333,16 +333,16 @@ class dbmerge:
                 self.conn.commit()
 
 
-            if self.missing_mode=='delete':
-                self._delete_rows_missing_in_source()
-                missing_msg = f'Deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
+            if self.delete_mode=='delete':
+                self._delete_rows_delete_in_source()
+                delete_msg = f'Deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
 
-            elif self.missing_mode=='mark':
-                self._mark_rows_missing_in_source()
-                missing_msg = f'Marked deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
+            elif self.delete_mode=='mark':
+                self._mark_rows_delete_in_source()
+                delete_msg = f'Marked deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
 
-            else:                  #self.missing_mode=='keep':
-                missing_msg = 'Deleted: no'
+            else:                  #self.delete_mode=='no':
+                delete_msg = 'Deleted: no'
                 self.delete_time=0
 
 
@@ -352,7 +352,7 @@ class dbmerge:
                               self.update_time+self.delete_time
             
             logger.info(f'Merged data into table "{self.table_full_name}". '+\
-                        ', '.join([data_msg,inserted_msg,updated_msg,missing_msg])+', '+\
+                        ', '.join([data_msg,inserted_msg,updated_msg,delete_msg])+', '+\
                         f'Total time: {format_ms(self.total_time)}')
         
         except:
@@ -412,9 +412,9 @@ class dbmerge:
             else:
                 self.new_fields[f]=self.data_fields[f]
 
-        missing_mark_field = self.missing_mark_field
-        if missing_mark_field is not None and missing_mark_field not in existing_fields:
-            self.new_fields[missing_mark_field]=Boolean()
+        delete_mark_field = self.delete_mark_field
+        if delete_mark_field is not None and delete_mark_field not in existing_fields:
+            self.new_fields[delete_mark_field]=Boolean()
 
         merged_on_field = self.merged_on_field
         if merged_on_field is not None and merged_on_field not in existing_fields:
@@ -438,7 +438,7 @@ class dbmerge:
                     raise IncorrectDataError(f'Incorrect type {given_type} given for field {f}. '+\
                                               'Should be sqlalchemy data type')
 
-    def _detect_missing_data_types(self):
+    def _detect_delete_data_types(self):
 
         not_given_data_types = [f for f in self.new_fields if self.new_fields[f] is None]
 
@@ -547,7 +547,7 @@ class dbmerge:
                     raise NoKeyError(f'Key field "{c}" not found in data')
 
 
-    def _insert_missing_data(self):
+    def _insert_delete_data(self):
         
         start_time = time.perf_counter()
         first_pk_col = self.table.c[self.key[0]]
@@ -584,7 +584,7 @@ class dbmerge:
         self.insert_time = end_time - start_time  
 
 
-    def _delete_rows_missing_in_source(self):
+    def _delete_rows_delete_in_source(self):
 
         start_time = time.perf_counter()
         delete_join_conditions = []
@@ -592,10 +592,10 @@ class dbmerge:
             delete_join_conditions.append(self.table.c[c]==self.temp_table.c[c])
         delete_where_clause = and_(*delete_join_conditions)
         
-        if self.missing_condition is None:
+        if self.delete_condition is None:
             delete_stmt = delete(self.table).where(not_(exists().where(delete_where_clause)))
         else:
-            delete_stmt = delete(self.table).where(and_(self.missing_condition,
+            delete_stmt = delete(self.table).where(and_(self.delete_condition,
                                                         not_(exists().where(delete_where_clause))))
                 
         self.delete_sql = str(delete_stmt)
@@ -607,7 +607,7 @@ class dbmerge:
         self.delete_time = end_time - start_time  
 
 
-    def _mark_rows_missing_in_source(self):
+    def _mark_rows_delete_in_source(self):
 
         start_time = time.perf_counter()
         update_join_conditions = []
@@ -616,18 +616,18 @@ class dbmerge:
         update_where_clause = and_(*update_join_conditions)
 
         update_values = {}
-        mark_field = self.table.c[self.missing_mark_field]
+        mark_field = self.table.c[self.delete_mark_field]
         update_values[mark_field] = 1
 
         if self.merged_on_field is not None:
             merged_on_field = self.table.c[self.merged_on_field]
             update_values[merged_on_field]=func.now()
 
-        if self.missing_condition is None:
+        if self.delete_condition is None:
             update_stmt = update(self.table).values(update_values).where(not_(exists().where(update_where_clause)))
         else:
             update_stmt = update(self.table).values(update_values).\
-                                where(and_(self.missing_condition,
+                                where(and_(self.delete_condition,
                                            not_(exists().where(update_where_clause)) ))
         
         self.delete_sql = str(update_stmt)
@@ -662,8 +662,8 @@ class dbmerge:
             temp_col = self.temp_table.c[c]
             where_conditions.append(col.is_distinct_from(temp_col))
 
-        if self.missing_mark_field is not None:
-            mark_field = self.table.c[self.missing_mark_field]
+        if self.delete_mark_field is not None:
+            mark_field = self.table.c[self.delete_mark_field]
             where_conditions.append(mark_field.is_not(None))
 
         where_clause = or_(*where_conditions)        
@@ -675,8 +675,8 @@ class dbmerge:
         for c in non_key_cols:
             update_values[self.table.c[c]] = select_stmt.c[c]
 
-        if self.missing_mark_field is not None:
-            mark_field = self.table.c[self.missing_mark_field]
+        if self.delete_mark_field is not None:
+            mark_field = self.table.c[self.delete_mark_field]
             update_values[mark_field]=None
 
         if self.merged_on_field is not None:
