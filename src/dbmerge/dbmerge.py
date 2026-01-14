@@ -1,6 +1,7 @@
 """
 This library is designed as a simple interface for Insert/Update/Delete operation with SQL database table.
-Merge is done with optimal speed via putting your data first to temporary table and then doing data modification in the target table.
+Merge is done with optimal speed via putting your data first to temporary table and then doing data modification 
+in the target table.
 This module is based on SQLAlchemy library and using its abstraction layer to support multiple database engines.
 DBMerge requires a non-null unique key (preferable primary key) to compare data and deside which operation is required.
 """
@@ -12,7 +13,7 @@ import pandas as pd
 import numpy as np
 from typing import Literal,Any
 import logging
-import datetime
+from datetime import datetime, date
 
 from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
@@ -301,7 +302,7 @@ class dbmerge:
                 it will be split in chunks. Defaults to 10000 rows per chunk.
 
         """
-
+        
         if delete_condition is not None and not isinstance(delete_condition,ColumnElement):
             raise IncorrectParameter('delete_condition argument should be sqlalchemy logical expression (ColumnElement type)')
         self.delete_condition = delete_condition
@@ -322,23 +323,23 @@ class dbmerge:
             if commit_all_steps:
                 self.conn.commit()
             
-            self._insert_delete_data()
-            inserted_msg = f'Inserted: {self.inserted_row_count} rows ({format_ms(self.insert_time)})'
-            if commit_all_steps:
-                self.conn.commit()
             
             self._update_not_matching_data()
             updated_msg = f'Updated: {self.updated_row_count} rows ({format_ms(self.update_time)})'
             if commit_all_steps:
                 self.conn.commit()
 
+            self._insert_missing_data()
+            inserted_msg = f'Inserted: {self.inserted_row_count} rows ({format_ms(self.insert_time)})'
+            if commit_all_steps:
+                self.conn.commit()
 
             if self.delete_mode=='delete':
-                self._delete_rows_delete_in_source()
+                self._delete_rows_missing_in_source()
                 delete_msg = f'Deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
 
             elif self.delete_mode=='mark':
-                self._mark_rows_delete_in_source()
+                self._mark_rows_missing_in_source()
                 delete_msg = f'Marked deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
 
             else:                  #self.delete_mode=='no':
@@ -466,9 +467,9 @@ class dbmerge:
                             self.new_fields[f] = String()
                         elif isinstance(test_row[f],bool):
                             self.new_fields[f] = Boolean()
-                        elif isinstance(test_row[f],datetime.date):
+                        elif isinstance(test_row[f],date):
                             self.new_fields[f] = Date()
-                        elif isinstance(test_row[f],datetime.datetime):
+                        elif isinstance(test_row[f],datetime):
                             if test_row[f].tzinfo is None:
                                 self.new_fields[f] = DateTime()
                             else:
@@ -547,7 +548,7 @@ class dbmerge:
                     raise NoKeyError(f'Key field "{c}" not found in data')
 
 
-    def _insert_delete_data(self):
+    def _insert_missing_data(self):
         
         start_time = time.perf_counter()
         first_pk_col = self.table.c[self.key[0]]
@@ -584,7 +585,7 @@ class dbmerge:
         self.insert_time = end_time - start_time  
 
 
-    def _delete_rows_delete_in_source(self):
+    def _delete_rows_missing_in_source(self):
 
         start_time = time.perf_counter()
         delete_join_conditions = []
@@ -607,7 +608,7 @@ class dbmerge:
         self.delete_time = end_time - start_time  
 
 
-    def _mark_rows_delete_in_source(self):
+    def _mark_rows_missing_in_source(self):
 
         start_time = time.perf_counter()
         update_join_conditions = []

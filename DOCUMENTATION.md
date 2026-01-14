@@ -23,7 +23,7 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 - **data** (list[dict] | pd.DataFrame | None, optional): Data to merge into the table. It can be list of dict e.g. [{'column1':'value1','column2':'value2'},] or a pandas DataFrame.
 - **delete_mode** (Literal['no', 'delete', 'mark'], optional): Defines how to handle values, which exist in target table, but does not exist in data or source table.
     - no - do nothing (default)
-    - delete - delete missing rows from target table
+    - delete - delete rows from target table, that are missing in the source data
     - mark - set deletion mark to True or 1 in the delete_mark_field.
 - **delete_mark_field** (str, optional): Field used for setting deletion status for record. The field should be boolean or integer. When record is missing in the data or source table, it is set to True or 1.
 - **merged_on_field** (str | None, optional): Timestamp field name which is set to current datetime when the data is inserted/updated/marked.
