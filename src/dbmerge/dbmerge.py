@@ -24,8 +24,9 @@ from alembic.operations import Operations
 
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig()
+logger = logging.getLogger('dbmerge')
+logger.setLevel(logging.INFO)
 
 class TableNotFoundError(RuntimeError):
     pass    
