@@ -760,8 +760,7 @@ class dbmerge:
                     data_slice = self.data[begin:end]
                 elif self.type_of_data == 'pandas':
                     data_slice = self.data.loc[begin:end-1]
-                    if self.engine.dialect.name in ('mysql','mariadb'):
-                        data_slice = data_slice.replace({np.nan: None})    
+                    data_slice = data_slice.replace({np.nan: None})    
                     data_slice = data_slice.to_dict(orient='records')
                 else:
                     return

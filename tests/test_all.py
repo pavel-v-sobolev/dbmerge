@@ -136,7 +136,7 @@ def test_insert_to_existing_table_and_test_new_field(engine_name,test_pandas):
     data = get_data(limit=10000)
     data['Test Field']=1
     if not test_pandas:
-        data = data.to_dict(orient='records')
+        data = data.replace({np.nan: None}).to_dict(orient='records')
 
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
                   merged_on_field='Merged On',inserted_on_field='Inserted On') as merge:
@@ -153,7 +153,7 @@ def test_change_data_and_mark_deleted_data(engine_name,test_pandas):
 
     data = get_data(limit=10001)
     if not test_pandas:
-        data = data.to_dict(orient='records')
+        data = data.replace({np.nan: None}).to_dict(orient='records')
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='temp',
                   data_types=data_types, key=key) as merge:
@@ -162,7 +162,7 @@ def test_change_data_and_mark_deleted_data(engine_name,test_pandas):
 
     data = get_modified_data(limit=10000)
     if not test_pandas:
-        data = data.to_dict(orient='records')
+        data = data.replace({np.nan: None}).to_dict(orient='records')
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='temp',
                   delete_mode='mark',merged_on_field='Merged On',inserted_on_field='Inserted On',
@@ -181,7 +181,7 @@ def test_date_range_with_deletion(engine_name,test_pandas):
 
     data = get_data(start_date=date(2025,1,1),end_date=date(2025,7,10))
     if not test_pandas:
-        data = data.to_dict(orient='records')
+        data = data.replace({np.nan: None}).to_dict(orient='records')
 
     with dbmerge(engine=engine, data=data,  table_name="Facts", schema='target', temp_schema='temp',
                   data_types=data_types, key=key) as merge:
@@ -189,7 +189,8 @@ def test_date_range_with_deletion(engine_name,test_pandas):
     
     data = get_modified_data(start_date=date(2025,3,1),end_date=date(2025,4,15))
     if not test_pandas:
-        data = data.to_dict(orient='records')
+        data = data.replace({np.nan: None}).to_dict(orient='records')
+
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='temp',
                   delete_mode='delete') as merge:
         merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,3,1),date(2025,4,15)))
@@ -207,7 +208,7 @@ def test_date_range_with_delete_mark(engine_name,test_pandas):
 
     data = get_data(start_date=date(2025,1,1),end_date=date(2025,7,10))
     if not test_pandas:
-        data = data.to_dict(orient='records')
+        data = data.replace({np.nan: None}).to_dict(orient='records')
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='temp', 
                   data_types=data_types, key=key) as merge:
@@ -216,6 +217,7 @@ def test_date_range_with_delete_mark(engine_name,test_pandas):
     data = get_modified_data(start_date=date(2025,3,1),end_date=date(2025,4,15))
     if not test_pandas:
         data = data.replace({np.nan: None}).to_dict(orient='records')
+
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
                   delete_mode='mark',delete_mark_field='Deleted') as merge:
         merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,3,1),date(2025,4,15)))
@@ -227,7 +229,8 @@ def test_date_range_with_delete_mark(engine_name,test_pandas):
     logger.debug('Now test how missing mark is recovered')
     data = get_data(start_date=date(2025,3,1),end_date=date(2025,4,15))
     if not test_pandas:
-        data = data.to_dict(orient='records')
+        data = data.replace({np.nan: None}).to_dict(orient='records')
+
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
                   delete_mode='mark',delete_mark_field='Deleted') as merge:
         merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,3,1),date(2025,4,15)))
@@ -246,7 +249,7 @@ def test_a_set_from_temp_with_deletion(engine_name,test_pandas):
 
     data = get_data(limit=10000)
     if not test_pandas:
-        data = data.to_dict(orient='records')
+        data = data.replace({np.nan: None}).to_dict(orient='records')
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='temp', 
                   data_types=data_types, key=key) as merge:
@@ -289,6 +292,7 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
 
     if not test_pandas:
         data = data.replace({np.nan: None}).to_dict(orient='records')
+
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp', 
                   key=key, data_types=data_types,
                   delete_mode='mark',merged_on_field='Merged On',inserted_on_field='Inserted On',
