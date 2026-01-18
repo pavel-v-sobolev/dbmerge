@@ -7,7 +7,7 @@ Merge is done with optimal speed via putting your data first to temporary table 
 This module is based on SQLAlchemy library and using its abstraction layer to support multiple database engines.
 DBMerge requires a non-null unique key (preferable primary key) to compare data and deside which operation is required.
 
-It was tested with PostgreSQL, MariaDB and SQLite.
+It was tested with PostgreSQL, MariaDB, SQLite and MS SQL.
 
 
 # Main features:

@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from datetime import date
+import time
 import uuid
 import pytest
 import logging
@@ -9,17 +10,27 @@ from sqlalchemy import create_engine,text,select
 from sqlalchemy import Table, MetaData, Column, String, Date, Integer, Numeric, JSON, Uuid
 
 from sample_data_in_pg import get_data, get_modified_data
+import urllib
+from dbmerge import dbmerge, drop_table_if_exists, format_ms
 
-from dbmerge import dbmerge, drop_table_if_exists
-
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
 
 logger = logging.getLogger()
-logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
+logger.setLevel(level=logging.DEBUG)
 
 engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
            'postgres':create_engine("""postgresql+psycopg2://postgres:@localhost:5432/dbmerge"""),
-           'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306""")
-          }
+           'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306"""),
+        #    'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(
+        #                                                     "DRIVER={ODBC Driver 18 for SQL Server};"
+        #                                                     "SERVER=localhost;"
+        #                                                     "DATABASE=dbmerge;"
+        #                                                     "UID=sa;"
+        #                                                     "PWD=MSSQL.test_pass;"
+        #                                                     "Encrypt=yes;"
+        #                                                     "TrustServerCertificate=yes;"   # often needed in dev / non-prod
+        #                                                     )}",connect_args={"fast_executemany": True})
+         }
 
 
 
@@ -87,6 +98,34 @@ def test_empty_data_updates(engine_name,test_pandas):
         merge.exec()
         assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.deleted_row_count}, should be 0'    
 
+@pytest.mark.parametrize("engine_name,test_pandas", [(engine_name,True) 
+                                                     for engine_name in engines])
+def test_case_sensitive_and_spaces(engine_name,test_pandas):
+    logger.debug('TEST CASE SENSITIVE AND SPACES')
+    engine = engines[engine_name]
+    clean_data(engine)
+
+    data_types = {'Shop':String(100),'Product':String(100),'Test Field':String(100)}
+
+    data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':2,'Price':50.10,'Test Field':'test'},
+        {'Shop':'124','Product':'123','Date':date(2025,1,1),'Qty':1,'Price':100.50,'Test Field':'test'},
+        {'Shop':'124','Product':'1223','Date':date(2025,1,1),'Qty':1,'Price':120.20,'Test Field':'test'}]
+
+    if test_pandas:
+        data = pd.DataFrame(data)
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
+                  key=key, data_types=data_types) as merge:
+        merge.exec()
+
+    data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':2,'Price':50.10,'Test Field':'test'},
+        {'Shop':'124','Product':'123','Date':date(2025,1,1),'Qty':1,'Price':100.50,'Test Field':'Test'},
+        {'Shop':'124','Product':'1223','Date':date(2025,1,1),'Qty':1,'Price':120.20,'Test Field':' tEst'}]
+
+    if test_pandas:
+        data = pd.DataFrame(data)
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
+                  key=key, data_types=data_types) as merge:
+        merge.exec()
 
 
 @pytest.mark.parametrize("engine_name,test_pandas", [(engine_name,test_pandas) 
@@ -270,7 +309,7 @@ def test_a_set_from_temp_with_deletion(engine_name,test_pandas):
 @pytest.mark.parametrize("engine_name,test_pandas", [(engine_name,test_pandas) 
                                                      for engine_name in engines for test_pandas in (True, False)])               
 def test_update_from_source_table_with_delete_in_a_period(engine_name,test_pandas):
-    logger.debug('TEST UPDATE FROM SOURCE TABLE WITH DELETE/UPDATE OF IN A SET')
+    logger.debug(f'TEST UPDATE FROM SOURCE TABLE WITH DELETE/UPDATE OF IN A SET {engine_name} {test_pandas}')
     engine = engines[engine_name]
     clean_data(engine)
 
@@ -290,13 +329,15 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
     logger.debug('Now modify some date and load to Facts table')
     data = get_modified_data()
 
+    data['Test field']=1.1
     if not test_pandas:
         data = data.replace({np.nan: None}).to_dict(orient='records')
 
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp', 
                   key=key, data_types=data_types,
                   delete_mode='mark',merged_on_field='Merged On',inserted_on_field='Inserted On',
-                  delete_mark_field='Deleted') as merge:
+                  delete_mark_field='Deleted'
+                  ) as merge:
         merge.exec()
         assert merge.inserted_row_count>0, f'Incorrect row count from insert {merge.inserted_row_count}, should be >0'
         assert merge.updated_row_count==0, f'Incorrect row count from update {merge.updated_row_count}, should be 0'
@@ -318,9 +359,9 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
 if __name__ == '__main__':
 
     # test_table_create_from_data_with_various_types('postgres',True)
-    # test_case_sensitive_and_spaces()
+    # test_case_sensitive_and_spaces('mssql',True)
     # test_table_only_key_no_other_fields()
-    test_insert_to_existing_table_and_test_new_field('postgres',True)
+    # test_insert_to_existing_table_and_test_new_field('mssql',True)
     # test_change_data_and_mark_deleted_data() # stress test
     # test_date_range_with_deletion()
     # test_date_range_with_delete_mark()
@@ -328,4 +369,7 @@ if __name__ == '__main__':
     #test_duplicates_and_na('postgres',True)
     #test_empty_data_updates('postgres',True)
     # test_date_range_with_deletion('mariadb',True)
+    # test_merged_field_on_in_primary_key('postgres',True)
+
     #test_update_from_source_table_with_delete_in_a_period('postgres',True)
+    test_update_from_source_table_with_delete_in_a_period('mssql',True)

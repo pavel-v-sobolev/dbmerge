@@ -134,6 +134,8 @@ class dbmerge:
             self.temp_schema = temp_schema
             self.source_schema = source_schema
             self.source_table = None
+            self.can_create_columns = can_create_columns
+            self.can_create_table = can_create_table
 
             if dialect_name in ['sqlite']:
                 if schema is not None:
@@ -545,8 +547,13 @@ class dbmerge:
             raise NoKeyError("No primary key: provide 'key' argument or set primary key in DB")
         else:
             for c in self.key:
-                if c not in self.data_fields:
+                if c in self.special_fields:
+                    raise NoKeyError(f'Key field "{c}" is a special field, which can not be used in the primary key.')
+                elif c not in self.data_fields:
                     raise NoKeyError(f'Key field "{c}" not found in data')
+                elif c in self.new_fields and self.table is not None:
+                    raise NoKeyError(f'Key field "{c}" is a new column, '+\
+                                     f'but table "{self.table_full_name}" already exist, can not add primary key column.')
 
 
     def _insert_missing_data(self):
@@ -765,8 +772,9 @@ class dbmerge:
                     data_slice = data_slice.to_dict(orient='records')
                 else:
                     return
-                
+                    
                 result = self.conn.execute(insert(self.temp_table), data_slice)
+
         
         end_time = time.perf_counter()
         self.data_insert_time = end_time - start_time       

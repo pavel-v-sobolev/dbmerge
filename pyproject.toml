@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbmerge"
-version = "1.0.5"
+version = "1.0.6"
 description = "DBMerge is a python library for automatic merge of table data to an SQL database with insert/update/delete(or mark)."
 authors = [
   { name="Pavel Sobolev", email="pavel-v-sobolev@yandex.ru" },
@@ -46,6 +46,7 @@ dev = [
     "psycopg2>=2.9",
     "mariadb>=1.1.5",
     "pytest>=7.1.1",
+    "pyodbc",
     "twine",
     "build"
 ]
