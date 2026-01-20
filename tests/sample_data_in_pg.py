@@ -137,36 +137,24 @@ def get_modified_data(shops:list=None, start_date: date=None, end_date: date=Non
         where = ''
 
     SQL = f"""
-        WITH 
-        random_data_updates
-        AS
-        (
         SELECT 
             "Date",
             "Product",
             "Shop",
             "Qty",
-            "Price",
             CASE WHEN random(1,100) % 5 = 0 
                 THEN 
                     CASE WHEN random(1,100) % 8 = 0
                     THEN NULL
                     ELSE random(50000,150000)/100 END 
-                ELSE "Price" END::NUMERIC "New Price",
-            CASE WHEN random(1,100) % 7 = 0 THEN 1 ELSE 0 END::NUMERIC "Delete"
-        FROM "Facts_source" ORDER BY "Date","Product","Shop"  {limit_str})
-
-        SELECT
-            "Date",
-            "Product",
-            "Shop",
-            "Qty",
-            "New Price" "Price"
-        FROM random_data_updates
-        WHERE "Delete"=0  {where}
-
+                ELSE "Price" END "Price"
+        FROM "Facts_source"  
+        WHERE "Price"<1200 {where}
+        ORDER BY "Date","Product","Shop" 
+        {limit_str} 
 
         """   
+
     data = pd.read_sql(text(SQL), engine_src)
     end_time = time.perf_counter()
     logger.debug(f'Get data with update_delete: {format_ms(end_time - start_time)}, Shops: {str(shops)}, '+\

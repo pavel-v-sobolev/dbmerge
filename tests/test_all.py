@@ -21,15 +21,15 @@ logger.setLevel(level=logging.DEBUG)
 engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
            'postgres':create_engine("""postgresql+psycopg2://postgres:@localhost:5432/dbmerge"""),
            'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306"""),
-        #    'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(
-        #                                                     "DRIVER={ODBC Driver 18 for SQL Server};"
-        #                                                     "SERVER=localhost;"
-        #                                                     "DATABASE=dbmerge;"
-        #                                                     "UID=sa;"
-        #                                                     "PWD=MSSQL.test_pass;"
-        #                                                     "Encrypt=yes;"
-        #                                                     "TrustServerCertificate=yes;"   # often needed in dev / non-prod
-        #                                                     )}",connect_args={"fast_executemany": True})
+           'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(
+                                                            "DRIVER={ODBC Driver 18 for SQL Server};"
+                                                            "SERVER=localhost;"
+                                                            "DATABASE=dbmerge;"
+                                                            "UID=sa;"
+                                                            "PWD=MSSQL.test_pass;"
+                                                            "Encrypt=yes;"
+                                                            "TrustServerCertificate=yes;"
+                                                            )}",connect_args={"autocommit": False,"fast_executemany": True})
          }
 
 
