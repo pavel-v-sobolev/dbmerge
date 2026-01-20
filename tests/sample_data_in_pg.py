@@ -6,8 +6,10 @@ from dbmerge import format_ms
 import time
 from datetime import date
 
-logger = logging.getLogger()
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
+
+logger = logging.getLogger()
+logger.setLevel(level=logging.DEBUG)
 
 
 
