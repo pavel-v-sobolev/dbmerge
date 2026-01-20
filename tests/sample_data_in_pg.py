@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
 
 
 
-con_str = """postgresql+psycopg2://postgres:@localhost:5432/dbmerge"""
+con_str = """postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge"""
 engine_src = create_engine(con_str)
 conn_src = engine_src.connect()
 

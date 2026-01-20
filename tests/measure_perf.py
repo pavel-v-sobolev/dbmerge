@@ -18,18 +18,21 @@ logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
 logger = logging.getLogger()
 logger.setLevel(level=logging.DEBUG)
 
+
+mssql_settings = urllib.parse.quote_plus(
+                                        "DRIVER={ODBC Driver 18 for SQL Server};"
+                                        "SERVER=localhost;"
+                                        "DATABASE=dbmerge;"
+                                        "UID=sa;"
+                                        "PWD=MSSQL.test_pass;"
+                                        "Encrypt=yes;"
+                                        "TrustServerCertificate=yes;"
+                                        )
+
 engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
-           'postgres':create_engine("""postgresql+psycopg2://postgres:@localhost:5432/dbmerge"""),
+           'postgres':create_engine("""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge"""),
            'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306"""),
-           'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(
-                                                            "DRIVER={ODBC Driver 18 for SQL Server};"
-                                                            "SERVER=localhost;"
-                                                            "DATABASE=dbmerge;"
-                                                            "UID=sa;"
-                                                            "PWD=MSSQL.test_pass;"
-                                                            "Encrypt=yes;"
-                                                            "TrustServerCertificate=yes;"
-                                                            )}",connect_args={"autocommit": False,"fast_executemany": True})
+           'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={mssql_settings}",connect_args={"autocommit": False,"fast_executemany": True})
          }
 
 
