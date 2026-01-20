@@ -22,9 +22,9 @@ def recreate_test_table():
          DROP TABLE IF EXISTS "Facts_source";
      """
     conn_src.execute(text(SQL))
-    conn_src.execute('CREATE SCHEMA IF NOT EXISTS "target"')
-    conn_src.execute('CREATE SCHEMA IF NOT EXISTS "temp"')
-    conn_src.execute('CREATE SCHEMA IF NOT EXISTS "source"')
+    conn_src.execute(text('CREATE SCHEMA IF NOT EXISTS "target"'))
+    conn_src.execute(text('CREATE SCHEMA IF NOT EXISTS "temp"'))
+    conn_src.execute(text('CREATE SCHEMA IF NOT EXISTS "source"'))
 
     logger.info('Create table Facts_source')
     SQL = """
