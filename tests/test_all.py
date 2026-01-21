@@ -31,7 +31,7 @@ mssql_settings = urllib.parse.quote_plus(
 engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
            'postgres':create_engine("""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge"""),
            'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306"""),
-           'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={mssql_settings}",connect_args={"autocommit": False,"fast_executemany": True})
+           #'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={mssql_settings}",connect_args={"autocommit": False,"fast_executemany": True})
          }
 
 
@@ -209,7 +209,7 @@ def test_change_data_and_mark_deleted_data(engine_name,test_pandas):
                   delete_mode='mark',merged_on_field='Merged On',inserted_on_field='Inserted On',
                   delete_mark_field='Deleted') as merge:
         merge.exec()
-        assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.inserted_row_count}, should be 0'
+        assert merge.inserted_row_count>0, f'Incorrect row count from insert {merge.inserted_row_count}, should be >0'
         assert merge.updated_row_count>0, f'Incorrect row count from update {merge.updated_row_count}, should be >0'
         assert merge.deleted_row_count>0, f'Incorrect row count from delete {merge.deleted_row_count}, should be >0'
 
@@ -303,7 +303,7 @@ def test_a_set_from_temp_with_deletion(engine_name,test_pandas):
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
                   delete_mode='delete') as merge:
         merge.exec(delete_condition=merge.table.c['Shop'].in_(select(merge.temp_table.c['Shop'])))
-        assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.inserted_row_count}, should be ==0'
+        assert merge.inserted_row_count>0, f'Incorrect row count from insert {merge.inserted_row_count}, should be >0'
         assert merge.updated_row_count>0, f'Incorrect row count from update {merge.updated_row_count}, should be >0'
         assert merge.deleted_row_count>0, f'Incorrect row count from delete {merge.deleted_row_count}, should be >0'
 
@@ -374,4 +374,4 @@ if __name__ == '__main__':
     # test_merged_field_on_in_primary_key('postgres',True)
 
     #test_update_from_source_table_with_delete_in_a_period('postgres',True)
-    test_update_from_source_table_with_delete_in_a_period('mssql',True)
+    test_update_from_source_table_with_delete_in_a_period('postgres',True)

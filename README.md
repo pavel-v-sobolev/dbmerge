@@ -49,7 +49,8 @@ data=[# some data for 2025-01
       {'Shop':'124','Product':'123','Date':date(2025,2,1),'Qty':1,'Price':110.50},
       {'Shop':'125','Product':'124','Date':date(2025,2,1),'Qty':1,'Price':90.20}]
 
-# key is required if your table does not exist in the database. Otherwise module will read this info from the database.
+# key is required if your table does not exist in the database. Otherwise module will read this info 
+# from the database.
 # data_types will be needed for creating table in mariadb, because it requires setting string length.
 key = ['Shop','Product','Date']
 data_types = {'Shop':String(100),'Product':String(100)}
@@ -95,5 +96,7 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 - In PostgreSQL only JSONB type is supported by this library, not JSON. The reason is that for JSON not possible to compare and check if something was changed.
 - MariaDB / MySQL is not detecting changes in uppercase and space padding. E.g. 'test' = ' Test' will be true. If it is important for your project, you need to change collation settings in your database.
 - For MariaDB / MySQL schema is same as database, but still schema settings are supported by this library.
-- MariaDB / MySQL does not allow strings with unlimited size. You need to set data_types, if you want to create a table automatically. E.g. data_types = {'Your Field':String(100)}
+- MariaDB / MySQL does not allow strings with unlimited size. You need to set data_types, if you want to create a table or field automatically. E.g. data_types = {'Your Field':String(100)}
 - SQLite does not support schema, so if schema setting provided, they are automatically reset to None with warning.
+- MS SQL has a poor performance of bulk insert operation because of pyodbc driver specific.
+

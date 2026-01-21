@@ -22,7 +22,7 @@ from sqlalchemy import types, dialects, func
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
-
+from dataclasses import dataclass
 
 logging.basicConfig()
 logger = logging.getLogger('dbmerge')
@@ -46,6 +46,17 @@ class TempTableAlreadyExists(RuntimeError):
 # Maximum rows to check when deteting column type until non null value is found
 MAX_TYPE_DETECTION_ROWS = 10000 
 
+@dataclass
+class mergeResult:
+    total_row_count: int
+    inserted_row_count: int 
+    updated_row_count: int 
+    deleted_row_count: int 
+    total_time: float 
+    temp_insert_time: float
+    insert_time: float
+    update_time: float
+    delete_time: float
 
 
 class dbmerge:
@@ -150,12 +161,12 @@ class dbmerge:
                     logger.warning(f'"{dialect_name}" engine does not support schemas. Omitting parameter source_schema = "{source_schema}"')
                     self.source_schema = None
             
-            self.count_data = 0
+            self.total_row_count = 0
             self.inserted_row_count =0 
             self.updated_row_count = 0
             self.deleted_row_count = 0
             self.total_time = 0
-            self.data_insert_time = 0
+            self.temp_insert_time = 0
             self.insert_time = 0
             self.update_time = 0
             self.delete_time = 0
@@ -222,22 +233,22 @@ class dbmerge:
 
                 self.source_table = self._load_table_metadata_from_db(self.source_table_name,
                                                                       self.source_schema)
-                self.count_data = 0
+                self.total_row_count = 0
                 if self.source_table is None:
                     raise IncorrectParameter(f'Table "{self.source_table_full_name}" not found in the database')
                 self._get_fields_from_source_table()
 
             elif isinstance(self.data,list):
                 self.type_of_data = 'list of dict'
-                self.count_data = len(self.data)
-                if self.count_data==0:
+                self.total_row_count = len(self.data)
+                if self.total_row_count==0:
                     raise IncorrectDataError(f'Input list is empty.')
                 self._get_fields_from_list_of_dict()               
 
             elif isinstance(self.data,pd.DataFrame):
                 self.type_of_data = 'pandas'
-                self.count_data = len(self.data)
-                if self.count_data==0:
+                self.total_row_count = len(self.data)
+                if self.total_row_count==0:
                     logger.warning('No data, empty dataframe')
                 self._get_fields_from_pandas()
 
@@ -277,7 +288,7 @@ class dbmerge:
 
 
     def exec(self, delete_condition: ColumnElement=None, source_condition: ColumnElement=None,
-             commit_all_steps=True, chunk_size: int = 10000):
+             commit_all_steps=True, chunk_size: int = 10000) -> mergeResult:
         """
         This method executes the merge operation, which contains the following steps:
         1) Insert source data to temporary table.
@@ -322,7 +333,7 @@ class dbmerge:
                 self._insert_data_to_temp()
             else:
                 self._insert_source_table_to_temp()
-            data_msg = f'Temp data: {self.count_data} rows ({format_ms(self.data_insert_time)})'
+            data_msg = f'Temp data: {self.total_row_count} rows ({format_ms(self.temp_insert_time)})'
             if commit_all_steps:
                 self.conn.commit()
             
@@ -352,12 +363,23 @@ class dbmerge:
 
             self.conn.commit()           
 
-            self.total_time = self.data_insert_time+self.insert_time+\
+            self.total_time = self.temp_insert_time+self.insert_time+\
                               self.update_time+self.delete_time
             
             logger.info(f'Merged data into table "{self.table_full_name}". '+\
                         ', '.join([data_msg,inserted_msg,updated_msg,delete_msg])+', '+\
                         f'Total time: {format_ms(self.total_time)}')
+            
+            return mergeResult(total_row_count = self.total_row_count,
+                               inserted_row_count = self.inserted_row_count,
+                               updated_row_count = self.updated_row_count,
+                               deleted_row_count = self.deleted_row_count,
+                               total_time = self.total_time, 
+                               temp_insert_time = self.temp_insert_time,
+                               insert_time = self.insert_time,
+                               update_time = self.update_time,
+                               delete_time = self.delete_time)
+    
         
         except:
             if hasattr(self, 'conn'):
@@ -756,14 +778,14 @@ class dbmerge:
 
         start_time = time.perf_counter()
         
-        chunks_num = (self.count_data // self.chunk_size)
-        if self.count_data % self.chunk_size > 0:
+        chunks_num = (self.total_row_count // self.chunk_size)
+        if self.total_row_count % self.chunk_size > 0:
             chunks_num = chunks_num + 1
         
-        if self.count_data>0:
+        if self.total_row_count>0:
             for i in range(chunks_num):
                 begin = i * self.chunk_size
-                end = min((i + 1) * self.chunk_size, self.count_data)
+                end = min((i + 1) * self.chunk_size, self.total_row_count)
                 if self.type_of_data == 'list of dict':
                     data_slice = self.data[begin:end]
                 elif self.type_of_data == 'pandas':
@@ -777,7 +799,7 @@ class dbmerge:
 
         
         end_time = time.perf_counter()
-        self.data_insert_time = end_time - start_time       
+        self.temp_insert_time = end_time - start_time       
         
     def _insert_source_table_to_temp(self):
 
@@ -793,10 +815,10 @@ class dbmerge:
 
         insert_stmt = insert(self.temp_table).from_select(target_fields,select_stmt)
         result = self.conn.execute(insert_stmt)
-        self.count_data = result.rowcount 
+        self.total_row_count = result.rowcount 
 
         end_time = time.perf_counter()
-        self.data_insert_time = end_time - start_time  
+        self.temp_insert_time = end_time - start_time  
 
 
     def _drop_temp_table(self):

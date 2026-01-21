@@ -47,19 +47,23 @@ These attributes will be available after init dbmerge object is initialized.
 
 
 ## exec method
-This method executes the merge operation, which contains the following steps:
+Method executes the merge operation. It returns mergeResult class with statistical information.
+
+This method includes the following steps:
 1) Insert source data to temporary table.
 Further steps are done base on data in the temp table to merge data to the target table (table). 
 2) Insert rows, missing in the target table.
 3) Update rows, which exist in target table and which have different values (fields are compared).
 4) Delete or mark as deleted (update deletion mark) for the fields, which dont exist in source data
 
+
+
 If your data comes in portions then you can set a delete_condition argument to define your portion of data.
 E.g. if you load monthly data you can call the method like this:
 
 ```python
 with dbmerge(data=data, engine=engine, table_name="YourTable",delete_mode='delete') as merge:
-    merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
+    result = merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
 
 ```
 
