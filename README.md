@@ -93,6 +93,7 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 
 
 # Database specific details:
+- In PostgreSQL temporary table is created as UNLOGGED.
 - In PostgreSQL only JSONB type is supported by this library, not JSON. The reason is that for JSON not possible to compare and check if something was changed.
 - MariaDB / MySQL is not detecting changes in uppercase and space padding. E.g. 'test' = ' Test' will be true. If it is important for your project, you need to change collation settings in your database.
 - For MariaDB / MySQL schema is same as database, but still schema settings are supported by this library.

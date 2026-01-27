@@ -18,7 +18,9 @@ from datetime import datetime, date
 from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
 from sqlalchemy import String, BigInteger, Numeric, Boolean, DateTime, Date, JSON, Uuid
-from sqlalchemy import types, dialects, func
+from sqlalchemy import types, dialects, func, text
+
+
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
@@ -771,6 +773,15 @@ class dbmerge:
 
         self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema)
         self.temp_table.create(self.engine, checkfirst=True)
+
+        # set unlogged for postgresql
+        if self.engine.dialect.name == 'postgresql':
+            if self.temp_schema is None:
+                SQL = f"""ALTER TABLE "{temp_table_name}" SET UNLOGGED;"""
+            else:
+                SQL = f"""ALTER TABLE "{self.temp_schema}"."{temp_table_name}" SET UNLOGGED;"""
+            self.conn.execute(text(SQL))
+
         self.conn.commit()        
  
 

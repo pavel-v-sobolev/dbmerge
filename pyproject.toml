@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbmerge"
-version = "1.0.7"
+version = "1.0.8"
 description = "DBMerge is a python library for automatic merge of table data to an SQL database with insert/update/delete(or mark)."
 keywords = ["upsert", "merge", "synchronization", "etl", "sqlalchemy", "database-sync"]
 authors = [
