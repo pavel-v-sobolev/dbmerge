@@ -140,7 +140,7 @@ class dbmerge:
             self.data = data
             self.engine = engine
             self.table_name = table_name
-
+            self.merge_finished = False
             dialect_name = self.engine.dialect.name
 
             self.schema = schema
@@ -152,15 +152,18 @@ class dbmerge:
 
             if dialect_name in ['sqlite']:
                 if schema is not None:
-                    logger.warning(f'"{dialect_name}" engine does not support schemas. Omitting parameter schema = "{schema}"')
+                    logger.warning(f'"{dialect_name}" engine does not support schemas. '
+                                   f'Omitting parameter schema = "{schema}"')
                     self.schema = None
 
                 if temp_schema is not None:
-                    logger.warning(f'"{dialect_name}" engine does not support schemas. Omitting parameter temp_schema = "{temp_schema}"')
+                    logger.warning(f'"{dialect_name}" engine does not support schemas. '
+                                   f'Omitting parameter temp_schema = "{temp_schema}"')
                     self.temp_schema = None
 
                 if source_schema is not None:
-                    logger.warning(f'"{dialect_name}" engine does not support schemas. Omitting parameter source_schema = "{source_schema}"')
+                    logger.warning(f'"{dialect_name}" engine does not support schemas. '
+                                   f'Omitting parameter source_schema = "{source_schema}"')
                     self.source_schema = None
             
             self.total_row_count = 0
@@ -319,6 +322,9 @@ class dbmerge:
 
         """
         
+        if self.merge_finished:
+            raise IncorrectParameter(f'Merge exec already finished of table {self.table_full_name}')
+
         if delete_condition is not None and not isinstance(delete_condition,ColumnElement):
             raise IncorrectParameter('delete_condition argument should be sqlalchemy logical expression (ColumnElement type)')
         self.delete_condition = delete_condition
@@ -391,6 +397,7 @@ class dbmerge:
         finally:
             self._drop_temp_table()
             self.conn.close()
+            self.merge_finished = True
 
 
 
@@ -800,7 +807,7 @@ class dbmerge:
                 if self.type_of_data == 'list of dict':
                     data_slice = self.data[begin:end]
                 elif self.type_of_data == 'pandas':
-                    data_slice = self.data.loc[begin:end-1]
+                    data_slice = self.data.iloc[begin:end]
                     data_slice = data_slice.replace({np.nan: None})    
                     data_slice = data_slice.to_dict(orient='records')
                 else:
@@ -845,7 +852,8 @@ def drop_table_if_exists(engine,table_name,schema=None):
     """
 
     if schema is not None and engine.dialect.name=='sqlite':
-        logger.warning('sqlite engine does not support schemas. Omitting parameter schema = "{schema}"')
+        logger.warning('sqlite engine does not support schemas. ' 
+                       f'Omitting parameter schema = "{schema}"')
         schema=None
 
     if schema is None:
