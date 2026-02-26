@@ -100,4 +100,5 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 - MariaDB / MySQL does not allow strings with unlimited size. You need to set data_types, if you want to create a table or field automatically. E.g. data_types = {'Your Field':String(100)}
 - SQLite does not support schema, so if schema setting provided, they are automatically reset to None with warning.
 - MS SQL has a poor performance of bulk insert operation because of pyodbc driver specific.
-
+- Oracle - Not supported yet, because of missing support for join operation in update statement in "oracledb" module.
+- DuckDB - Not supported yet, because "duckdb_engine" has some bug in loading table definition from the database.

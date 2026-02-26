@@ -6,7 +6,7 @@ import uuid
 import pytest
 import logging
 
-from sqlalchemy import create_engine,text,select
+from sqlalchemy import create_engine,text,select,schema,StaticPool
 from sqlalchemy import Table, MetaData, Column, String, Date, Integer, Numeric, JSON, Uuid
 
 from sample_data_in_pg import get_data, get_modified_data
@@ -32,6 +32,7 @@ mssql_settings = urllib.parse.quote_plus(
 engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
            'postgres':create_engine("""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge"""),
            'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306"""),
+           #'duckdb':create_engine('duckdb:///:memory:', poolclass=StaticPool)
            #'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={mssql_settings}",connect_args={"autocommit": False,"fast_executemany": True})
          }
 
@@ -39,31 +40,41 @@ engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
 
 
 
-def clean_data(engine):
+def prepare_and_clean_data(engine):
     drop_table_if_exists(engine,'Facts',schema='target')
     drop_table_if_exists(engine,'Facts_source',schema='source')
 
+    with engine.connect() as conn:
+        if conn.dialect.name!='sqlite':
+            for schema_name in ['tmp','target']:
+                if not conn.dialect.has_schema(conn, schema_name):
+                    conn.execute(schema.CreateSchema(schema_name))
+                    conn.commit()
+
 
 def measure_performance(engine_name,size):
+
     logger.debug(f'MEASURE PERFORMANCE {engine_name} {size}')
     engine = engines[engine_name]
+
     key = ['Shop','Product','Date']
     data_types = {'Shop':String(100),'Product':String(100)}
-    clean_data(engine)
+
+    prepare_and_clean_data(engine)
 
     logger.debug('Create source table')
     data = get_data(limit = size/2)
     
-    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
                   inserted_on_field='Inserted On',merged_on_field='Merged On',key=key, data_types=data_types) as merge:
         merge.exec()
 
-    logger.debug('Now modify some date and load to Facts table')
+    logger.debug('Now modify some data and load to Facts table')
     data = get_modified_data(limit = size)
 
     #data = data.fillna(0)
 
-    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='temp',
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
                  delete_mode='delete', inserted_on_field='Inserted On',merged_on_field='Merged On',
                  key=key, data_types=data_types) as merge:
         result = merge.exec()

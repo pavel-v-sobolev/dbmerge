@@ -51,7 +51,8 @@ dev = [
     "psycopg2>=2.9",
     "mariadb>=1.1.5",
     "pytest>=7.1.1",
+    "duckdb_engine",
     "pyodbc",
     "twine",
-    "build"
+    "build",
 ]
