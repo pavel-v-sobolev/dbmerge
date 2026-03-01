@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbmerge"
-version = "1.0.10"
+version = "1.0.11"
 description = "DBMerge is a python library for automatic merge of table data to an SQL database with insert/update/delete(or mark)."
 keywords = ["upsert", "merge", "synchronization", "etl", "sqlalchemy", "database-sync"]
 authors = [
@@ -22,11 +22,12 @@ license-files = ["LICEN[CS]E*"]
 
 
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: MIT License",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Topic :: Database",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -41,9 +42,12 @@ Homepage = "https://github.com/pavel-v-sobolev/dbmerge"
 Issues = "https://github.com/pavel-v-sobolev/dbmerge/issues"
 Documentation = "https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md"
 Examples = "https://github.com/pavel-v-sobolev/dbmerge/blob/main/user_guide.py"
+Repository = "https://github.com/pavel-v-sobolev/dbmerge"
+Changelog = "https://github.com/pavel-v-sobolev/dbmerge/releases"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dbmerge"]
 
 [project.optional-dependencies]
 dev = [

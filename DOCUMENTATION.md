@@ -5,7 +5,7 @@
 Init function performs preparation steps before merge.
 - Check that target table is existing and create table if it does not exist.
 - Check existing table fields and create missing fields according to given or detected data types.
-- To make effecient merge the module creates a temporary table, which will be used in exec() method.
+- To make efficient merge the module creates a temporary table, which will be used in exec() method.
 \
 Preferable way to do this is to use context:\
 E.g.:

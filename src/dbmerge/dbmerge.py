@@ -3,7 +3,7 @@ This library is designed as a simple interface for Insert/Update/Delete operatio
 Merge is done with optimal speed via putting your data first to temporary table and then doing data modification 
 in the target table.
 This module is based on SQLAlchemy library and using its abstraction layer to support multiple database engines.
-DBMerge requires a non-null unique key (preferable primary key) to compare data and deside which operation is required.
+DBMerge requires a non-null unique key (preferable primary key) to compare data and decide which operation is required.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ class IncorrectParameter(RuntimeError):
 class TempTableAlreadyExists(RuntimeError):
     pass
 
-# Maximum rows to check when deteting column type until non null value is found
+# Maximum rows to check when detecting column type until non null value is found
 MAX_TYPE_DETECTION_ROWS = 10000 
 
 @dataclass
@@ -80,7 +80,7 @@ class dbmerge:
                  delete_mark_field: str = None,
                  merged_on_field: str | None = None,
                  inserted_on_field: str | None = None,
-                 skip_update_fields: list = [],
+                 skip_update_fields: list | None = None,
                  key: list | None = None,
                  data_types: dict[str,types.TypeEngine] | None = None,
                  schema: str | None = None, 
@@ -93,7 +93,7 @@ class dbmerge:
         Init function performs preparation steps before merge.
         - Check that target table is existing and create table if it does not exist.
         - Check existing table fields and create missing fields according to given or detected data types.
-        - To make effecient merge the module creates a temporary table, which will be used in exec() method.
+        - To make efficient merge the module creates a temporary table, which will be used in exec() method.
 
         Preferable way to do this is to use context:
         E.g.:
@@ -191,8 +191,8 @@ class dbmerge:
 
             self.source_table_name = source_table_name
             
-            self.skip_update_fields = skip_update_fields
-
+            self.skip_update_fields = skip_update_fields if skip_update_fields is not None else []
+            
             if self.schema is None:
                 self.table_full_name = table_name
             else:
@@ -281,7 +281,7 @@ class dbmerge:
                         self._detect_delete_data_types()
                     self._create_table()
                 else:
-                    raise TableNotFoundError("Table not found {self.table_full_name} and can_create_table=False")
+                    raise TableNotFoundError(f"Table not found {self.table_full_name} and can_create_table=False")
             else:
                 if len(self.new_fields)>0:
                     if can_create_columns:
@@ -295,7 +295,7 @@ class dbmerge:
             self._create_temp_table()
 
 
-        except:
+        except Exception as e:
             if hasattr(self, 'conn'):
                 self.conn.rollback()
             raise
@@ -399,7 +399,7 @@ class dbmerge:
                                delete_time = self.delete_time)
     
         
-        except:
+        except Exception as e:
             if hasattr(self, 'conn'):
                 self.conn.rollback()
             raise
