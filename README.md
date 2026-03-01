@@ -17,7 +17,7 @@ It was tested with PostgreSQL, MariaDB, SQLite and MS SQL.
 
 
 # Main features:
-- Insert rows new, which dont exist in the target table.
+- Insert new rows, which dont exist in the target table.
 - Update rows, which exist in target table, but have different values. It is skipping update of rows which dont change the values.
 - It has various options for deletion of rows, which were not found in the source table, but exist in the target table. (Either keep, delete or mark with special boolean flag field).
 - It can handle data filtering in deletion part. E.g. handle subsets or period in the source data to check and delete/mark only inside this scope.
