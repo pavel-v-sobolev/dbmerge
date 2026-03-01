@@ -31,7 +31,7 @@ mssql_settings = urllib.parse.quote_plus(
 engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
            'postgres':create_engine("""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge"""),
            'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306"""),
-           'duckdb':create_engine('duckdb:///:memory:', poolclass=StaticPool),
+           #'duckdb':create_engine('duckdb:///:memory:', poolclass=StaticPool),
            #'oracle':create_engine("oracle+oracledb://system:oracle@localhost/?service_name=XEPDB1")
            #'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={mssql_settings}",connect_args={"autocommit": False,"fast_executemany": True})
          }

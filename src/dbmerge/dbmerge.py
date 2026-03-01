@@ -6,12 +6,23 @@ This module is based on SQLAlchemy library and using its abstraction layer to su
 DBMerge requires a non-null unique key (preferable primary key) to compare data and deside which operation is required.
 """
 
+from __future__ import annotations
+from typing import Literal,Any,TYPE_CHECKING
 
 import uuid
 import time
-import pandas as pd
-import numpy as np
-from typing import Literal,Any
+
+if TYPE_CHECKING:
+    from pandas import DataFrame
+
+try:
+    import pandas as pd
+    import numpy as np
+    HAS_PANDAS = True
+except ImportError:
+    pd = None
+    HAS_PANDAS = False
+
 import logging
 from datetime import datetime, date
 
@@ -21,8 +32,7 @@ from sqlalchemy import String, BigInteger, Numeric, Boolean, DateTime, Date, JSO
 from sqlalchemy import types, dialects, func, text
 
 
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
+
 
 from dataclasses import dataclass
 
@@ -65,7 +75,7 @@ class dbmerge:
     def __init__(self,
                  engine: Engine, 
                  table_name: str, 
-                 data: list[dict[str,Any]] | pd.DataFrame | None = None,
+                 data: list[dict[str,Any]] | DataFrame | None = None,
                  delete_mode: Literal['no', 'delete', 'mark']='no',
                  delete_mark_field: str = None,
                  merged_on_field: str | None = None,
@@ -250,7 +260,7 @@ class dbmerge:
                     raise IncorrectDataError(f'Input list is empty.')
                 self._get_fields_from_list_of_dict()               
 
-            elif isinstance(self.data,pd.DataFrame):
+            elif HAS_PANDAS and isinstance(self.data,pd.DataFrame):
                 self.type_of_data = 'pandas'
                 self.total_row_count = len(self.data)
                 if self.total_row_count==0:
@@ -556,6 +566,10 @@ class dbmerge:
     def _create_new_fields(self):
 
         if len(self.new_fields)>0:
+            
+            from alembic.migration import MigrationContext
+            from alembic.operations import Operations
+
             op=Operations(MigrationContext.configure(self.conn))
             for field_name in self.new_fields:
                 logger.info(f'Creating new field "{field_name}" - {self.new_fields[field_name]}')       

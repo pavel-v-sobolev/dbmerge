@@ -2,7 +2,7 @@ from sqlalchemy import create_engine, String, select
 from datetime import date
 from dbmerge import dbmerge, drop_table_if_exists
 
-engine = create_engine("""postgresql+psycopg2://postgres:@localhost:5432/dbmerge""")
+engine = create_engine("""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge""")
 
 # This is a additional routine to drop table in database (just to run a fresh test each time)
 # Be careful if you use it!
