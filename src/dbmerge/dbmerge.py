@@ -257,15 +257,30 @@ class dbmerge:
                 self.type_of_data = 'list of dict'
                 self.total_row_count = len(self.data)
                 if self.total_row_count==0:
-                    raise IncorrectDataError(f'Input list is empty.')
-                self._get_fields_from_list_of_dict()               
+                    if self.table is None:
+                        raise IncorrectDataError(f'Input list is empty and table "{self.table_full_name}" does not exist.')
+                    else:
+                        logger.warning('Input list is empty.')
+                        self._get_fields_from_table()
+                else:
+                    self._get_fields_from_list_of_dict()               
 
             elif HAS_PANDAS and isinstance(self.data,pd.DataFrame):
                 self.type_of_data = 'pandas'
                 self.total_row_count = len(self.data)
                 if self.total_row_count==0:
-                    logger.warning('No data, empty dataframe')
-                self._get_fields_from_pandas()
+                    if len(self.data.columns)==0:
+                        if self.table is None:
+                            raise IncorrectDataError(f'Input DataFrame is empty and table "{self.table_full_name}" does not exist.')
+                        else:
+                            logger.warning('No data, empty dataframe with empty columns')
+                            self._get_fields_from_table()
+                    else:
+                        logger.warning('No data, empty dataframe')
+                        self._get_fields_from_pandas()
+
+                else:
+                    self._get_fields_from_pandas()
 
             else:
                 raise IncorrectDataError(f'Input "data" should be pandas DataFrame or list of dict')
@@ -278,7 +293,7 @@ class dbmerge:
                     logger.info(f'Table "{self.table_full_name}" does not exist. Creating.')
                     self._check_given_types()    
                     if self.type_of_data in ['list of dict','pandas']: #data types from source table are already known
-                        self._detect_delete_data_types()
+                        self._detect_missing_data_types()
                     self._create_table()
                 else:
                     raise TableNotFoundError(f"Table not found {self.table_full_name} and can_create_table=False")
@@ -287,7 +302,7 @@ class dbmerge:
                     if can_create_columns:
                         self._check_given_types()
                         if self.type_of_data in ['list of dict','pandas']:
-                            self._detect_delete_data_types()
+                            self._detect_missing_data_types()
                         self._create_new_fields()
                     else:
                         self._remove_new_fields()
@@ -335,12 +350,21 @@ class dbmerge:
         if self.merge_finished:
             raise IncorrectParameter(f'Merge exec already finished of table {self.table_full_name}')
 
-        if delete_condition is not None and not isinstance(delete_condition,ColumnElement):
-            raise IncorrectParameter('delete_condition argument should be sqlalchemy logical expression (ColumnElement type)')
+        if delete_condition is not None:
+            if not isinstance(delete_condition,ColumnElement):
+                raise IncorrectParameter('delete_condition argument should be sqlalchemy logical expression (ColumnElement type)')
+            if self.delete_mode not in ['delete', 'mark']:
+                logger.warning(f"""delete_condition is assigned, but delete_mode='{self.delete_mode}'. """
+                                """delete_condition will be ignored.""")
+            
         self.delete_condition = delete_condition
 
-        if source_condition is not None and not isinstance(source_condition,ColumnElement):
-            raise IncorrectParameter('source_condition argument should be sqlalchemy logical expression (ColumnElement type)')
+        if source_condition is not None:
+            if not isinstance(source_condition,ColumnElement):
+                raise IncorrectParameter('source_condition argument should be sqlalchemy logical expression (ColumnElement type)')
+            if self.source_table is None:
+                logger.warning('source_condition is assigned, but source_table is not assigned. '
+                               'source_condition will be ignored.')
         self.source_condition = source_condition
 
         self.chunk_size = chunk_size
@@ -437,6 +461,9 @@ class dbmerge:
     def _get_fields_from_pandas(self):
         self.data_fields = {c:None for c in self.data.columns if c not in self.special_fields}
 
+    def _get_fields_from_table(self):
+        self.data_fields = {c.name:c.type for c in self.table.c if c not in self.special_fields}
+
 
     def _check_type_is_supported(self,field_type):
         if isinstance(field_type,JSON) and self.engine.dialect.name == 'postgresql':
@@ -483,7 +510,7 @@ class dbmerge:
                     raise IncorrectDataError(f'Incorrect type {given_type} given for field {f}. '+\
                                               'Should be sqlalchemy data type')
 
-    def _detect_delete_data_types(self):
+    def _detect_missing_data_types(self):
 
         not_given_data_types = [f for f in self.new_fields if self.new_fields[f] is None]
 

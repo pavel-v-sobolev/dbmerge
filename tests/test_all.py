@@ -79,12 +79,13 @@ def test_table_create_from_data_with_various_types(engine_name,test_pandas):
 
 
 
-@pytest.mark.parametrize("engine_name,test_pandas", [(engine_name,True) 
-                                                     for engine_name in engines])
+@pytest.mark.parametrize("engine_name,test_pandas", [(engine_name,test_pandas) 
+                                                     for engine_name in engines for test_pandas in (True, False)])
 def test_empty_data_updates(engine_name,test_pandas):
     logger.debug('TEST TABLE CREATE FROM DATA WITH VARIOUS TYPES')
     engine = engines[engine_name]
     prepare_and_clean_data(engine)
+
 
     data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':2,'Price':50.10},
         {'Shop':'124','Product':'123','Date':date(2025,1,1),'Qty':1,'Price':100.50},
@@ -96,14 +97,16 @@ def test_empty_data_updates(engine_name,test_pandas):
                   key=key, data_types=data_types) as merge:
         merge.exec()
     if test_pandas:
-        data = pd.DataFrame(pd.DataFrame({'Shop':[],'Product':[],'Date':[]}))
+        data = pd.DataFrame({'Shop':[],'Product':[],'Date':[]})
+        #data = pd.DataFrame()
     else:
         data = []
 
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',delete_mode='delete') as merge:
         merge.exec()
         assert merge.deleted_row_count==3, f'Incorrect row count from delete {merge.deleted_row_count}, should be 3'
-    
+
+
     with dbmerge(engine=engine, table_name="Facts_empty", schema='target', temp_schema='tmp',delete_mode='delete',
                  source_table_name = 'Facts', source_schema = 'target', key=key) as merge:
         merge.exec()
@@ -370,7 +373,7 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
 if __name__ == '__main__':
 
     #test_table_create_from_data_with_various_types('oracle',True)
-    test_case_sensitive_and_spaces('postgres',True)
+    test_empty_data_updates('postgres',True)
     # test_table_only_key_no_other_fields()
     # test_insert_to_existing_table_and_test_new_field('mssql',True)
     # test_change_data_and_mark_deleted_data() # stress test
