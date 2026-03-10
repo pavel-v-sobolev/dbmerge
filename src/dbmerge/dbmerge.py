@@ -29,7 +29,7 @@ from datetime import datetime, date
 from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
 from sqlalchemy import String, BigInteger, Numeric, Boolean, DateTime, Date, JSON, Uuid
-from sqlalchemy import types, dialects, func, text
+from sqlalchemy import types, dialects, func, text, schema
 
 
 
@@ -88,7 +88,8 @@ class dbmerge:
                  source_table_name: str | None = None, 
                  source_schema: str | None = None, 
                  can_create_table: bool = True,
-                 can_create_columns: bool = True):
+                 can_create_columns: bool = True,
+                 can_create_schemas: bool = True):
         """
         Init function performs preparation steps before merge.
         - Check that target table is existing and create table if it does not exist.
@@ -138,7 +139,7 @@ class dbmerge:
             source_schema (str | None, optional): Database schema of source table or view.
             can_create_table (bool, optional): If True (default), then table and view will be created automatically.
             can_create_columns (bool, optional): If True (default), then module will create missing columns in the database table.
-            
+            can_create_schemas (bool, optional): If True (default), then module will automatically create target and temp schema, it they dont exist in DB.
 
         Raises:
             IncorrectParameter: Raised in several cases when arguments are not correct or missing required arguments.
@@ -159,6 +160,7 @@ class dbmerge:
             self.source_table = None
             self.can_create_columns = can_create_columns
             self.can_create_table = can_create_table
+            self.can_create_schemas = can_create_schemas
 
             if dialect_name in ['sqlite']:
                 if schema is not None:
@@ -193,16 +195,21 @@ class dbmerge:
             
             self.skip_update_fields = skip_update_fields if skip_update_fields is not None else []
             
-            if self.schema is None:
-                self.table_full_name = table_name
-            else:
+            self.conn = engine.connect()
+
+            if self.schema is not None:
                 self.table_full_name = self.schema+'.'+table_name
-
-            if self.source_schema is None:
-                self.source_table_full_name = source_table_name
+                self._create_schema_if_not_exists(self.schema)
             else:
-                self.source_table_full_name = self.source_schema+'.'+source_table_name
+                self.table_full_name = table_name
 
+            if self.source_schema is not None:
+                self.source_table_full_name = self.source_schema+'.'+source_table_name                
+            else:
+                self.source_table_full_name = source_table_name
+
+            if self.temp_schema is not None:
+                self._create_schema_if_not_exists(self.temp_schema)
 
             self.key = key
 
@@ -215,7 +222,7 @@ class dbmerge:
             self.data_fields = {}
             self.new_fields = {}
 
-            self.conn = engine.connect()
+            
             self.inspector = inspect(self.engine)
             self.metadata = MetaData()
 
@@ -445,6 +452,16 @@ class dbmerge:
     def __del__(self):
         self._drop_temp_table()
         self.conn.close()
+
+    def _create_schema_if_not_exists(self,schema_name):
+        if self.conn.dialect.name not in ['sqlite','mariadb','mysql']:
+            if not self.conn.dialect.has_schema(self.conn, schema_name):
+                if self.can_create_schemas:
+                    logger.info(f"""Creating schema "{schema_name}".""")
+                    self.conn.execute(schema.CreateSchema(schema_name))
+                    self.conn.commit()
+                else:
+                    raise IncorrectParameter(f"""Schema "{schema_name}" does not exist and can_create_schemas=False""")
 
 
     def _get_fields_from_source_table(self):

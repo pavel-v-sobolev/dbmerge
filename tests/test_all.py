@@ -49,13 +49,6 @@ def prepare_and_clean_data(engine):
     drop_table_if_exists(engine,'Facts',schema='target')
     drop_table_if_exists(engine,'Facts_source',schema='source')
 
-    with engine.connect() as conn:
-        if conn.dialect.name!='sqlite':
-            for schema_name in ['tmp','target']:
-                if not conn.dialect.has_schema(conn, schema_name):
-                    conn.execute(schema.CreateSchema(schema_name))
-                    conn.commit()
-
 
 @pytest.mark.parametrize("engine_name,test_pandas", [(engine_name,test_pandas) 
                                                      for engine_name in engines for test_pandas in (True, False)])
@@ -372,4 +365,4 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
 
 if __name__ == '__main__':
 
-    test_change_data_and_mark_deleted_data('sqlite',True)
+    test_change_data_and_mark_deleted_data('postgres',True)

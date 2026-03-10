@@ -44,13 +44,6 @@ def prepare_and_clean_data(engine):
     drop_table_if_exists(engine,'Facts',schema='target')
     drop_table_if_exists(engine,'Facts_source',schema='source')
 
-    with engine.connect() as conn:
-        if conn.dialect.name!='sqlite':
-            for schema_name in ['tmp','target']:
-                if not conn.dialect.has_schema(conn, schema_name):
-                    conn.execute(schema.CreateSchema(schema_name))
-                    conn.commit()
-
 
 def measure_performance(engine_name,size):
 
