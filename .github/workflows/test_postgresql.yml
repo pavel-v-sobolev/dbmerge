@@ -34,9 +34,9 @@ jobs:
       
       - name: Set up Python
         run: uv python install 3.13
-      
-      - name: Install PostgreSQL system libraries
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Install DB system libraries
+        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev libpq-dev
       
       - name: Install dependencies
         run: |

@@ -20,8 +20,8 @@ jobs:
       - name: Set up Python
         run: uv python install 3.13
       
-      - name: Install MariaDB system libraries
-        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev
+      - name: Install DB system libraries
+        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev libpq-dev
       
       - name: Install dependencies
         run: |
