@@ -1,0 +1,34 @@
+name: Test SQLite
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+      
+      - name: Create data directory
+        run: mkdir -p data
+      
+      - name: Initialize sample data
+        run: |
+          uv run python tests/sample_data_in_sqlite.py
+      
+      - name: Run pytest (SQLite only)
+        run: |
+          uv run pytest tests/test_all.py -v --tb=short -k "sqlite"
+

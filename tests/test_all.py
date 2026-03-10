@@ -9,7 +9,7 @@ import logging
 from sqlalchemy import create_engine, text, select, schema
 from sqlalchemy import Table, MetaData, Column, String, Date, Integer, Numeric, JSON, Uuid, StaticPool
 
-from sample_data_in_pg import get_data, get_modified_data
+from sample_data_in_sqlite import get_data, get_modified_data
 import urllib
 from dbmerge import dbmerge, drop_table_if_exists, format_ms
 
@@ -372,18 +372,4 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
 
 if __name__ == '__main__':
 
-    #test_table_create_from_data_with_various_types('oracle',True)
-    test_empty_data_updates('postgres',True)
-    # test_table_only_key_no_other_fields()
-    # test_insert_to_existing_table_and_test_new_field('mssql',True)
-    # test_change_data_and_mark_deleted_data() # stress test
-    # test_date_range_with_deletion()
-    # test_date_range_with_delete_mark()
-    # test_a_set_from_temp_with_deletion()
-    #test_duplicates_and_na('postgres',True)
-    #test_empty_data_updates('postgres',True)
-    # test_date_range_with_deletion('mariadb',True)
-    # test_merged_field_on_in_primary_key('postgres',True)
-
-    #test_update_from_source_table_with_delete_in_a_period('postgres',True)
-    # test_update_from_source_table_with_delete_in_a_period('postgres',True)
+    test_change_data_and_mark_deleted_data('sqlite',True)
