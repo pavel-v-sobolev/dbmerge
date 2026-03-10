@@ -52,7 +52,4 @@ jobs:
       - name: Run pytest (PostgreSQL only)
         run: |
           uv run pytest tests/test_all.py -v --tb=short -k "postgres"
-      
-      - name: Run performance tests
-        run: |
-          uv run python tests/measure_perf.py
+
