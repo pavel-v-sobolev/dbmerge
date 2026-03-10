@@ -17,9 +17,15 @@ jobs:
         with:
           enable-cache: true
       
-      - name: Install dependencies (SQLite CI)
+      - name: Set up Python
+        run: uv python install 3.12
+      
+      - name: Install MariaDB system libraries
+        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev
+      
+      - name: Install dependencies
         run: |
-          uv sync --extra ci-sqlite
+          uv sync --extra dev
       
       - name: Create data directory
         run: mkdir -p data
