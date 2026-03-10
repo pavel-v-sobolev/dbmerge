@@ -60,3 +60,8 @@ dev = [
     "twine",
     "build",
 ]
+
+ci-sqlite = [
+    "pandas>=2.0.1",
+    "pytest>=7.1.1",
+]

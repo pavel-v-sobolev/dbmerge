@@ -17,9 +17,9 @@ jobs:
         with:
           enable-cache: true
       
-      - name: Install dependencies
+      - name: Install dependencies (SQLite CI)
         run: |
-          uv sync --extra dev
+          uv sync --extra ci-sqlite
       
       - name: Create data directory
         run: mkdir -p data
