@@ -1,0 +1,58 @@
+name: Test PostgreSQL
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dbmerge
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      
+      - name: Set up Python
+        run: uv python install 3.13
+      
+      - name: Install PostgreSQL system libraries
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+      
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+      
+      - name: Create data directory
+        run: mkdir -p data
+      
+      - name: Initialize sample data
+        run: |
+          uv run python tests/sample_data_in_sqlite.py
+      
+      - name: Run pytest (PostgreSQL only)
+        run: |
+          uv run pytest tests/test_all.py -v --tb=short -k "postgres"
+      
+      - name: Run performance tests
+        run: |
+          uv run python tests/measure_perf.py
