@@ -21,7 +21,7 @@ logger.setLevel(level=logging.DEBUG)
 mssql_settings = urllib.parse.quote_plus(
                                         "DRIVER={ODBC Driver 18 for SQL Server};"
                                         "SERVER=localhost;"
-                                        "DATABASE=dbmerge;"
+                                        "DATABASE=master;"
                                         "UID=sa;"
                                         "PWD=MSSQL.test_pass;"
                                         "Encrypt=yes;"
@@ -30,7 +30,7 @@ mssql_settings = urllib.parse.quote_plus(
 
 engines = {'sqlite':"""sqlite:///data/data.sqlite""",
            'postgres':"""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge""",
-           'mariadb':"""mariadb+mariadbconnector://root:root@localhost:3306""",
+           'mariadb':"""mariadb+mariadbconnector://root:root@127.0.0.1:3306""",
            'mssql':f"mssql+pyodbc:///?odbc_connect={mssql_settings}"
            #'duckdb':create_engine('duckdb:///:memory:', poolclass=StaticPool),
            #'oracle':create_engine("oracle+oracledb://system:oracle@localhost/?service_name=XEPDB1")
