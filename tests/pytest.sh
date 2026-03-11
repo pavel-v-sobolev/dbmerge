@@ -1,0 +1,1 @@
+pytest -v -k "sqlite or postgres or mariadb"

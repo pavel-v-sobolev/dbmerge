@@ -19,7 +19,7 @@ It was tested with PostgreSQL, MariaDB, SQLite and MS SQL.
 # Main features:
 - Insert new rows, which dont exist in the target table.
 - Update rows, which exist in target table, but have different values. It is skipping update of rows which dont change the values.
-- It has various options for deletion of rows, which were not found in the source table, but exist in the target table. (Either keep, delete or mark with special boolean flag field).
+- It has various options for deletion of rows, which were not found in the source table, but exist in the target table. (Either do nothing or delete or mark with special boolean flag field).
 - It can handle data filtering in deletion part. E.g. handle subsets or period in the source data to check and delete/mark only inside this scope.
 - It handles creation of table or table columns, if they dont exist in the database.
 - It can use different data inputs: pandas DataFrame, list of dict or other database table or view.

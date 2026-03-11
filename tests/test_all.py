@@ -28,12 +28,12 @@ mssql_settings = urllib.parse.quote_plus(
                                         "TrustServerCertificate=yes;"
                                         )
 
-engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
-           'postgres':create_engine("""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge"""),
-           'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306"""),
+engines = {'sqlite':"""sqlite:///data/data.sqlite""",
+           'postgres':"""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge""",
+           'mariadb':"""mariadb+mariadbconnector://root:root@localhost:3306""",
+           'mssql':f"mssql+pyodbc:///?odbc_connect={mssql_settings}"
            #'duckdb':create_engine('duckdb:///:memory:', poolclass=StaticPool),
            #'oracle':create_engine("oracle+oracledb://system:oracle@localhost/?service_name=XEPDB1")
-           #'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={mssql_settings}",connect_args={"autocommit": False,"fast_executemany": True})
          }
 
 
@@ -54,7 +54,7 @@ def prepare_and_clean_data(engine):
                                                      for engine_name in engines for test_pandas in (True, False)])
 def test_table_create_from_data_with_various_types(engine_name,test_pandas):
     logger.debug('TEST TABLE CREATE FROM DATA WITH VARIOUS TYPES')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
     data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':None,'Price':1.1,'Data':{'a':1},'uuid':uuid.uuid4()},
@@ -76,7 +76,7 @@ def test_table_create_from_data_with_various_types(engine_name,test_pandas):
                                                      for engine_name in engines for test_pandas in (True, False)])
 def test_empty_data_updates(engine_name,test_pandas):
     logger.debug('TEST TABLE CREATE FROM DATA WITH VARIOUS TYPES')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
 
@@ -109,7 +109,7 @@ def test_empty_data_updates(engine_name,test_pandas):
                                                      for engine_name in engines])
 def test_case_sensitive_and_spaces(engine_name,test_pandas):
     logger.debug('TEST CASE SENSITIVE AND SPACES')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
     data_types = {'Shop':String(100),'Product':String(100),'Test Field':String(100)}
@@ -139,7 +139,7 @@ def test_case_sensitive_and_spaces(engine_name,test_pandas):
                                                      for engine_name in engines for test_pandas in (True, False)])
 def test_table_only_key_no_other_fields(engine_name,test_pandas):
     logger.debug('TEST ONLY KEY NO OTHER FIELDS')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
     data=[{'Shop':'123 ','Product':'123','Date':date(2025,1,1)},
@@ -164,7 +164,7 @@ def test_table_only_key_no_other_fields(engine_name,test_pandas):
                                                      for engine_name in engines for test_pandas in (True, False)])
 def test_insert_to_existing_table_and_test_new_field(engine_name,test_pandas):
     logger.debug('TEST INSERT TO EXISTING TABLE AND TEST NEW FIELD')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
     logger.debug('Create table from first merge')
@@ -194,7 +194,7 @@ def test_insert_to_existing_table_and_test_new_field(engine_name,test_pandas):
                                                      for engine_name in engines for test_pandas in (True, False)])
 def test_change_data_and_mark_deleted_data(engine_name,test_pandas):
     logger.debug("TEST CHANGE DATA AND DELETE DATA with delete_mode='mark'")
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
     data = get_data(limit=10001)
@@ -222,7 +222,7 @@ def test_change_data_and_mark_deleted_data(engine_name,test_pandas):
                                                      for engine_name in engines for test_pandas in (True, False)])
 def test_date_range_with_deletion(engine_name,test_pandas):
     logger.debug('TEST DATE RANGE WITH DELETION')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
     data = get_data(start_date=date(2025,1,1),end_date=date(2025,7,10))
@@ -249,7 +249,7 @@ def test_date_range_with_deletion(engine_name,test_pandas):
                                                      for engine_name in engines for test_pandas in (True, False)])
 def test_date_range_with_delete_mark(engine_name,test_pandas):
     logger.debug('TEST DATE RANGE WITH MISSING MARK')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
     data = get_data(start_date=date(2025,1,1),end_date=date(2025,7,10))
@@ -290,7 +290,7 @@ def test_date_range_with_delete_mark(engine_name,test_pandas):
                                                      for engine_name in engines for test_pandas in (True, False)])
 def test_a_set_from_temp_with_deletion(engine_name,test_pandas):
     logger.debug('TEST A SET FROM TEMP WITH DELETION')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
     data = get_data(limit=10000)
@@ -317,7 +317,7 @@ def test_a_set_from_temp_with_deletion(engine_name,test_pandas):
                                                      for engine_name in engines for test_pandas in (True, False)])               
 def test_update_from_source_table_with_delete_in_a_period(engine_name,test_pandas):
     logger.debug(f'TEST UPDATE FROM SOURCE TABLE WITH DELETE/UPDATE OF IN A SET {engine_name} {test_pandas}')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
     prepare_and_clean_data(engine)
 
     logger.debug('Create source table')
@@ -365,4 +365,4 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
 
 if __name__ == '__main__':
 
-    test_change_data_and_mark_deleted_data('postgres',True)
+    test_change_data_and_mark_deleted_data('mariadb',True)

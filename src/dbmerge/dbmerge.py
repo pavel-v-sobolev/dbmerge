@@ -40,6 +40,9 @@ logging.basicConfig()
 logger = logging.getLogger('dbmerge')
 logger.setLevel(logging.INFO)
 
+logging.getLogger("alembic").setLevel(logging.WARNING)
+
+
 class TableNotFoundError(RuntimeError):
     pass    
 
@@ -454,7 +457,7 @@ class dbmerge:
         self.conn.close()
 
     def _create_schema_if_not_exists(self,schema_name):
-        if self.conn.dialect.name not in ['sqlite','mariadb','mysql']:
+        if self.conn.dialect.name not in ['sqlite']:
             if not self.conn.dialect.has_schema(self.conn, schema_name):
                 if self.can_create_schemas:
                     logger.info(f"""Creating schema "{schema_name}".""")

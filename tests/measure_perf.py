@@ -29,9 +29,9 @@ mssql_settings = urllib.parse.quote_plus(
                                         "TrustServerCertificate=yes;"
                                         )
 
-engines = {'sqlite':create_engine("""sqlite:///data/data.sqlite"""),
-           'postgres':create_engine("""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge"""),
-           'mariadb':create_engine("""mariadb+mariadbconnector://root:root@localhost:3306"""),
+engines = {'sqlite':"""sqlite:///data/data.sqlite""",
+           'postgres':"""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge""",
+           'mariadb':"""mariadb+mariadbconnector://root:root@localhost:3306""",
            #'duckdb':create_engine('duckdb:///:memory:', poolclass=StaticPool)
            #'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={mssql_settings}",connect_args={"autocommit": False,"fast_executemany": True})
          }
@@ -48,7 +48,7 @@ def prepare_and_clean_data(engine):
 def measure_performance(engine_name,size):
 
     logger.debug(f'MEASURE PERFORMANCE {engine_name} {size}')
-    engine = engines[engine_name]
+    engine = create_engine(engines[engine_name])
 
     key = ['Shop','Product','Date']
     data_types = {'Shop':String(100),'Product':String(100)}

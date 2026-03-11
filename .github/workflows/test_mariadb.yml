@@ -1,0 +1,53 @@
+name: Test MariaDB
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test_mariadb:
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:10
+        env:
+          MARIADB_ROOT_PASSWORD: mariadb
+          MARIADB_DATABASE: dbmerge
+        options: >-
+          --health-cmd "mariadb-admin ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install DB system libraries
+        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev libpq-dev
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+
+      - name: Create data directory
+        run: mkdir -p data
+
+      - name: Initialize sample data
+        run: |
+          uv run python tests/sample_data_in_sqlite.py
+
+      - name: Run pytest (MariaDB only)
+        run: |
+          uv run pytest tests/test_all.py -v --tb=short -k "mariadb"
