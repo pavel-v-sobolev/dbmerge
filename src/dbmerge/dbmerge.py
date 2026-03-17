@@ -94,59 +94,44 @@ class dbmerge:
                  can_create_columns: bool = True,
                  can_create_schemas: bool = True):
         """
-        Init function performs preparation steps before merge.
-        - Check that target table is existing and create table if it does not exist.
-        - Check existing table fields and create missing fields according to given or detected data types.
-        - To make efficient merge the module creates a temporary table, which will be used in exec() method.
+        Init function prepares the database and internal structures before the merge operation.
+        
+        Key Preparation Steps:
+        - Verifies the existence of the target table and creates it if it does not exist.
+        - Inspects existing table fields and automatically creates missing columns based on the provided or auto-detected data types.
+        - Creates a temporary staging table to ensure the merge operation executes with optimal performance. The temporary table is safely dropped upon exiting the context.
 
-        Preferable way to do this is to use context:
-        E.g.:
-            with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
-                merge.exec()
+        Preferable usage (Context Manager):
+        ```python
+        with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
+            merge.exec()
+        ```
 
         Args:
-            engine (Engine): Database sqlalchemy engine. 
-                Module was tested with postgres, mariadb, sqlite. It should work with most of DBs, 
-                which support insert, update from select syntax and delete with where not exists syntax.
-            table_name (str): Target table name. This is where the data is merged.
-            data (list[dict] | pd.DataFrame | None, optional): Data to merge into the table.
-                It can be list of dict e.g. [{'column1':'value1','column2':'value2'},] 
-                or a pandas DataFrame.
-            delete_mode (Literal['no', 'delete', 'mark'], optional): 
-                Defines how to handle values, which exist in target table, 
-                but does not exist in data or source table.
-                - no - do nothing (default)
-                - delete - delete missing rows from target table
-                - mark - set deletion mark to True or 1 in the delete_mark_field.
-            delete_mark_field (str, optional): Field used for setting deletion status for record.
-                The field should be boolean or integer. 
-                When record is missing in the data or source table, it is set to True or 1.
-            merged_on_field (str | None, optional): Timestamp field name which is set to current datetime when the 
-                data is inserted/updated/marked.
-            inserted_on_field (str | None, optional): Timestamp field when the record was inserted. 
-                This field is not changed when data is updated or marked for deletion. 
-            skip_update_fields (list, optional): List of fields, that will be excluded from update. 
-                These fields will be written only when data is inserted.  
-            key (list | None, optional): List of key fields which will be used to compare source and target tables.
-                If key is not set, then table primary key will be used (recommended).
-                This field will be required if the table does not exist and it will be created automatically with this primary key.                 
-            data_types (dict[str,types.TypeEngine] | None, optional): A dictionary of data types. 
-                If the table or field is not existing in the database, then it will be used to assign a data type.
-                If data type for new field is not given here, then the module will try to auto detect the data type.
-            schema (str | None, optional): Database schema of target table. If it is None, then default schema will be used. 
-                E.g. public schema for postgres database is default in this case. 
-                Sqlite database does not support schamas, so this parameter will not work.
-            temp_schema (str | None, optional): Database schema where temporary tabe will be created. 
-            source_table_name (str | None, optional): If this parameter is set, 
-                then data will be taken from other database table or view.
-            source_schema (str | None, optional): Database schema of source table or view.
-            can_create_table (bool, optional): If True (default), then table and view will be created automatically.
-            can_create_columns (bool, optional): If True (default), then module will create missing columns in the database table.
-            can_create_schemas (bool, optional): If True (default), then module will automatically create target and temp schema, it they dont exist in DB.
+            engine (Engine): The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, and MS SQL.
+            table_name (str): The name of the target table where data will be merged.
+            data (list[dict] | pd.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries or a Pandas DataFrame.
+            delete_mode (Literal['no', 'delete', 'mark'], optional): Defines how to handle records that exist in the target table but are missing from the source data.
+                - 'no' (default): Retain existing target rows.
+                - 'delete': Hard delete rows from the target table.
+                - 'mark': Soft delete rows by setting a boolean/integer flag in `delete_mark_field`.
+            delete_mark_field (str, optional): The column name used to flag a record as deleted. Set to True or 1 when `delete_mode='mark'`.
+            merged_on_field (str | None, optional): Timestamp column automatically updated to current datetime when a row is inserted, updated, or marked.
+            inserted_on_field (str | None, optional): Timestamp column automatically set to current datetime when a new row is initially inserted.
+            skip_update_fields (list, optional): List of column names to exclude from the UPDATE operation.
+            key (list | None, optional): List of column names serving as the unique key to compare source and target tables. If omitted, uses the target table's Primary Key.
+            data_types (dict[str, types.TypeEngine] | None, optional): Dictionary mapping column names to SQLAlchemy data types. Used when creating missing tables or columns.
+            schema (str | None, optional): The database schema of the target table.
+            temp_schema (str | None, optional): The database schema where the temporary staging table will be created.
+            source_table_name (str | None, optional): If provided, data will be sourced directly from another existing database table or view.
+            source_schema (str | None, optional): The database schema of the source table or view.
+            can_create_table (bool, optional): Allows the module to automatically create the target table if it does not exist (default is True).
+            can_create_columns (bool, optional): Allows the module to append missing columns to the target table (default is True).
+            can_create_schemas (bool, optional): Allows the module to automatically create target and temp schema if they don't exist (default is True).
 
         Raises:
-            IncorrectParameter: Raised in several cases when arguments are not correct or missing required arguments.
-            TempTableAlreadyExists: Not realistic case when temp table already exist due to hash collision with parrelel process.
+            IncorrectParameter: Raised when arguments are not correct or missing.
+            TempTableAlreadyExists: Raised if a temporary table with the generated name already exists.
         """
         
 
@@ -331,31 +316,34 @@ class dbmerge:
     def exec(self, delete_condition: ColumnElement=None, source_condition: ColumnElement=None,
              commit_all_steps=True, chunk_size: int = 10000) -> mergeResult:
         """
-        This method executes the merge operation, which contains the following steps:
-        1) Insert source data to temporary table.
-        Further steps are done base on data in the temp table to merge data to the target table (table). 
-        2) Insert rows, missing in the target table.
-        3) Update rows, which exist in target table and which have different values (fields are compared).
-        4) Delete or mark as deleted (update deletion mark) for the fields, which dont exist in source data
+        Executes the merge operation. It returns a mergeResult class with statistical information.
 
-        If your data comes in portions then you can set a delete_condition argument to define your portion of data.
-        E.g. if you load monthly data you can call the method like this:
-            with dbmerge(data=data, engine=engine, table_name="YourTable",delete_mode='delete') as merge:
+        This method triggers the actual merge operation based on the configurations passed during initialization.
+        
+        Execution Workflow:
+        1) Inserts the source data into the temporary staging table.
+        2) Insert: Copies rows from the temporary table to the target table that do not currently exist.
+        3) Update: Updates existing rows in the target table where field values differ from the temporary table.
+        4) Delete / Mark: Deletes or marks rows in the target table that are entirely missing from the temporary staging data.
+
+        If your data comes in portions (e.g., monthly snapshots), you can set a delete_condition argument 
+        to restrict the deletion scope so that it only affects the relevant timeframe.
+        E.g.:
+            with dbmerge(data=data, engine=engine, table_name="YourTable", delete_mode='delete') as merge:
                 merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
 
         Args:
-            delete_condition (ColumnElement, optional): 
-                If missing mode is 'delete' or 'mark', then you can set a condition to filter the target table. 
-                It should be an SQL alchemy binary exporession, which will be used in the where condition of delete or mark deleted.
-            source_condition (ColumnElement, optional): If the data is loaded from source table or view, 
-                then you can set this parameter to use in the where() statement when selecting the data 
-                and inserting to temp table. 
-            commit_all_steps (bool, optional): If set to True (default), then all steps will be commited 
-                (insert to temp, insert to target, update, delete).     
-                If False, then commit will be done only after all is finished.
-            chunk_size (int, optional): When data (from list or dataframe) is inserted to temp table, 
-                it will be split in chunks. Defaults to 10000 rows per chunk.
+            delete_condition (ColumnElement, optional): An SQLAlchemy binary expression used in the WHERE clause 
+                during the delete/mark phase. Essential for chunked or partitioned data syncs.
+            source_condition (ColumnElement, optional): An SQLAlchemy binary expression used to filter the SELECT statement 
+                when loading data from a source_table_name.
+            commit_all_steps (bool, optional): If set to True (default), then every step (temp insert, target insert, update, delete) 
+                is committed immediately. If False, a single commit is issued after all steps complete successfully.
+            chunk_size (int, optional): Defines the batch size when inserting raw data (from Lists or Pandas DataFrames) 
+                into the temporary table to avoid memory/query-size limits. Defaults to 10000.
 
+        Returns:
+            mergeResult: A dataclass object containing execution statistics (e.g., inserted_row_count, total_time).
         """
         
         if self.merge_finished:
