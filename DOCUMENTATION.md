@@ -1,90 +1,98 @@
-# DBMerge Python Module Documentation
+# DBMerge API Documentation
 
-# dbmerge class 
-## init method
-Init function performs preparation steps before merge.
-- Check that target table is existing and create table if it does not exist.
-- Check existing table fields and create missing fields according to given or detected data types.
-- To make efficient merge the module creates a temporary table, which will be used in exec() method.
-\
-Preferable way to do this is to use context:\
-E.g.:
+The `dbmerge` module provides a simple, robust interface for merging data into SQL database tables. The core functionality is encapsulated within the `dbmerge` class, which is designed to be used as a context manager to ensure safe resource handling and connection closure.
 
+---
+
+## Class: `dbmerge`
+
+### Initialization: `__init__`
+
+The initialization method prepares the database and internal structures before the actual merge operation occurs. 
+
+**Key Preparation Steps:**
+1. Verifies the existence of the target table. If it does not exist, it is automatically created.
+2. Inspects existing table fields. Missing columns are automatically created based on the provided or auto-detected data types.
+3. Creates a temporary table to ensure the merge operation is executed with optimal performance. The temporary table is safely dropped when the context manager exits.
+
+**Recommended Usage (Context Manager):**
 ```python
+from dbmerge import dbmerge
+
 with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
     merge.exec()
-
 ```
 
-### Arguments
+#### Arguments
 
-- **engine** (Engine): Database sqlalchemy engine. Module was tested with postgres, mariadb, sqlite. It should work with most of DBs, which support insert, update from select syntax and delete with where not exists syntax.
-- **table_name** (str): Target table name. This is where the data is merged.
-- **data** (list[dict] | pd.DataFrame | None, optional): Data to merge into the table. It can be list of dict e.g. [{'column1':'value1','column2':'value2'},] or a pandas DataFrame.
-- **delete_mode** (Literal['no', 'delete', 'mark'], optional): Defines how to handle values, which exist in target table, but does not exist in data or source table.
-    - no - do nothing (default)
-    - delete - delete rows from target table, that are missing in the source data
-    - mark - set deletion mark to True or 1 in the delete_mark_field.
-- **delete_mark_field** (str, optional): Field used for setting deletion status for record. The field should be boolean or integer. When record is missing in the data or source table, it is set to True or 1.
-- **merged_on_field** (str | None, optional): Timestamp field name which is set to current datetime when the data is inserted/updated/marked.
-- **inserted_on_field** (str | None, optional): Timestamp field when the record was inserted. This field is not changed when data is updated or marked for deletion. 
-- **skip_update_fields** (list, optional): List of fields, that will be excluded from update. These fields will be written only when data is inserted.
-- **key** (list | None, optional): List of key fields which will be used to compare source and target tables. If key is not set, then table primary key will be used (recommended). This field will be required if the table does not exist and it will be created automatically with this primary key.                 
-- **data_types** (dict[str,types.TypeEngine] | None, optional): A dictionary of data types. If the table or field is not existing in the database, then it will be used to assign a data type. If data type for new field is not given here, then the module will try to auto detect the data type.
-- **schema** (str | None, optional): Database schema of target table. If it is None, then default schema will be used. E.g. public schema for postgres database is default in this case. Sqlite database does not support schamas, so this parameter will be ignored.
-- **temp_schema** (str | None, optional): Database schema where temporary tabe will be created. 
-- **source_table_name** (str | None, optional): If this parameter is set, then data will be taken from other database table or view.
-- **source_schema** (str | None, optional): Database schema of source table or view.
-- **can_create_table** (bool, optional): If True (default), then table and view will be created automatically.
-- **can_create_columns** (bool, optional): If True (default), then module will create missing columns in the database table.
+- **`engine`** *(sqlalchemy.engine.Engine)*: The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, and MS SQL.
+- **`table_name`** *(str)*: The name of the target table where data will be merged.
+- **`data`** *(list[dict] | pd.DataFrame | None, optional)*: The source data to merge. Accepts a list of dictionaries (e.g., `[{'col1': 'val1'}, ...]`) or a Pandas DataFrame.
+- **`delete_mode`** *(Literal['no', 'delete', 'mark'], optional)*: Defines how to handle records that exist in the target table but are missing from the source data. 
+  - `'no'` (default): Retain existing target rows (do nothing).
+  - `'delete'`: Hard delete rows from the target table.
+  - `'mark'`: Soft delete rows by setting a boolean/integer flag in `delete_mark_field`.
+- **`delete_mark_field`** *(str, optional)*: The column name used to flag a record as deleted (must be boolean or integer). Set to `True` or `1` when `delete_mode='mark'`.
+- **`merged_on_field`** *(str | None, optional)*: The name of a timestamp column. Automatically updated to the current datetime whenever a row is inserted, updated, or marked as deleted.
+- **`inserted_on_field`** *(str | None, optional)*: The name of a timestamp column. Automatically set to the current datetime when a new row is initially inserted. It is ignored during updates or deletions.
+- **`skip_update_fields`** *(list, optional)*: A list of column names to exclude from the `UPDATE` operation. These fields will only be written during the initial `INSERT`.
+- **`key`** *(list | None, optional)*: A list of column names serving as the unique key to compare source and target tables. If omitted, the module attempts to use the target table's Primary Key. *Note: If the table does not exist yet, this parameter is required to create the Primary Key.*
+- **`data_types`** *(dict[str, types.TypeEngine] | None, optional)*: A dictionary mapping column names to SQLAlchemy data types (e.g., `{'Name': String(100)}`). Used when creating missing tables or columns. If omitted, data types are auto-detected from the source data.
+- **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite.
+- **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created.
+- **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory (`data` parameter is ignored).
+- **`source_schema`** *(str | None, optional)*: The database schema of the source table or view.
+- **`can_create_table`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target table if it does not exist.
+- **`can_create_columns`** *(bool, optional)*: Defaults to `True`. Allows the module to append missing columns to the target table.
+- **`can_create_schemas`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target schema in the database if it does not exist.
 
-### Attributes
-These attributes will be available after init dbmerge object is initialized.
-- **table** - SQLAlchemy Table object for your target table. If it does not exist, then it will be automatically created during initialization.
-- **temp_table** - SQLAlchemy Table object for temporary table. This table is created during init and will we deleted after exec method will be finished (or if leaving the with block).
-- **source_table** - SQLAlchemy Table object for source table, if you are doing merge operation from source table.
+#### Instance Attributes (Available after initialization)
+- **`table`**: The SQLAlchemy `Table` object representing your target table.
+- **`temp_table`**: The SQLAlchemy `Table` object representing the temporary staging table.
+- **`source_table`**: The SQLAlchemy `Table` object representing the source table (only populated if `source_table_name` was provided).
 
+---
 
+### Execution: `exec()`
 
-## exec method
-Method executes the merge operation. It returns mergeResult class with statistical information.
+This method triggers the actual merge operation based on the configurations passed during initialization.
 
-This method includes the following steps:
-1) Insert source data to temporary table.
-Further steps are done base on data in the temp table to merge data to the target table (table). 
-2) Insert rows, missing in the target table.
-3) Update rows, which exist in target table and which have different values (fields are compared).
-4) Delete or mark as deleted (update deletion mark) for the fields, which dont exist in source data
+**Execution Workflow:**
+1. Inserts the source data into the temporary staging table.
+2. **Insert:** Copies rows from the temporary table to the target table that do not currently exist.
+3. **Update:** Updates existing rows in the target table where field values differ from the temporary table.
+4. **Delete / Mark:** Deletes or marks rows in the target table that are entirely missing from the temporary staging data.
 
-
-
-If your data comes in portions then you can set a delete_condition argument to define your portion of data.
-E.g. if you load monthly data you can call the method like this:
+**Scoped Deletion Example:**
+If you load data in chunks (e.g., monthly snapshots), you can restrict the deletion scope using the `delete_condition` argument so that it only affects the relevant timeframe.
 
 ```python
-with dbmerge(data=data, engine=engine, table_name="YourTable",delete_mode='delete') as merge:
-    result = merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
+from datetime import date
 
+with dbmerge(data=data, engine=engine, table_name="YourTable", delete_mode='delete') as merge:
+    # Restrict deletion scope to January 2025
+    condition = merge.table.c['Date'].between(date(2025, 1, 1), date(2025, 1, 31))
+    result = merge.exec(delete_condition=condition)
 ```
 
-### Arguments
-- **delete_condition** (ColumnElement, optional) - If delete mode is 'delete' or 'mark', then you can set a condition to filter the target table. It should be an SQL alchemy binary exporession, which will be used in the where condition of delete or mark deleted.
-- **source_condition** (ColumnElement, optional): If the data is loaded from source table or view, then you can set this parameter to use in the where() statement when selecting the data and inserting to temp table. 
-- **commit_all_steps** (bool, optional): If set to True (default), then all steps will be commited (insert to temp, insert to target, update, delete). If False, then commit will be done only after all is finished.
-- **chunk_size** (int, optional): When data (from list or dataframe) is inserted to temp table, it will be split in chunks. Defaults to 10000 rows per chunk.
+#### Arguments
+- **`delete_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used in the `WHERE` clause during the delete/mark phase. Essential for chunked or partitioned data syncs.
+- **`source_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used to filter the `SELECT` statement when loading data from a `source_table_name`.
+- **`commit_all_steps`** *(bool, optional)*: Defaults to `True`. If `True`, every step (temp insert, target insert, update, delete) is committed immediately. If `False`, a single commit is issued after all steps complete successfully.
+- **`chunk_size`** *(int, optional)*: Defaults to `10000`. Defines the batch size when inserting raw data (from Lists or Pandas DataFrames) into the temporary table to avoid memory/query-size limits.
 
-### Attributes
-These attributes will be available after exec method is finished
-- **count_data** - number of rows in your data
-- **inserted_row_count** - number of rows that were inserted into the target table 
-- **updated_row_count** - number of rows that were updated in the target table
-- **deleted_row_count** - number of rows that were deleted or marked as deleted with using delete_mark_field.
-- **total_time** - total time in seconds for all database operations. insert to temp, insert to target, update, delete (or mark)
-- **data_insert_time** - time in seconds for inserting data to temporary table
-- **insert_time** - time in seconds for inserting data to target table
-- **update_time** - time in seconds for updating data, which dont match the data in the target table
-- **delete_time** - time in seconds for deleting data or marking as deleted.
-- **insert_sql** - SQL statement that was issued to the database when inserting data to target table.
-- **update_sql** - SQL statement that was issued to the database when updating data.
-- **delete_sql** - SQL statement that was issued to the database when deleting data or marking data as deleted.
+#### Execution Results & Statistics
+After `exec()` completes, the returned result object (or the `dbmerge` instance) exposes the following statistical attributes:
 
+- **`count_data`**: Total number of rows processed from the source data.
+- **`inserted_row_count`**: Number of new rows inserted into the target table.
+- **`updated_row_count`**: Number of existing rows successfully updated.
+- **`deleted_row_count`**: Number of rows deleted (or flagged as deleted).
+- **`total_time`**: Total execution time (in seconds) for the entire database operation.
+- **`data_insert_time`**: Time taken (in seconds) to load data into the temporary table.
+- **`insert_time`**: Time taken (in seconds) to perform the target `INSERT` step.
+- **`update_time`**: Time taken (in seconds) to perform the target `UPDATE` step.
+- **`delete_time`**: Time taken (in seconds) to perform the `DELETE` or `MARK` step.
+- **`insert_sql`**: The exact SQL `INSERT` statement executed against the database.
+- **`update_sql`**: The exact SQL `UPDATE` statement executed against the database.
+- **`delete_sql`**: The exact SQL `DELETE` (or mark) statement executed against the database.

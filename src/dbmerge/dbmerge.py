@@ -323,6 +323,7 @@ class dbmerge:
         except Exception as e:
             if hasattr(self, 'conn'):
                 self.conn.rollback()
+                self.conn.close()
             raise
 
 
@@ -440,7 +441,8 @@ class dbmerge:
 
         finally:
             self._drop_temp_table()
-            self.conn.close()
+            if hasattr(self, 'conn'):
+                self.conn.close()
             self.merge_finished = True
 
 
@@ -450,11 +452,13 @@ class dbmerge:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self._drop_temp_table()
-        self.conn.close()
+        if hasattr(self, 'conn'):
+            self.conn.close()
 
     def __del__(self):
         self._drop_temp_table()
-        self.conn.close()
+        if hasattr(self, 'conn'):
+            self.conn.close()
 
     def _create_schema_if_not_exists(self,schema_name):
         if self.conn.dialect.name not in ['sqlite']:
