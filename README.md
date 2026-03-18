@@ -5,7 +5,7 @@
 
 [![PostgreSQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml) [![MariaDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml) [![SQLite](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml) [![MS SQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml)
 
-**DBMerge** is a Python library that provides a simplified, database-agnostic interface for performing `UPSERT` (Insert/Update/Delete) operations. Built on top of SQLAlchemy, it abstracts away the complexities of writing engine-specific SQL `MERGE` or `ON CONFLICT` statements.
+**DBMerge** is a Python library that provides a simplified interface for performing `UPSERT` (Insert/Update/Delete) operations. Built on top of SQLAlchemy, it abstracts away the complexities of writing engine-specific SQL `MERGE` or `ON CONFLICT` statements.
 
 ## Overview
 
@@ -67,6 +67,21 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 - **Smart Deletion:** Supports scoped deletion. You can pass a SQLAlchemy logical expression to delete missing data only within a specific timeframe or subset (e.g., updating only a single month).
 - **Auto-Schema Management:** Automatically creates missing tables or columns in the database.
 - **Audit:** Optional parameters to automatically add `merged_on` and `inserted_on` timestamps to track when rows were created or modified.
+
+
+## Benchmark
+
+Below is a performance comparison for synchronizing data using DBMerge for different databases.
+
+| Database | DBMerge (100k rows) | DBMerge (1mil rows) |
+|----------|-----------------------------|---------------------|
+| PostgreSQL | 2.0s | 19.8s |
+| MySQL / MariaDB | 1.0s | 11.1s |
+| SQLite | 0.7s | 7.6s |
+| MS SQL Server | 22.4s | 4m 23s |
+
+*\* Disclaimer: Benchmarks measured on a local laptop. Your actual results may vary based on hardware and setup.*
+
 
 ## Database-Specific Notes & Limitations
 
