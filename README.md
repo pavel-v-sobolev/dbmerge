@@ -71,16 +71,18 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 
 ## Benchmark
 
-Below is a performance comparison for synchronizing data using DBMerge for different databases.
+DBMerge handles the entire reconciliation process (staging, comparing, updating, inserting) with solid performance, scaling well even for larger datasets.
+
+Here is a rough performance comparison for synchronizing data of different sizes using DBMerge (measured on a standard developer laptop):
 
 | Database | DBMerge (100k rows) | DBMerge (1mil rows) |
-|----------|-----------------------------|---------------------|
-| PostgreSQL | 2.0s | 19.8s |
-| MySQL / MariaDB | 1.0s | 11.1s |
-| SQLite | 0.7s | 7.6s |
-| MS SQL Server | 22.4s | 4m 23s |
+|----------|---------------------|---------------------|
+| **PostgreSQL** | ~2.0s | ~19.8s |
+| **MySQL / MariaDB** | ~1.0s | ~11.1s |
+| **SQLite** | ~0.7s | ~7.6s |
+| **MS SQL Server*** | ~22.4s | ~4m 23s |
 
-*\* Disclaimer: Benchmarks measured on a local laptop. Your actual results may vary based on hardware and setup.*
+*\* Note: MS SQL Server bulk operations take longer due to inherent limitations in the `pyodbc` driver*
 
 
 ## Database-Specific Notes & Limitations
