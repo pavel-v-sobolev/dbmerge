@@ -4,9 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbmerge"
-version = "1.0.12"
-description = "DBMerge is a Python library that provides a simplified interface for performing `UPSERT` (Insert/Update/Delete) operations. Built on top of SQLAlchemy, it abstracts away the complexities of writing engine-specific SQL `MERGE` or `ON CONFLICT` statements."
-keywords = ["upsert", "merge", "synchronization", "etl", "sqlalchemy", "database-sync"]
+version = "1.0.13"
+description = "A database-agnostic Python library for simple and fast UPSERT (Insert/Update/Delete) operations via SQLAlchemy."
+
+keywords = [
+    "sql","database","etl","upsert","merge","sqlalchemy","pandas","data-engineering","synchronization","database-sync",
+    "postgres","mysql","sqlite"
+]
+
 authors = [
   { name="Pavel Sobolev", email="pavel-v-sobolev@yandex.ru" },
 ]
