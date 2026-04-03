@@ -31,9 +31,10 @@ mssql_settings = urllib.parse.quote_plus(
 engines = {'sqlite':"""sqlite:///data/data.sqlite""",
            'postgres':"""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge""",
            'mariadb':"""mariadb+mariadbconnector://root:root@127.0.0.1:3306""",
-           'mssql':f"mssql+pyodbc:///?odbc_connect={mssql_settings}"
-           #'duckdb':create_engine('duckdb:///:memory:', poolclass=StaticPool),
-           #'oracle':create_engine("oracle+oracledb://system:oracle@localhost/?service_name=XEPDB1")
+           'mssql':f"mssql+pyodbc:///?odbc_connect={mssql_settings}",
+           #'duckdb':'duckdb:///:memory:',
+           #'duckdb':'duckdb:///data/data.ddb'
+           #'oracle':"oracle+oracledb://system:oracle@localhost/?service_name=XEPDB1"
          }
 
 
@@ -365,4 +366,4 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,test_panda
 
 if __name__ == '__main__':
 
-    test_change_data_and_mark_deleted_data('mariadb',True)
+    test_insert_to_existing_table_and_test_new_field('duckdb',True)

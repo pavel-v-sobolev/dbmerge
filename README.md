@@ -7,7 +7,7 @@
 </p>
 
 **DBMerge** is a Python library that provides a simplified interface for performing `UPSERT` (Insert/Update/Delete) operations. \
-Built on top of SQLAlchemy, it abstracts away the complexities of writing engine-specific SQL `MERGE` or `ON CONFLICT` statements.
+Built on top of SQLAlchemy, it abstracts away engine-specific SQL `MERGE` or `ON CONFLICT` statements.
 
 [![PyPI version](https://img.shields.io/pypi/v/dbmerge.svg)](https://pypi.org/project/dbmerge/)
 [![Python versions](https://img.shields.io/pypi/pyversions/dbmerge.svg)](https://pypi.org/project/dbmerge/)
@@ -15,8 +15,12 @@ Built on top of SQLAlchemy, it abstracts away the complexities of writing engine
 [![PostgreSQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml) [![MariaDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml) [![SQLite](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml) [![MS SQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml)
 
 
-
 ## Overview
+**Common problems solved**
+
+- **Efficient bulk upsert with conflict resolution** - Insert or update records in bulk without writing complex SQL. DBMerge automatically handles primary key conflicts: existing rows are updated, new rows are inserted.
+- **Update rows only when values change** - Automatically compares source data against the target table and skips writes for unchanged rows, reducing database load and I/O.
+- **Materialize complex views** - Persist results of heavy computations to a physical table for fast querying, supporting also partial data updates.
 
 **DBMerge accepts multiple data sources as input:**
 - Pandas DataFrames
@@ -76,6 +80,7 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 - **Smart Deletion:** Supports scoped deletion. You can pass a SQLAlchemy logical expression to delete missing data only within a specific timeframe or subset (e.g., updating only a single month).
 - **Auto-Schema Management:** Automatically creates missing tables or columns in the database.
 - **Audit:** Optional parameters to automatically add `merged_on` and `inserted_on` timestamps to track when rows were created or modified.
+- **Statistics:** Measures number of updated/inserted/deleted rows, total time and time for each operation step.
 
 
 ## Benchmark
