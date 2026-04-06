@@ -1,0 +1,17 @@
+services:
+  mssql-express:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql-express
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "MSSQL.test_pass"  # Must meet complexity requirements
+      MSSQL_PID: "Express"                      # This enables Express Edition
+    ports:
+      - "1433:1433" 
+    volumes:
+      - mssql_data:/var/opt/mssql
+    restart: unless-stopped
+
+volumes:
+  mssql_data:
+

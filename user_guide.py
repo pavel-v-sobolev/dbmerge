@@ -55,7 +55,7 @@ data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':2,'Price':50.10}
       {'Shop':'123','Product':'125','Date':date(2025,2,1),'Qty':13,'Price':70.10}]
 with dbmerge(engine=engine, data=data, table_name="Facts", 
              delete_mode='delete', merged_on_field='Merged On') as merge:
-      # Lets create missing condition so that in checks that value of Shop in the target table
+      # Lets create delete condition so that in checks that value of Shop in the target table
       # is in values in the temp_table.
       # This means, that deletion will be only done for shops, loaded in the data.
       merge.exec(delete_condition=merge.table.c['Shop'].in_(select(merge.temp_table.c['Shop'])))
@@ -72,7 +72,7 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 with dbmerge(engine=engine, table_name="Facts_latest", source_table_name='Facts',
              delete_mode='delete', key=key, data_types=data_types, merged_on_field='Merged On') as merge:
     # Select only 2025-02 data froum your source table
-    # Apply missing condition to target table, just in case some data need to be deleted.
+    # Apply delete condition to target table, just in case some data need to be deleted.
     merge.exec(source_condition=merge.source_table.c['Date'].between(date(2025,2,1),date(2025,2,28)),
                delete_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))
 

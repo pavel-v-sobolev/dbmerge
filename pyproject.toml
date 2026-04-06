@@ -64,4 +64,5 @@ dev = [
     "pyodbc",
     "twine",
     "build",
+    "ydb-sqlalchemy"
 ]
