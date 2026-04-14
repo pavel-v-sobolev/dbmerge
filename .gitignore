@@ -4,7 +4,11 @@ __pycache__/
 *$py.class
 
 data
+ydb_certs
+ydb_data
+
 .vscode
+.qwen
 
 # C extensions
 *.so

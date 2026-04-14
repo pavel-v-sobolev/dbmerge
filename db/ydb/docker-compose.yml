@@ -10,7 +10,7 @@ services:
     environment:
       - YDB_ANONYMOUS_CREDENTIALS=true
       - YDB_USE_IN_MEMORY_PDISKS=true
-#    volumes:
-#      - ./ydb_certs:/ydb_certs
-#      - ./ydb_data:/ydb_data
+    volumes:
+      - ./ydb_certs:/ydb_certs
+      - ./ydb_data:/ydb_data
 
