@@ -7,13 +7,15 @@ DBMerge requires a non-null unique key (preferable primary key) to compare data 
 """
 
 from __future__ import annotations
-from typing import Literal,Any,TYPE_CHECKING
+from typing import Literal, Any, TYPE_CHECKING
 
 import uuid
 import time
 
 if TYPE_CHECKING:
-    from pandas import DataFrame
+    from pandas import DataFrame as PandasDataFrame
+    from polars import DataFrame as PolarsDataFrame
+
 
 try:
     import pandas as pd
@@ -23,18 +25,57 @@ except ImportError:
     pd = None
     HAS_PANDAS = False
 
+try:
+    import polars as pl
+    HAS_POLARS = True
+except ImportError:
+    pl = None
+    HAS_POLARS = False
+
 import logging
 from datetime import datetime, date
+from dataclasses import dataclass
 
 from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
-from sqlalchemy import String, BigInteger, Numeric, Boolean, DateTime, Date, JSON, Uuid
+from sqlalchemy import String, BigInteger, Numeric, Boolean, DateTime, Date, Time, JSON, Uuid, LargeBinary
 from sqlalchemy import types, dialects, func, text, schema
 
+POLARS_TO_SQLALCHEMY_TYPE_MAP = {
+    'Int8': BigInteger(),
+    'Int16': BigInteger(),
+    'Int32': BigInteger(),
+    'Int64': BigInteger(),
+    'Int128': BigInteger(),
+    'UInt8': BigInteger(),
+    'UInt16': BigInteger(),
+    'UInt32': BigInteger(),
+    'UInt64': BigInteger(),
+    'UInt128': BigInteger(),
+    'Float16': Numeric(),
+    'Float32': Numeric(),
+    'Float64': Numeric(),
+    'Decimal': Numeric(),
+    'Boolean': Boolean(),
+    'Utf8': String(),
+    'String': String(),
+    'Categorical': String(),
+    'Categories': String(),
+    'Enum': String(),
+    'Binary': LargeBinary(),
+    'Date': Date(),
+    'Datetime': DateTime(),
+    'Time': Time(),
+    'Duration': String(),
+    'List': JSON(),
+    'Struct': JSON(),
+    'Array': JSON(),
+    'Object': JSON(),
+    'Null': String(),
+    'Unknown': String(),
+    'Extension': JSON(),
+}
 
-
-
-from dataclasses import dataclass
 
 logging.basicConfig()
 logger = logging.getLogger('dbmerge')
@@ -61,6 +102,7 @@ class TempTableAlreadyExists(RuntimeError):
 # Maximum rows to check when detecting column type until non null value is found
 MAX_TYPE_DETECTION_ROWS = 10000 
 
+
 @dataclass
 class mergeResult:
     total_row_count: int
@@ -78,7 +120,7 @@ class dbmerge:
     def __init__(self,
                  engine: Engine, 
                  table_name: str, 
-                 data: list[dict[str,Any]] | DataFrame | None = None,
+                 data: list[dict[str,Any]] | PandasDataFrame | PolarsDataFrame | None = None,
                  delete_mode: Literal['no', 'delete', 'mark']='no',
                  delete_mark_field: str = None,
                  merged_on_field: str | None = None,
@@ -110,7 +152,7 @@ class dbmerge:
         Args:
             engine (Engine): The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, and MS SQL.
             table_name (str): The name of the target table where data will be merged.
-            data (list[dict] | pd.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries or a Pandas DataFrame.
+            data (list[dict] | pd.DataFrame | pl.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries or a Pandas/Polars DataFrame.
             delete_mode (Literal['no', 'delete', 'mark'], optional): Defines how to handle records that exist in the target table but are missing from the source data.
                 - 'no' (default): Retain existing target rows.
                 - 'delete': Hard delete rows from the target table.
@@ -144,11 +186,25 @@ class dbmerge:
 
             self.schema = schema
             self.temp_schema = temp_schema
+
+            self.source_table_name = source_table_name
             self.source_schema = source_schema
             self.source_table = None
             self.can_create_columns = can_create_columns
             self.can_create_table = can_create_table
             self.can_create_schemas = can_create_schemas
+
+            self.inspector = inspect(self.engine)
+            self.metadata = MetaData()
+
+            if dialect_name in ('mysql','mariadb'):
+                if self.schema is None:
+                    raise IncorrectParameter(f"""MariaDB/MySQL require "schema" argument to be set to your database name.""")
+                if self.temp_schema is None:
+                    self.temp_schema = self.schema
+                if self.source_schema is None and self.source_table_name is not None:
+                    raise IncorrectParameter(f"""MariaDB/MySQL require "source_schema" argument to be set 
+                                             to your database name, corresponding to your "source_table".""")
 
             if dialect_name in ['sqlite']:
                 if schema is not None:
@@ -178,8 +234,6 @@ class dbmerge:
             self.insert_sql = ''
             self.update_sql = ''
             self.delete_sql = ''
-
-            self.source_table_name = source_table_name
             
             self.skip_update_fields = skip_update_fields if skip_update_fields is not None else []
             
@@ -209,10 +263,6 @@ class dbmerge:
             self.table = None
             self.data_fields = {}
             self.new_fields = {}
-
-            
-            self.inspector = inspect(self.engine)
-            self.metadata = MetaData()
 
             self.delete_mode = delete_mode
 
@@ -277,8 +327,25 @@ class dbmerge:
                 else:
                     self._get_fields_from_pandas()
 
+            elif HAS_POLARS and isinstance(self.data,pl.DataFrame):
+                self.type_of_data = 'polars'
+                self.total_row_count = len(self.data)
+                if self.total_row_count==0:
+                    if len(self.data.columns)==0:
+                        if self.table is None:
+                            raise IncorrectDataError(f'Input DataFrame is empty and table "{self.table_full_name}" does not exist.')
+                        else:
+                            logger.warning('No data, empty dataframe with empty columns')
+                            self._get_fields_from_table()
+                    else:
+                        logger.warning('No data, empty dataframe')
+                        self._get_fields_from_polars()
+
+                else:
+                    self._get_fields_from_polars()
+
             else:
-                raise IncorrectDataError(f'Input "data" should be pandas DataFrame or list of dict')
+                raise IncorrectDataError(f'Input "data" should be pandas/polars DataFrame or list of dict')
 
             self._check_existing_and_new_fields()
             self._check_key()
@@ -287,7 +354,7 @@ class dbmerge:
                 if can_create_table:
                     logger.info(f'Table "{self.table_full_name}" does not exist. Creating.')
                     self._check_given_types()    
-                    if self.type_of_data in ['list of dict','pandas']: #data types from source table are already known
+                    if self.type_of_data in ['list of dict','pandas','polars']: #data types from source table are already known
                         self._detect_missing_data_types()
                     self._create_table()
                 else:
@@ -347,7 +414,7 @@ class dbmerge:
         """
         
         if self.merge_finished:
-            raise IncorrectParameter(f'Merge exec already finished of table {self.table_full_name}')
+            raise IncorrectParameter(f'Merge exec already finished on table {self.table_full_name}')
 
         if delete_condition is not None:
             if not isinstance(delete_condition,ColumnElement):
@@ -473,6 +540,14 @@ class dbmerge:
     def _get_fields_from_pandas(self):
         self.data_fields = {c:None for c in self.data.columns if c not in self.special_fields}
 
+    def _get_fields_from_polars(self):
+        self.data_fields = {}
+        for c,t in self.data.schema.items():
+            if c not in self.special_fields:
+                if str(t) in POLARS_TO_SQLALCHEMY_TYPE_MAP.keys():
+                    self.data_fields[c] = POLARS_TO_SQLALCHEMY_TYPE_MAP[str(t)]
+        
+
     def _get_fields_from_table(self):
         self.data_fields = {c.name:c.type for c in self.table.c if c not in self.special_fields}
 
@@ -526,10 +601,15 @@ class dbmerge:
 
         not_given_data_types = [f for f in self.new_fields if self.new_fields[f] is None]
 
+        if len(not_given_data_types) == 0:
+            return
+        
         if self.type_of_data == 'list of dict':
             test_data = self.data[:self.max_type_detection_rows]
         elif self.type_of_data == 'pandas':
-            test_data = self.data.loc[:self.max_type_detection_rows].to_dict(orient='records')
+            test_data = self.data.iloc[:self.max_type_detection_rows].to_dict(orient='records')
+        elif self.type_of_data == 'polars':
+            test_data = self.data.slice(0,self.max_type_detection_rows).to_dicts()
         else:
             return
 
@@ -542,21 +622,24 @@ class dbmerge:
                 for f in not_given_data_types:
                     #Check if this field was already detected
                     if self.new_fields.get(f) is None:
-                        if isinstance(test_row[f],int):
+                        # bool should be before int, 
+                        # because boolean vars are also detected as int in python isinstance check 
+                        if isinstance(test_row[f],bool):
+                            self.new_fields[f] = Boolean()
+                        elif isinstance(test_row[f],int):
                             self.new_fields[f] = BigInteger()
                         elif isinstance(test_row[f],float):
                             self.new_fields[f] = Numeric()
                         elif isinstance(test_row[f],str):
                             self.new_fields[f] = String()
-                        elif isinstance(test_row[f],bool):
-                            self.new_fields[f] = Boolean()
-                        elif isinstance(test_row[f],date):
-                            self.new_fields[f] = Date()
+                        # datetime should be before date, becuase datetime is also detected as date
                         elif isinstance(test_row[f],datetime):
                             if test_row[f].tzinfo is None:
                                 self.new_fields[f] = DateTime()
                             else:
                                 self.new_fields[f] = DateTime(timezone=True)
+                        elif isinstance(test_row[f],date):
+                            self.new_fields[f] = Date()
                         elif isinstance(test_row[f],list) or isinstance(test_row[f],dict) or \
                             isinstance(test_row[f],tuple):
                             if self.engine.dialect.name == 'postgresql':
@@ -825,22 +908,27 @@ class dbmerge:
     def _create_temp_table(self):
         
         temp_table_name = self.table_name + '_' + self.unique_id
-        table_exists = self.inspector.has_table(temp_table_name, self.temp_schema)
-        if table_exists:
-            raise TempTableAlreadyExists(f'Temp table "{temp_table_name}" already exists in schema "{self.temp_schema}"')
 
         cols = [Column(c.name, c.type, primary_key = c.name in self.key) for c in self.table.c]
 
-        self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema)
-        self.temp_table.create(self.engine, checkfirst=True)
-
-        # set unlogged for postgresql
-        if self.engine.dialect.name == 'postgresql':
-            if self.temp_schema is None:
-                SQL = f"""ALTER TABLE "{temp_table_name}" SET UNLOGGED;"""
-            else:
-                SQL = f"""ALTER TABLE "{self.temp_schema}"."{temp_table_name}" SET UNLOGGED;"""
-            self.conn.execute(text(SQL))
+        if self.engine.dialect.name =='postgresql':
+            self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
+                                    prefixes=['UNLOGGED'])
+            # postgresql_on_commit='PRESERVE ROWS' should be used for TEMP table, 
+            # but looks like UNLOGGED is performing better then TEMP
+            self.temp_table.create(bind=self.conn)
+        
+        elif self.engine.dialect.name in ('mariadb','mysql','sqlite'):
+            self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
+                                    prefixes=['TEMPORARY'])
+            self.temp_table.create(bind=self.conn)
+        
+        else:
+            table_exists = self.inspector.has_table(temp_table_name, self.temp_schema)
+            if table_exists:
+                raise TempTableAlreadyExists(f'Temp table "{temp_table_name}" already exists in schema "{self.temp_schema}"')
+            self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema)
+            self.temp_table.create(bind=self.conn, checkfirst=True)
 
         self.conn.commit()        
  
@@ -863,6 +951,9 @@ class dbmerge:
                     data_slice = self.data.iloc[begin:end]
                     data_slice = data_slice.replace({np.nan: None})    
                     data_slice = data_slice.to_dict(orient='records')
+                elif self.type_of_data == 'polars':
+                    data_slice = self.data.slice(begin,self.chunk_size)   
+                    data_slice = data_slice.to_dicts()
                 else:
                     return
                     

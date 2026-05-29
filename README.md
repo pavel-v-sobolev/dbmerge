@@ -23,7 +23,7 @@ Built on top of SQLAlchemy, it abstracts away engine-specific SQL `MERGE` or `ON
 - **Materialize complex views** - Persist results of heavy computations to a physical table for fast querying, supporting also partial data updates.
 
 **DBMerge accepts multiple data sources as input:**
-- Pandas DataFrame
+- Pandas/Polars DataFrame
 - Lists of dictionaries
 - Database table or view
 

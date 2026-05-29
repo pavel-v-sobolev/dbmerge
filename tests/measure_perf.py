@@ -9,7 +9,7 @@ import logging
 from sqlalchemy import create_engine,text,select,schema,StaticPool
 from sqlalchemy import Table, MetaData, Column, String, Date, Integer, Numeric, JSON, Uuid
 
-from sample_data_in_pg import get_data, get_modified_data
+from sample_data_in_sqlite import get_data, get_modified_data
 import urllib
 from dbmerge import dbmerge, drop_table_if_exists, format_ms
 

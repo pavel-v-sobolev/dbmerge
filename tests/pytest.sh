@@ -1,1 +1,1 @@
-pytest -v -k "sqlite or postgres or mariadb"
+pytest tests/test_all.py -v -k "sqlite or postgres or mariadb"

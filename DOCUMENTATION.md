@@ -27,7 +27,7 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 
 - **`engine`** *(sqlalchemy.engine.Engine)*: The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, and MS SQL.
 - **`table_name`** *(str)*: The name of the target table where data will be merged.
-- **`data`** *(list[dict] | pd.DataFrame | None, optional)*: The source data to merge. Accepts a list of dictionaries (e.g., `[{'col1': 'val1'}, ...]`) or a Pandas DataFrame.
+- **`data`** *(list[dict] | pd.DataFrame | pl.DataFrame | None, optional)*: The source data to merge. Accepts a list of dictionaries (e.g., `[{'col1': 'val1'}, ...]`) or a Pandas/Polars DataFrame.
 - **`delete_mode`** *(Literal['no', 'delete', 'mark'], optional)*: Defines how to handle records that exist in the target table but are missing from the source data. 
   - `'no'` (default): Retain existing target rows (do nothing).
   - `'delete'`: Hard delete rows from the target table.
@@ -79,7 +79,7 @@ with dbmerge(data=data, engine=engine, table_name="YourTable", delete_mode='dele
 - **`delete_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used in the `WHERE` clause during the delete/mark phase. Essential for chunked or partitioned data syncs.
 - **`source_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used to filter the `SELECT` statement when loading data from a `source_table_name`.
 - **`commit_all_steps`** *(bool, optional)*: Defaults to `True`. If `True`, every step (temp insert, target insert, update, delete) is committed immediately. If `False`, a single commit is issued after all steps complete successfully.
-- **`chunk_size`** *(int, optional)*: Defaults to `10000`. Defines the batch size when inserting raw data (from Lists or Pandas DataFrames) into the temporary table to avoid memory/query-size limits.
+- **`chunk_size`** *(int, optional)*: Defaults to `10000`. Defines the batch size when inserting raw data (from Lists or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits.
 
 #### Execution Results & Statistics
 After `exec()` completes, the returned result object (or the `dbmerge` instance) exposes the following statistical attributes:
