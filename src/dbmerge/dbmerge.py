@@ -546,6 +546,8 @@ class dbmerge:
             if c not in self.special_fields:
                 if str(t) in POLARS_TO_SQLALCHEMY_TYPE_MAP.keys():
                     self.data_fields[c] = POLARS_TO_SQLALCHEMY_TYPE_MAP[str(t)]
+                else:
+                    self.data_fields[c] = None
         
 
     def _get_fields_from_table(self):
