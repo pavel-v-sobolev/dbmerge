@@ -77,9 +77,13 @@ POLARS_TO_SQLALCHEMY_TYPE_MAP = {
 }
 
 
-logging.basicConfig()
 logger = logging.getLogger('dbmerge')
 logger.setLevel(logging.INFO)
+if not logger.handlers:                       # do not duplicate handler on re-import
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
+    logger.addHandler(_handler)
+logger.propagate = False                      # do not propagate to the application root logger
 
 logging.getLogger("alembic").setLevel(logging.WARNING)
 
@@ -120,7 +124,7 @@ class dbmerge:
     def __init__(self,
                  engine: Engine, 
                  table_name: str, 
-                 data: list[dict[str,Any]] | PandasDataFrame | PolarsDataFrame | None = None,
+                 data: list[dict[str,Any]] | dict[str,list] | PandasDataFrame | PolarsDataFrame | None = None,
                  delete_mode: Literal['no', 'delete', 'mark']='no',
                  delete_mark_field: str = None,
                  merged_on_field: str | None = None,
@@ -152,7 +156,7 @@ class dbmerge:
         Args:
             engine (Engine): The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, and MS SQL.
             table_name (str): The name of the target table where data will be merged.
-            data (list[dict] | pd.DataFrame | pl.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries or a Pandas/Polars DataFrame.
+            data (list[dict] | dict[str,list] | pd.DataFrame | pl.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries (e.g. [{'col1': 'val1'}, ...]), a dict of lists (e.g. {'col1': ['val1', ...], ...}) or a Pandas/Polars DataFrame.
             delete_mode (Literal['no', 'delete', 'mark'], optional): Defines how to handle records that exist in the target table but are missing from the source data.
                 - 'no' (default): Retain existing target rows.
                 - 'delete': Hard delete rows from the target table.
@@ -298,6 +302,7 @@ class dbmerge:
                     raise IncorrectParameter(f'Table "{self.source_table_full_name}" not found in the database')
                 self._get_fields_from_source_table()
 
+            # LIST OF DICT
             elif isinstance(self.data,list):
                 self.type_of_data = 'list of dict'
                 self.total_row_count = len(self.data)
@@ -308,8 +313,36 @@ class dbmerge:
                         logger.warning('Input list is empty.')
                         self._get_fields_from_table()
                 else:
-                    self._get_fields_from_list_of_dict()               
+                    self._get_fields_from_list_of_dict() 
 
+            # DICT OF LIST
+            elif isinstance(self.data,dict):
+                self.type_of_data = 'dict of list'
+                list_length = None
+                
+                if len(self.data.keys())==0:
+                    raise IncorrectDataError(f'Input "data" is empty dict')
+                
+                for k,v in self.data.items():
+                    if not isinstance(v,list):
+                        raise IncorrectDataError(f'Input "data" is dict, but value for key "{k}" is not list')
+                    elif list_length is None:
+                        list_length = len(v)
+                    elif len(v)!=list_length:
+                        raise IncorrectDataError(f'Input "data" is dict of list, but lists have different length. '+\
+                                                 f'Key "{k}" has list of length {len(v)}, but expected length is {list_length}')
+
+                self.total_row_count = list_length
+                if self.total_row_count==0:
+                    if self.table is None:
+                        raise IncorrectDataError(f'Input list is empty and table "{self.table_full_name}" does not exist.')
+                    else:
+                        logger.warning('Input list is empty.')
+                        self._get_fields_from_table()
+                else:
+                    self._get_fields_from_dict_of_list()              
+
+            # PANDAS
             elif HAS_PANDAS and isinstance(self.data,pd.DataFrame):
                 self.type_of_data = 'pandas'
                 self.total_row_count = len(self.data)
@@ -327,6 +360,7 @@ class dbmerge:
                 else:
                     self._get_fields_from_pandas()
 
+            # POLARS
             elif HAS_POLARS and isinstance(self.data,pl.DataFrame):
                 self.type_of_data = 'polars'
                 self.total_row_count = len(self.data)
@@ -354,7 +388,7 @@ class dbmerge:
                 if can_create_table:
                     logger.info(f'Table "{self.table_full_name}" does not exist. Creating.')
                     self._check_given_types()    
-                    if self.type_of_data in ['list of dict','pandas','polars']: #data types from source table are already known
+                    if self.type_of_data in ['list of dict','dict of list','pandas','polars']: #data types from source table are already known
                         self._detect_missing_data_types()
                     self._create_table()
                 else:
@@ -363,7 +397,7 @@ class dbmerge:
                 if len(self.new_fields)>0:
                     if can_create_columns:
                         self._check_given_types()
-                        if self.type_of_data in ['list of dict','pandas']:
+                        if self.type_of_data in ['list of dict','dict of list','pandas','polars']:
                             self._detect_missing_data_types()
                         self._create_new_fields()
                     else:
@@ -372,7 +406,7 @@ class dbmerge:
             self._create_temp_table()
 
 
-        except Exception as e:
+        except Exception:
             if hasattr(self, 'conn'):
                 self.conn.rollback()
                 self.conn.close()
@@ -489,7 +523,7 @@ class dbmerge:
                                delete_time = self.delete_time)
     
         
-        except Exception as e:
+        except Exception:
             if hasattr(self, 'conn'):
                 self.conn.rollback()
             raise
@@ -507,13 +541,22 @@ class dbmerge:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self._drop_temp_table()
-        if hasattr(self, 'conn'):
+        if hasattr(self, 'conn') and not self.conn.closed:
             self.conn.close()
 
     def __del__(self):
-        self._drop_temp_table()
-        if hasattr(self, 'conn'):
-            self.conn.close()
+        # Best-effort safety net for objects used without a context manager and
+        # without calling exec(). Must never raise: during interpreter shutdown
+        # the engine/connection may already be finalized.
+        try:
+            self._drop_temp_table()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'conn') and not self.conn.closed:
+                self.conn.close()
+        except Exception:
+            pass
 
     def _create_schema_if_not_exists(self,schema_name):
         if self.conn.dialect.name not in ['sqlite']:
@@ -537,6 +580,9 @@ class dbmerge:
         else:
             raise IncorrectDataError(f'Input "data" is list, but no dict inside')
 
+    def _get_fields_from_dict_of_list(self):
+        self.data_fields = {c:None for c in self.data.keys() if c not in self.special_fields}
+
     def _get_fields_from_pandas(self):
         self.data_fields = {c:None for c in self.data.columns if c not in self.special_fields}
 
@@ -551,7 +597,7 @@ class dbmerge:
         
 
     def _get_fields_from_table(self):
-        self.data_fields = {c.name:c.type for c in self.table.c if c not in self.special_fields}
+        self.data_fields = {c.name:c.type for c in self.table.c if c.name not in self.special_fields}
 
 
     def _check_type_is_supported(self,field_type):
@@ -608,6 +654,9 @@ class dbmerge:
         
         if self.type_of_data == 'list of dict':
             test_data = self.data[:self.max_type_detection_rows]
+        elif self.type_of_data == 'dict of list':
+            test_data = [dict(zip(self.data.keys(), vals)) 
+                         for vals in zip(*[v[:self.max_type_detection_rows] for v in self.data.values()])]
         elif self.type_of_data == 'pandas':
             test_data = self.data.iloc[:self.max_type_detection_rows].to_dict(orient='records')
         elif self.type_of_data == 'polars':
@@ -947,15 +996,23 @@ class dbmerge:
             for i in range(chunks_num):
                 begin = i * self.chunk_size
                 end = min((i + 1) * self.chunk_size, self.total_row_count)
+                
                 if self.type_of_data == 'list of dict':
                     data_slice = self.data[begin:end]
+                
+                elif self.type_of_data == 'dict of list':
+                    data_slice = [dict(zip(self.data.keys(), vals)) 
+                                  for vals in zip(*[v[begin:end] for v in self.data.values()])]
+                
                 elif self.type_of_data == 'pandas':
                     data_slice = self.data.iloc[begin:end]
                     data_slice = data_slice.replace({np.nan: None})    
                     data_slice = data_slice.to_dict(orient='records')
+                
                 elif self.type_of_data == 'polars':
                     data_slice = self.data.slice(begin,self.chunk_size)   
                     data_slice = data_slice.to_dicts()
+                
                 else:
                     return
                     

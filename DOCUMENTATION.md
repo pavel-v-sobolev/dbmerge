@@ -27,7 +27,7 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 
 - **`engine`** *(sqlalchemy.engine.Engine)*: The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, and MS SQL.
 - **`table_name`** *(str)*: The name of the target table where data will be merged.
-- **`data`** *(list[dict] | pd.DataFrame | pl.DataFrame | None, optional)*: The source data to merge. Accepts a list of dictionaries (e.g., `[{'col1': 'val1'}, ...]`) or a Pandas/Polars DataFrame.
+- **`data`** *(list[dict] | dict[str, list] | pd.DataFrame | pl.DataFrame | None, optional)*: The source data to merge. Accepts a list of dictionaries (e.g., `[{'col1': 'val1'}, ...]`), a dict of lists (e.g., `{'col1': ['val1', ...], ...}`) or a Pandas/Polars DataFrame.
 - **`delete_mode`** *(Literal['no', 'delete', 'mark'], optional)*: Defines how to handle records that exist in the target table but are missing from the source data. 
   - `'no'` (default): Retain existing target rows (do nothing).
   - `'delete'`: Hard delete rows from the target table.
@@ -82,17 +82,22 @@ with dbmerge(data=data, engine=engine, table_name="YourTable", delete_mode='dele
 - **`chunk_size`** *(int, optional)*: Defaults to `10000`. Defines the batch size when inserting raw data (from Lists or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits.
 
 #### Execution Results & Statistics
-After `exec()` completes, the returned result object (or the `dbmerge` instance) exposes the following statistical attributes:
+`exec()` returns a `mergeResult` dataclass. The same statistics are also available as attributes on the `dbmerge` instance after `exec()` completes.
 
-- **`count_data`**: Total number of rows processed from the source data.
+Fields of the returned `mergeResult` (and matching instance attributes):
+
+- **`total_row_count`**: Total number of rows processed from the source data.
 - **`inserted_row_count`**: Number of new rows inserted into the target table.
 - **`updated_row_count`**: Number of existing rows successfully updated.
 - **`deleted_row_count`**: Number of rows deleted (or flagged as deleted).
 - **`total_time`**: Total execution time (in seconds) for the entire database operation.
-- **`data_insert_time`**: Time taken (in seconds) to load data into the temporary table.
+- **`temp_insert_time`**: Time taken (in seconds) to load data into the temporary table.
 - **`insert_time`**: Time taken (in seconds) to perform the target `INSERT` step.
 - **`update_time`**: Time taken (in seconds) to perform the target `UPDATE` step.
 - **`delete_time`**: Time taken (in seconds) to perform the `DELETE` or `MARK` step.
+
+The executed SQL statements are exposed only on the `dbmerge` instance (not in `mergeResult`):
+
 - **`insert_sql`**: The exact SQL `INSERT` statement executed against the database.
 - **`update_sql`**: The exact SQL `UPDATE` statement executed against the database.
 - **`delete_sql`**: The exact SQL `DELETE` (or mark) statement executed against the database.

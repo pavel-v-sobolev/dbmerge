@@ -24,7 +24,7 @@ Built on top of SQLAlchemy, it abstracts away engine-specific SQL `MERGE` or `ON
 
 **DBMerge accepts multiple data sources as input:**
 - Pandas/Polars DataFrame
-- Lists of dictionaries
+- Lists of dictionaries / Dictionary of Lists
 - Database table or view
 
 DBMerge automates data update process by comparing your source data against the target table and automatically performing the required operations.
