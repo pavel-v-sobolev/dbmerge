@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbmerge"
-version = "1.0.15"
+version = "1.0.16"
 description = "A database-agnostic Python library for simple and fast UPSERT (Insert/Update/Delete) operations via SQLAlchemy."
 
 keywords = [

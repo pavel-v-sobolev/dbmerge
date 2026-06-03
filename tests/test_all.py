@@ -50,6 +50,7 @@ data_types = {'Shop':String(100),'Product':String(100)}
 def prepare_and_clean_data(engine):
     drop_table_if_exists(engine,'Facts',schema='target')
     drop_table_if_exists(engine,'Facts_source',schema='source')
+    drop_table_if_exists(engine,'Fact1Fact2Fact3Fact4Fact5Fact6Fact7Fact8Fact9Fact10Fact11Fact12',schema='target')
 
 
 @pytest.mark.parametrize("engine_name,type_of_data", [(engine_name,type_of_data) 
@@ -73,6 +74,32 @@ def test_table_create_from_data_with_various_types(engine_name,type_of_data):
         data = pl.DataFrame(data)
 
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
+                  key=key, data_types=data_types) as merge:
+        merge.exec()
+        assert merge.inserted_row_count==3, f'Incorrect row count from insert {merge.inserted_row_count}, should be 3'
+
+@pytest.mark.parametrize("engine_name,type_of_data", [(engine_name,type_of_data) 
+                                                     for engine_name in engines 
+                                                     for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
+def test_table_with_long_name(engine_name,type_of_data):
+    logger.debug(f'TEST TABLE CREATE FROM DATA WITH VARIOUS TYPES {engine_name} {type_of_data}')
+    engine = create_engine(engines[engine_name])
+    prepare_and_clean_data(engine)
+
+    data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':None},
+        {'Shop':'124','Product':'123','Date':date(2025,1,1),'Qty':1},
+        {'Shop':'124','Product':'1223','Date':date(2025,1,1),'Qty':2}]
+    
+    data_types = {'Shop':String(100),'Product':String(100),'Qty':Integer()}
+
+    if type_of_data=='dict of list':
+        data = {k:[d[k] for d in data] for k in data[0].keys()}
+    elif type_of_data=='pandas':
+        data = pd.DataFrame(data)
+    elif type_of_data=='polars':
+        data = pl.DataFrame(data)
+
+    with dbmerge(engine=engine, data=data, table_name="Fact1Fact2Fact3Fact4Fact5Fact6Fact7Fact8Fact9Fact10Fact11Fact12", schema='target', temp_schema='tmp',
                   key=key, data_types=data_types) as merge:
         merge.exec()
         assert merge.inserted_row_count==3, f'Incorrect row count from insert {merge.inserted_row_count}, should be 3'
@@ -460,4 +487,4 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,type_of_da
 
 if __name__ == '__main__':
 
-    test_table_create_from_data_with_various_types('postgres','dict of list')
+    test_update_from_source_table_with_delete_in_a_period('postgres','list of dict')

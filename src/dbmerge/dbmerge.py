@@ -106,6 +106,8 @@ class TempTableAlreadyExists(RuntimeError):
 # Maximum rows to check when detecting column type until non null value is found
 MAX_TYPE_DETECTION_ROWS = 10000 
 
+# Maximum length of postgres table name is 63, postgres might need some symbols for "_pkey" suffix.
+MAX_TEMP_TABLE_NAME_LEN = 58
 
 @dataclass
 class mergeResult:
@@ -160,8 +162,10 @@ class dbmerge:
             delete_mode (Literal['no', 'delete', 'mark'], optional): Defines how to handle records that exist in the target table but are missing from the source data.
                 - 'no' (default): Retain existing target rows.
                 - 'delete': Hard delete rows from the target table.
-                - 'mark': Soft delete rows by setting a boolean/integer flag in `delete_mark_field`.
-            delete_mark_field (str, optional): The column name used to flag a record as deleted. Set to True or 1 when `delete_mode='mark'`.
+                - 'mark': Soft delete rows by setting a flag in `delete_mark_field`.
+            delete_mark_field (str, optional): The column name used to flag a record as deleted. A row missing from the source is
+                set to True, and is reset back to NULL (not False) once it reappears in the source (to get active rows use
+                `WHERE delete_mark_field IS DISTINCT FROM True`).
             merged_on_field (str | None, optional): Timestamp column automatically updated to current datetime when a row is inserted, updated, or marked.
             inserted_on_field (str | None, optional): Timestamp column automatically set to current datetime when a new row is initially inserted.
             skip_update_fields (list, optional): List of column names to exclude from the UPDATE operation.
@@ -177,7 +181,7 @@ class dbmerge:
 
         Raises:
             IncorrectParameter: Raised when arguments are not correct or missing.
-            TempTableAlreadyExists: Raised if a temporary table with the generated name already exists.
+            TempTableAlreadyExists: Raised if a temporary table with the generated name already exists (a very unlikely case, since the name includes a random unique id).
         """
         
 
@@ -423,8 +427,8 @@ class dbmerge:
         
         Execution Workflow:
         1) Inserts the source data into the temporary staging table.
-        2) Insert: Copies rows from the temporary table to the target table that do not currently exist.
-        3) Update: Updates existing rows in the target table where field values differ from the temporary table.
+        2) Update: Updates existing rows in the target table where field values differ from the temporary table.
+        3) Insert: Copies rows from the temporary table to the target table that do not currently exist.
         4) Delete / Mark: Deletes or marks rows in the target table that are entirely missing from the temporary staging data.
 
         If your data comes in portions (e.g., monthly snapshots), you can set a delete_condition argument 
@@ -956,17 +960,31 @@ class dbmerge:
         self.conn.commit() 
 
  
+    @staticmethod
+    def _truncate_to_bytes(s, max_bytes):
+        # Postgres limits identifiers by bytes, not characters. Truncate the byte
+        # representation and drop any incomplete trailing multibyte sequence.
+        encoded = s.encode('utf-8')
+        if len(encoded) <= max_bytes:
+            return s
+        return encoded[:max_bytes].decode('utf-8', errors='ignore')
+
     def _create_temp_table(self):
-        
-        temp_table_name = self.table_name + '_' + self.unique_id
+
+        # '_' and unique_id are ASCII (1 byte each), so we can subtract their char length as bytes
+        max_bytes = MAX_TEMP_TABLE_NAME_LEN - len(self.unique_id) - 1
+
+        temp_table_name = self._truncate_to_bytes(self.table_name, max_bytes) + '_' + self.unique_id
 
         cols = [Column(c.name, c.type, primary_key = c.name in self.key) for c in self.table.c]
 
         if self.engine.dialect.name =='postgresql':
             self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
                                     prefixes=['UNLOGGED'])
-            # postgresql_on_commit='PRESERVE ROWS' should be used for TEMP table, 
-            # but looks like UNLOGGED is performing better then TEMP
+            # postgresql_on_commit='PRESERVE ROWS' should be used for TEMP table,
+            # but looks like UNLOGGED is performing better then TEMP.
+            # Note: UNLOGGED is a persistent table (unlike TEMP), so if the process crashes before
+            # _drop_temp_table() runs, the table is left behind in temp_schema and is not auto-cleaned.
             self.temp_table.create(bind=self.conn)
         
         elif self.engine.dialect.name in ('mariadb','mysql','sqlite'):
@@ -1016,7 +1034,7 @@ class dbmerge:
                 else:
                     return
                     
-                result = self.conn.execute(insert(self.temp_table), data_slice)
+                self.conn.execute(insert(self.temp_table), data_slice)
 
         
         end_time = time.perf_counter()
@@ -1090,7 +1108,10 @@ def format_ms(seconds):
         parts.append(f"{minutes}m")
     if seconds:
         parts.append(f"{seconds}s")
-    if ms and milliseconds<1000:  
+    if ms and milliseconds<1000:
         parts.append(f"{round(ms)}ms")
-    
+
+    if not parts:
+        return "0ms"
+
     return " ".join(parts[:2])
