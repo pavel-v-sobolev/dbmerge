@@ -12,7 +12,7 @@ Built on top of SQLAlchemy, it abstracts away engine-specific SQL `MERGE` or `ON
 [![PyPI version](https://img.shields.io/pypi/v/dbmerge.svg)](https://pypi.org/project/dbmerge/)
 [![Python versions](https://img.shields.io/pypi/pyversions/dbmerge.svg)](https://pypi.org/project/dbmerge/)
 
-[![PostgreSQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml) [![MariaDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml) [![SQLite](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml) [![MS SQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml)
+[![PostgreSQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml) [![MariaDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml) [![SQLite](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml) [![MS SQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml) [![CockroachDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_cockroach.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_cockroach.yml)
 
 
 ## Overview
@@ -41,6 +41,7 @@ Tested and verified with:
 - MariaDB / MySQL
 - SQLite
 - MS SQL Server
+- CockroachDB
 
 ## Installation
 
@@ -94,7 +95,9 @@ Here is a rough performance comparison for synchronizing data of different sizes
 | **PostgreSQL** | ~2.0s | ~19.8s |
 | **MySQL / MariaDB** | ~1.0s | ~11.1s |
 | **SQLite** | ~0.7s | ~7.6s |
+| **CockroachDB** | ~8.6s | ~2m 49s |
 | **MS SQL Server*** | ~22.4s | ~4m 23s |
+
 
 *\* Note: MS SQL Server bulk operations take longer due to inherent limitations in the `pyodbc` driver*
 
@@ -110,8 +113,9 @@ Here is a rough performance comparison for synchronizing data of different sizes
   - Does not allow strings with unlimited size. You must explicitly define `data_types` if you want to create a table or field automatically (e.g., `data_types={'Your Field': String(100)}`).
 - **SQLite:** Does not support schemas. If a schema setting is provided, it is automatically reset to `None` with a warning.
 - **MS SQL Server:** Bulk insert operations may have lower performance due to specific `pyodbc` driver limitations.
-- **Oracle:** Currently not supported (missing support for `JOIN` operations in `UPDATE` statements within the `oracledb` module).
-- **DuckDB:** Currently not supported (due to a bug in `duckdb_engine` regarding table definition loading).
+- **CockroachDB:** Uses the official `sqlalchemy-cockroachdb` dialect (over `psycopg2`); speaks the PostgreSQL wire protocol.
+- **Oracle:** Currently **not supported** (missing support for `JOIN` operations in `UPDATE` statements within the `oracledb` module).
+- **DuckDB:** Currently **not supported** (due to a bug in `duckdb_engine` regarding table definition loading).
 
 ## Documentation
 
