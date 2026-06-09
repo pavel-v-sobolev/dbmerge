@@ -37,6 +37,13 @@ jobs:
         run: |
           uv sync --extra dev
 
+      - name: Create data directory
+        run: mkdir -p data
+
+      - name: Initialize sample data
+        run: |
+          uv run python tests/sample_data_in_sqlite.py
+
       - name: Wait for CockroachDB
         run: |
           for i in $(seq 1 30); do
@@ -47,6 +54,6 @@ jobs:
           done
           echo "CockroachDB did not become ready"; docker logs cockroach; exit 1
 
-      - name: Run CockroachDB smoke test
+      - name: Run pytest (CockroachDB only)
         run: |
-          uv run python db/cockroach/cockroach_test.py
+          uv run pytest tests/test_all.py -v --tb=short -k "cockroachdb"
