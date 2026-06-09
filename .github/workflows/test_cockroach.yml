@@ -1,0 +1,52 @@
+name: Test CockroachDB
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test_cockroach:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # CockroachDB needs a custom command ("start-single-node --insecure"), which
+      # GitHub Actions "services:" containers cannot override, so we run it directly.
+      - name: Start CockroachDB
+        run: |
+          docker run -d --name cockroach \
+            -p 26257:26257 -p 8080:8080 \
+            cockroachdb/cockroach:latest-v24.3 \
+            start-single-node --insecure
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install DB system libraries
+        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev libpq-dev
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+
+      - name: Wait for CockroachDB
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec cockroach cockroach sql --insecure -e "SELECT 1" >/dev/null 2>&1; then
+              echo "CockroachDB is ready"; exit 0
+            fi
+            echo "waiting for CockroachDB... ($i)"; sleep 2
+          done
+          echo "CockroachDB did not become ready"; docker logs cockroach; exit 1
+
+      - name: Run CockroachDB smoke test
+        run: |
+          uv run python db/cockroach/cockroach_test.py

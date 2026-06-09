@@ -32,6 +32,7 @@ mssql_settings = urllib.parse.quote_plus(
 engines = {'sqlite':"""sqlite:///data/data.sqlite""",
            'postgres':"""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge""",
            'mariadb':"""mariadb+mariadbconnector://root:root@127.0.0.1:3306""",
+           'cockroachdb':f"cockroachdb://root@localhost:26257/defaultdb?sslmode=disable",
            #'duckdb':create_engine('duckdb:///:memory:', poolclass=StaticPool)
            #'mssql':create_engine(f"mssql+pyodbc:///?odbc_connect={mssql_settings}",connect_args={"autocommit": False,"fast_executemany": True})
          }
@@ -83,13 +84,13 @@ def measure_performance(engine_name,size):
 if __name__ == '__main__':
 
     result = {}
-    for engine_name in ['postgres','mariadb','sqlite']:
+    for engine_name in ['postgres','mariadb','sqlite','cockroachdb']:
         total_time = measure_performance(engine_name,1000000)
         result[engine_name] = round(total_time,1)
 
 logger.info(str(result))
 
 # 
-# size = 100000 {'postgres': 2.0, 'mariadb': 1.0, 'sqlite': 0.7, 'mssql': 22.4}
-# size = 1000000 {'postgres': 19.8, 'mariadb': 11.1, 'sqlite': 7.6, 'mssql': 263.7}
+# size = 100000 {'postgres': 2.0, 'mariadb': 1.0, 'sqlite': 0.7, 'mssql': 22.4,'cockroachdb': 8.6}
+# size = 1000000 {'postgres': 19.8, 'mariadb': 11.1, 'sqlite': 7.6, 'mssql': 263.7,'cockroachdb': 169.5}
 # inserted  65% updated  7% deleted  15%

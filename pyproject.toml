@@ -66,5 +66,6 @@ dev = [
     "pyodbc",
     "twine",
     "build",
-    "ydb-sqlalchemy"
+    "ydb-sqlalchemy",
+    "sqlalchemy-cockroachdb"
 ]

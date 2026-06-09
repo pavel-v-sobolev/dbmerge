@@ -7,7 +7,7 @@ import uuid
 import pytest
 import logging
 
-from sqlalchemy import create_engine, text, select, schema
+from sqlalchemy import create_engine, text, select, schema, func
 from sqlalchemy import Table, MetaData, Column, String, Date, Integer, Numeric, JSON, Uuid, StaticPool
 
 from sample_data_in_sqlite import get_data, get_modified_data
@@ -33,6 +33,7 @@ engines = {'sqlite':"""sqlite:///data/data.sqlite""",
            'postgres':"""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge""",
            'mariadb':"""mariadb+mariadbconnector://root:root@127.0.0.1:3306""",
            'mssql':f"mssql+pyodbc:///?odbc_connect={mssql_settings}",
+           'cockroachdb':f"cockroachdb://root@localhost:26257/defaultdb?sslmode=disable",
            #'duckdb':'duckdb:///:memory:',
            #'duckdb':'duckdb:///data/data.ddb'
            #'oracle':"oracle+oracledb://system:oracle@localhost/?service_name=XEPDB1"
@@ -45,6 +46,31 @@ engines = {'sqlite':"""sqlite:///data/data.sqlite""",
 key = ['Shop','Product','Date']
 data_types = {'Shop':String(100),'Product':String(100)}
 
+
+def _reflect_facts(engine):
+    # sqlite does not support schemas - dbmerge stores the table without one there.
+    schema = None if engine.dialect.name=='sqlite' else 'target'
+    return Table('Facts', MetaData(), autoload_with=engine, schema=schema)
+
+
+def count_all_rows(engine, date_from=None, date_to=None):
+    """Count rows in target.Facts, optionally restricted to a date range."""
+    tbl = _reflect_facts(engine)
+    stmt = select(func.count()).select_from(tbl)
+    if date_from is not None and date_to is not None:
+        stmt = stmt.where(tbl.c['Date'].between(date_from, date_to))
+    with engine.connect() as conn:
+        return conn.execute(stmt).scalar()
+
+
+def count_deleted_rows(engine, date_from=None, date_to=None):
+    """Count rows whose 'Deleted' flag is set (True/1), optionally within a date range."""
+    tbl = _reflect_facts(engine)
+    stmt = select(func.count()).select_from(tbl).where(tbl.c['Deleted'] == True)
+    if date_from is not None and date_to is not None:
+        stmt = stmt.where(tbl.c['Date'].between(date_from, date_to))
+    with engine.connect() as conn:
+        return conn.execute(stmt).scalar()
 
 
 def prepare_and_clean_data(engine):
@@ -353,8 +379,13 @@ def test_date_range_with_delete_mark(engine_name,type_of_data):
         data = pl.from_pandas(data)
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='tmp',
-                  data_types=data_types, key=key) as merge:
+                  data_types=data_types, key=key, delete_mark_field='Deleted') as merge:
         merge.exec()
+        total_rows = merge.inserted_row_count
+
+    # freshly inserted rows must default to active (Deleted=False), never NULL or True
+    assert count_all_rows(engine)==total_rows, f'Expected {total_rows} rows in the table'
+    assert count_deleted_rows(engine)==0, 'Inserted rows must default to Deleted=False, none should be marked deleted'
 
     data = get_modified_data(start_date=date(2025,3,1),end_date=date(2025,4,15))
     if type_of_data=='dict of list':
@@ -372,6 +403,12 @@ def test_date_range_with_delete_mark(engine_name,type_of_data):
         assert merge.deleted_row_count>0, f'Incorrect row count from delete {merge.deleted_row_count}, should be >0'
         deleted_count = merge.deleted_row_count
 
+    # the flag must actually be persisted as True, and scoped to the delete_condition range only
+    assert count_all_rows(engine)==total_rows, 'Mark mode must not insert or physically delete rows'
+    assert count_deleted_rows(engine)==deleted_count, 'Number of rows marked Deleted=True must match deleted_row_count'
+    assert count_deleted_rows(engine,date(2025,3,1),date(2025,4,15))==deleted_count, 'All marked rows must fall inside the delete_condition range'
+    assert count_deleted_rows(engine,date(2025,1,1),date(2025,2,28))==0, 'Rows outside the delete_condition range must stay active'
+
     logger.debug('Now test how missing mark is recovered')
     data = get_data(start_date=date(2025,3,1),end_date=date(2025,4,15))
     if type_of_data=='dict of list':
@@ -388,7 +425,59 @@ def test_date_range_with_delete_mark(engine_name,type_of_data):
         assert merge.updated_row_count>=deleted_count,\
             f'Incorrect row count from update {merge.updated_row_count}, should be >={deleted_count}'
         assert merge.deleted_row_count==0, f'Incorrect row count from delete {merge.deleted_row_count}, should be ==0'
-        
+
+    # recovered (reappeared) rows must be reset back to active (Deleted=False)
+    assert count_deleted_rows(engine,date(2025,3,1),date(2025,4,15))==0, 'Recovered rows must be reset to Deleted=False'
+    assert count_deleted_rows(engine)==0, 'No row should remain marked deleted after full recovery'
+    assert count_all_rows(engine)==total_rows, 'Recovery must not insert or physically delete rows'
+
+
+@pytest.mark.parametrize("engine_name,type_of_data", [(engine_name,type_of_data)
+                                                     for engine_name in engines
+                                                     for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
+def test_delete_mark_field_with_delete_mode_no(engine_name,type_of_data):
+    logger.debug(f"TEST delete_mark_field is always populated with delete_mode='no' {engine_name} {type_of_data}")
+    engine = create_engine(engines[engine_name])
+    prepare_and_clean_data(engine)
+
+    # Part A: 'Deleted' is NOT in the data -> every row must default to False
+    data=[{'Shop':'1','Product':'A','Date':date(2025,1,1),'Qty':10},
+          {'Shop':'1','Product':'B','Date':date(2025,1,1),'Qty':20},
+          {'Shop':'2','Product':'A','Date':date(2025,1,1),'Qty':30}]
+    if type_of_data=='dict of list':
+        data = {k:[d[k] for d in data] for k in data[0].keys()}
+    elif type_of_data=='pandas':
+        data = pd.DataFrame(data)
+    elif type_of_data=='polars':
+        data = pl.DataFrame(data)
+
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
+                  key=key, data_types=data_types, delete_mark_field='Deleted') as merge:
+        merge.exec()
+        assert merge.inserted_row_count==3, f'Incorrect row count from insert {merge.inserted_row_count}, should be 3'
+
+    assert count_all_rows(engine)==3
+    assert count_deleted_rows(engine)==0, "delete_mode='no': rows without 'Deleted' in data must default to False, not NULL/True"
+
+    # Part B: 'Deleted' IS in the data -> the supplied value must be stored as-is
+    data=[{'Shop':'1','Product':'A','Date':date(2025,1,1),'Qty':10,'Deleted':True},
+          {'Shop':'1','Product':'B','Date':date(2025,1,1),'Qty':20,'Deleted':False},
+          {'Shop':'2','Product':'A','Date':date(2025,1,1),'Qty':30,'Deleted':True}]
+    if type_of_data=='dict of list':
+        data = {k:[d[k] for d in data] for k in data[0].keys()}
+    elif type_of_data=='pandas':
+        data = pd.DataFrame(data)
+    elif type_of_data=='polars':
+        data = pl.DataFrame(data)
+
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
+                  key=key, data_types=data_types, delete_mark_field='Deleted') as merge:
+        merge.exec()
+        assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.inserted_row_count}, should be 0'
+
+    assert count_all_rows(engine)==3
+    assert count_deleted_rows(engine)==2, "delete_mode='no': 'Deleted' supplied in data must be used as-is (2 True expected)"
+
 
 @pytest.mark.parametrize("engine_name,type_of_data", [(engine_name,type_of_data)
                                                      for engine_name in engines
@@ -487,4 +576,4 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,type_of_da
 
 if __name__ == '__main__':
 
-    test_update_from_source_table_with_delete_in_a_period('postgres','list of dict')
+    test_date_range_with_delete_mark('cockroachdb','list of dict')

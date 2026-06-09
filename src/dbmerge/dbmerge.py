@@ -36,9 +36,9 @@ import logging
 from datetime import datetime, date
 from dataclasses import dataclass
 
-from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists
+from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists, literal
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
-from sqlalchemy import String, BigInteger, Numeric, Boolean, DateTime, Date, Time, JSON, Uuid, LargeBinary
+from sqlalchemy import String, Integer, BigInteger, Numeric, Boolean, DateTime, Date, Time, JSON, Uuid, LargeBinary
 from sqlalchemy import types, dialects, func, text, schema
 
 POLARS_TO_SQLALCHEMY_TYPE_MAP = {
@@ -109,6 +109,10 @@ MAX_TYPE_DETECTION_ROWS = 10000
 # Maximum length of postgres table name is 63, postgres might need some symbols for "_pkey" suffix.
 MAX_TEMP_TABLE_NAME_LEN = 58
 
+# Dialects that require JSONB (not plain JSON) so values can be compared with IS DISTINCT FROM.
+# CockroachDB speaks the postgres wire protocol and natively supports JSONB.
+JSONB_DIALECTS = ('postgresql', 'cockroachdb')
+
 @dataclass
 class mergeResult:
     total_row_count: int
@@ -163,9 +167,9 @@ class dbmerge:
                 - 'no' (default): Retain existing target rows.
                 - 'delete': Hard delete rows from the target table.
                 - 'mark': Soft delete rows by setting a flag in `delete_mark_field`.
-            delete_mark_field (str, optional): The column name used to flag a record as deleted. A row missing from the source is
-                set to True, and is reset back to NULL (not False) once it reappears in the source (to get active rows use
-                `WHERE delete_mark_field IS DISTINCT FROM True`).
+            delete_mark_field (str, optional): The column used to flag a record as deleted. Must be a Boolean or Integer column.
+                A row missing from the source is set to True/1; inserted or resurrected (reappeared) rows are set to False/0.
+                If this column is present in the incoming data, the supplied value is used as-is.
             merged_on_field (str | None, optional): Timestamp column automatically updated to current datetime when a row is inserted, updated, or marked.
             inserted_on_field (str | None, optional): Timestamp column automatically set to current datetime when a new row is initially inserted.
             skip_update_fields (list, optional): List of column names to exclude from the UPDATE operation.
@@ -278,7 +282,7 @@ class dbmerge:
             self.merged_on_field = merged_on_field
             self.inserted_on_field = inserted_on_field
             
-            self.special_fields = [f for f in [self.delete_mark_field,self.merged_on_field,self.inserted_on_field]
+            self.special_fields = [f for f in [self.merged_on_field,self.inserted_on_field]
                                    if f is not None]
 
             if self.delete_mode=='mark': 
@@ -386,6 +390,12 @@ class dbmerge:
                 raise IncorrectDataError(f'Input "data" should be pandas/polars DataFrame or list of dict')
 
             self._check_existing_and_new_fields()
+
+            # delete_mark_field may be supplied in the incoming data; if so we honor that value
+            # instead of managing the flag automatically.
+            self.delete_mark_from_data = (self.delete_mark_field is not None
+                                          and self.delete_mark_field in self.data_fields)
+
             self._check_key()
 
             if self.table is None:
@@ -406,7 +416,10 @@ class dbmerge:
                         self._create_new_fields()
                     else:
                         self._remove_new_fields()
-                
+
+            if self.delete_mark_field is not None:
+                self._resolve_delete_mark_values()
+
             self._create_temp_table()
 
 
@@ -605,9 +618,9 @@ class dbmerge:
 
 
     def _check_type_is_supported(self,field_type):
-        if isinstance(field_type,JSON) and self.engine.dialect.name == 'postgresql':
+        if isinstance(field_type,JSON) and self.engine.dialect.name in JSONB_DIALECTS:
             if not isinstance(field_type,dialects.postgresql.JSONB):
-                raise IncorrectDataError(f'JSON type is not supported for postgres. '+\
+                raise IncorrectDataError(f'JSON type is not supported for "{self.engine.dialect.name}". '+\
                                         'Use JSONB instead (sqlalchemy.dialects.postgresql.JSONB)')
 
     def _check_existing_and_new_fields(self):
@@ -624,7 +637,9 @@ class dbmerge:
                 self.new_fields[f]=self.data_fields[f]
 
         delete_mark_field = self.delete_mark_field
-        if delete_mark_field is not None and delete_mark_field not in existing_fields:
+        if delete_mark_field is not None and delete_mark_field not in existing_fields \
+                and delete_mark_field not in self.new_fields:
+            # not present in data either - default the auto-managed flag to Boolean
             self.new_fields[delete_mark_field]=Boolean()
 
         merged_on_field = self.merged_on_field
@@ -633,7 +648,26 @@ class dbmerge:
 
         inserted_on_field = self.inserted_on_field
         if inserted_on_field is not None and inserted_on_field not in existing_fields:
-            self.new_fields[inserted_on_field]=DateTime()        
+            self.new_fields[inserted_on_field]=DateTime()
+
+
+    def _resolve_delete_mark_values(self):
+        # delete_mark_field must be a Boolean (active=False / deleted=True) or an
+        # Integer column (active=0 / deleted=1). Resolve the concrete values to use.
+        if self.delete_mark_field not in self.table.c:
+            raise IncorrectParameter(f'delete_mark_field "{self.delete_mark_field}" column does not exist '
+                                     f'in table "{self.table_full_name}" and could not be created.')
+
+        col_type = self.table.c[self.delete_mark_field].type
+        if isinstance(col_type, Boolean):
+            self.delete_mark_active_value = False
+            self.delete_mark_deleted_value = True
+        elif isinstance(col_type, (Integer, Numeric)):
+            self.delete_mark_active_value = 0
+            self.delete_mark_deleted_value = 1
+        else:
+            raise IncorrectParameter(f'delete_mark_field "{self.delete_mark_field}" must be a Boolean or Integer '
+                                     f'column, but its type is {col_type}.')
 
 
     def _check_given_types(self):
@@ -697,7 +731,7 @@ class dbmerge:
                             self.new_fields[f] = Date()
                         elif isinstance(test_row[f],list) or isinstance(test_row[f],dict) or \
                             isinstance(test_row[f],tuple):
-                            if self.engine.dialect.name == 'postgresql':
+                            if self.engine.dialect.name in JSONB_DIALECTS:
                                 self.new_fields[f] = dialects.postgresql.JSONB()
                             else:
                                 self.new_fields[f] = JSON()
@@ -794,6 +828,10 @@ class dbmerge:
             source_fields.append(func.now().label(self.inserted_on_field))
             target_fields.append(self.table.c[self.inserted_on_field])
 
+        if self.delete_mark_field is not None and not self.delete_mark_from_data:
+            source_fields.append(literal(self.delete_mark_active_value).label(self.delete_mark_field))
+            target_fields.append(self.table.c[self.delete_mark_field])
+
         join_conditions = []
         for key_col in self.key:
             join_conditions.append(self.table.c[key_col]==self.temp_table.c[key_col])
@@ -848,7 +886,7 @@ class dbmerge:
 
         update_values = {}
         mark_field = self.table.c[self.delete_mark_field]
-        update_values[mark_field] = 1
+        update_values[mark_field] = self.delete_mark_deleted_value
 
         if self.merged_on_field is not None:
             merged_on_field = self.table.c[self.merged_on_field]
@@ -893,11 +931,13 @@ class dbmerge:
             temp_col = self.temp_table.c[c]
             where_conditions.append(col.is_distinct_from(temp_col))
 
-        if self.delete_mark_field is not None:
+        # When the flag is auto-managed (not supplied in the data), a row currently marked as
+        # deleted must be picked up for update so it gets reset back to the active value.
+        if self.delete_mark_field is not None and not self.delete_mark_from_data:
             mark_field = self.table.c[self.delete_mark_field]
-            where_conditions.append(mark_field.is_not(None))
+            where_conditions.append(mark_field.is_distinct_from(self.delete_mark_active_value))
 
-        where_clause = or_(*where_conditions)        
+        where_clause = or_(*where_conditions)
 
         select_stmt = select(self.temp_table).join(self.table, on_clause, isouter=False).where(where_clause)
         select_stmt = select_stmt.subquery()
@@ -906,9 +946,9 @@ class dbmerge:
         for c in non_key_cols:
             update_values[self.table.c[c]] = select_stmt.c[c]
 
-        if self.delete_mark_field is not None:
+        if self.delete_mark_field is not None and not self.delete_mark_from_data:
             mark_field = self.table.c[self.delete_mark_field]
-            update_values[mark_field]=None
+            update_values[mark_field]=self.delete_mark_active_value
 
         if self.merged_on_field is not None:
             merged_on_field = self.table.c[self.merged_on_field]
