@@ -22,7 +22,7 @@ data_types = {'Shop':String(100),'Product':String(100)}
 # Object is created with context to make sure that all resources are freed and connection to db is closed
 with dbmerge(engine=engine, data=data, table_name="Facts", 
                   key=key, data_types=data_types, merged_on_field='Merged On') as merge:
-    merge.exec()
+    result = merge.exec()
 
 # OUTPUT:
 # INFO - Merged data into table "Facts". Temp data: 6 rows (3ms), 
@@ -40,7 +40,7 @@ data=[{'Shop':'123','Product':'123','Date':date(2025,2,1),'Qty':2,'Price':52.10}
 with dbmerge(engine=engine, data=data, table_name="Facts", 
              delete_mode='delete', merged_on_field='Merged On') as merge:
     # Use the table attribute to access our target table as SQLAlchemy object.
-    merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))
+    result = merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))
 
 # OUTPUT:
 # INFO - Merged data into table "Facts". Temp data: 2 rows (3ms), 
@@ -58,7 +58,7 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
       # Lets create delete condition so that in checks that value of Shop in the target table
       # is in values in the temp_table.
       # This means, that deletion will be only done for shops, loaded in the data.
-      merge.exec(delete_condition=merge.table.c['Shop'].in_(select(merge.temp_table.c['Shop'])))
+      result = merge.exec(delete_condition=merge.table.c['Shop'].in_(select(merge.temp_table.c['Shop'])))
 
 # OUTPUT:
 # INFO - Merged data into table "Facts". Temp data: 4 rows (3ms), 
@@ -73,8 +73,8 @@ with dbmerge(engine=engine, table_name="Facts_latest", source_table_name='Facts'
              delete_mode='delete', key=key, data_types=data_types, merged_on_field='Merged On') as merge:
     # Select only 2025-02 data froum your source table
     # Apply delete condition to target table, just in case some data need to be deleted.
-    merge.exec(source_condition=merge.source_table.c['Date'].between(date(2025,2,1),date(2025,2,28)),
-               delete_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))
+    result = merge.exec(source_condition=merge.source_table.c['Date'].between(date(2025,2,1),date(2025,2,28)),
+                        delete_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))
 
 # OUTPUT:
 # INFO - Merged data into table "Facts_latest". Temp data: 4 rows (5ms), 

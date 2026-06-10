@@ -14,4 +14,4 @@ data = [
 # # The table will be created automatically if it doesn't exist.
 with dbmerge(engine=engine, data=data, table_name="Facts", 
              key=['Shop', 'Product', 'Date'], data_types={'Price':Numeric(10,3)}) as merge:
-    merge.exec()
+    result = merge.exec()

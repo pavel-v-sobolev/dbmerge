@@ -13,6 +13,6 @@ data = [
 
 # 3. Execute the merge operation
 # The table will be created automatically if it doesn't exist.
-with dbmerge(engine=engine, data=data, table_name="Facts", 
+with dbmerge(engine=engine, data=data, table_name="Facts",
              key=['Shop', 'Product', 'Date']) as merge:
-    merge.exec()
+    result = merge.exec()

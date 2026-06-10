@@ -78,14 +78,15 @@ POLARS_TO_SQLALCHEMY_TYPE_MAP = {
 
 
 logger = logging.getLogger('dbmerge')
-logger.setLevel(logging.INFO)
-if not logger.handlers:                       # do not duplicate handler on re-import
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
-    logger.addHandler(_handler)
-logger.propagate = False                      # do not propagate to the application root logger
 
-logging.getLogger("alembic").setLevel(logging.WARNING)
+def _ensure_logger_handler():
+    # If the user has not set up logging, then we set up a default logger to stdout with INFO level. 
+    # If the user has already set up logging, we do nothing and let the user's configuration work.
+    if not logger.hasHandlers():
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
+        logger.addHandler(h)
+        logger.setLevel(logging.INFO)
 
 
 class TableNotFoundError(RuntimeError):
@@ -144,7 +145,7 @@ class dbmerge:
                  source_schema: str | None = None, 
                  can_create_table: bool = True,
                  can_create_columns: bool = True,
-                 can_create_schemas: bool = True):
+                 can_create_schemas: bool = True) -> mergeResult:
         """
         Init function prepares the database and internal structures before the merge operation.
         
@@ -156,7 +157,7 @@ class dbmerge:
         Preferable usage (Context Manager):
         ```python
         with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
-            merge.exec()
+            result = merge.exec()
         ```
 
         Args:
@@ -190,6 +191,7 @@ class dbmerge:
         
 
         try:
+            _ensure_logger_handler()
             self.data = data
             self.engine = engine
             self.table_name = table_name

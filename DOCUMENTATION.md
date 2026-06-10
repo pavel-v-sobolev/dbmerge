@@ -20,7 +20,7 @@ The initialization method prepares the database and internal structures before t
 from dbmerge import dbmerge
 
 with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
-    merge.exec()
+    result = merge.exec()
 ```
 
 #### Arguments

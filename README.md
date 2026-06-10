@@ -71,7 +71,7 @@ data = [
 # The table will be created automatically if it doesn't exist.
 with dbmerge(engine=engine, data=data, table_name="Facts", 
              key=['Shop', 'Product', 'Date']) as merge:
-    merge.exec()
+    result = merge.exec()
 ```
 
 ## Key Features

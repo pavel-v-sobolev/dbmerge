@@ -20,8 +20,8 @@ engine = create_engine('duckdb:///data/data.ddb')
 
 with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', 
               temp_schema='tmp', key= ['Shop','Product','Date']) as merge:
-    merge.exec()
+    result = merge.exec()
 
-with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', 
+with dbmerge(engine=engine, data=data, table_name="Facts", schema='target',
               temp_schema='tmp', key= ['Shop','Product','Date']) as merge:
-    merge.exec()
+    result = merge.exec()
