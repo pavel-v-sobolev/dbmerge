@@ -82,6 +82,7 @@ logger = logging.getLogger('dbmerge')
 def _ensure_logger_handler():
     # If the user has not set up logging, then we set up a default logger to stdout with INFO level. 
     # If the user has already set up logging, we do nothing and let the user's configuration work.
+    # This function is called from dbmerge class __init__.
     if not logger.hasHandlers():
         h = logging.StreamHandler()
         h.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
