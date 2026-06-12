@@ -4,12 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbmerge"
-version = "1.0.18"
-description = "A database-agnostic Python library for simple and fast UPSERT (Insert/Update/Delete) operations via SQLAlchemy."
+version = "1.0.19"
+description = "Database-agnostic UPSERT (insert/update/delete) for Python: merge pandas/polars DataFrames or dicts into PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server and CockroachDB via SQLAlchemy."
 
 keywords = [
-    "sql","database","etl","upsert","merge","sqlalchemy","pandas","data-engineering","synchronization","database-sync",
-    "postgres","mysql","sqlite"
+    "sql","database","etl","upsert","merge","dwh","python",
+    "sqlalchemy","pandas","polars",
+    "data-engineering","synchronization","database-sync","bulk-insert",
+    "postgres","mysql","mariadb","sqlite","mssql","sql-server","cockroachdb"
 ]
 
 authors = [
@@ -28,18 +30,20 @@ license-files = ["LICEN[CS]E*"]
 
 classifiers = [
     "Development Status :: 5 - Production/Stable",
-    "License :: OSI Approved :: MIT License",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
+    "Typing :: Typed",
 ]
 
 [project.urls]
@@ -54,7 +58,23 @@ Changelog = "https://github.com/pavel-v-sobolev/dbmerge/releases"
 [tool.hatch.build.targets.wheel]
 packages = ["src/dbmerge"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/dbmerge",
+    "README.md",
+    "DOCUMENTATION.md",
+    "llms.txt",
+    "user_guide.py",
+    "quick_start.py",
+]
+
 [project.optional-dependencies]
+pandas = [
+    "pandas>=2.0.1",
+]
+polars = [
+    "polars",
+]
 dev = [
     "pandas>=2.0.1",
     "polars",

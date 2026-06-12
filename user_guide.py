@@ -71,7 +71,7 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 
 with dbmerge(engine=engine, table_name="Facts_latest", source_table_name='Facts',
              delete_mode='delete', key=key, data_types=data_types, merged_on_field='Merged On') as merge:
-    # Select only 2025-02 data froum your source table
+    # Select only 2025-02 data from your source table
     # Apply delete condition to target table, just in case some data need to be deleted.
     result = merge.exec(source_condition=merge.source_table.c['Date'].between(date(2025,2,1),date(2025,2,28)),
                         delete_condition=merge.table.c['Date'].between(date(2025,2,1),date(2025,2,28)))

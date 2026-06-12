@@ -1,8 +1,8 @@
 <p align="left">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/pavel-v-sobolev/dbmerge/master/assets/logo_dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/pavel-v-sobolev/dbmerge/master/assets/logo_light.png">
-    <img alt="dbmerge logo" src="https://raw.githubusercontent.com/pavel-v-sobolev/dbmerge/master/assets/logo_light.png" width="500">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/pavel-v-sobolev/dbmerge/main/assets/logo_dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/pavel-v-sobolev/dbmerge/main/assets/logo_light.png">
+    <img alt="dbmerge logo" src="https://raw.githubusercontent.com/pavel-v-sobolev/dbmerge/main/assets/logo_light.png" width="500">
   </picture>
 </p>
 

@@ -9,28 +9,13 @@ DBMerge requires a non-null unique key (preferable primary key) to compare data 
 from __future__ import annotations
 from typing import Literal, Any, TYPE_CHECKING
 
+import sys
 import uuid
 import time
 
 if TYPE_CHECKING:
     from pandas import DataFrame as PandasDataFrame
     from polars import DataFrame as PolarsDataFrame
-
-
-try:
-    import pandas as pd
-    import numpy as np
-    HAS_PANDAS = True
-except ImportError:
-    pd = None
-    HAS_PANDAS = False
-
-try:
-    import polars as pl
-    HAS_POLARS = True
-except ImportError:
-    pl = None
-    HAS_POLARS = False
 
 import logging
 from datetime import datetime, date
@@ -75,6 +60,17 @@ POLARS_TO_SQLALCHEMY_TYPE_MAP = {
     'Unknown': String(),
     'Extension': JSON(),
 }
+
+
+def _is_pandas_dataframe(data) -> bool:
+    # If pandas was never imported by the calling process, "data" cannot be a pandas DataFrame,
+    # so we only look up sys.modules and never import pandas ourselves.
+    pd = sys.modules.get('pandas')
+    return pd is not None and isinstance(data, pd.DataFrame)
+
+def _is_polars_dataframe(data) -> bool:
+    pl = sys.modules.get('polars')
+    return pl is not None and isinstance(data, pl.DataFrame)
 
 
 logger = logging.getLogger('dbmerge')
@@ -134,7 +130,7 @@ class dbmerge:
                  table_name: str, 
                  data: list[dict[str,Any]] | dict[str,list] | PandasDataFrame | PolarsDataFrame | None = None,
                  delete_mode: Literal['no', 'delete', 'mark']='no',
-                 delete_mark_field: str = None,
+                 delete_mark_field: str | None = None,
                  merged_on_field: str | None = None,
                  inserted_on_field: str | None = None,
                  skip_update_fields: list | None = None,
@@ -146,7 +142,7 @@ class dbmerge:
                  source_schema: str | None = None, 
                  can_create_table: bool = True,
                  can_create_columns: bool = True,
-                 can_create_schemas: bool = True) -> mergeResult:
+                 can_create_schemas: bool = True) -> None:
         """
         Init function prepares the database and internal structures before the merge operation.
         
@@ -162,18 +158,24 @@ class dbmerge:
         ```
 
         Args:
-            engine (Engine): The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, and MS SQL.
+            engine (Engine): The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, MS SQL and CockroachDB.
             table_name (str): The name of the target table where data will be merged.
             data (list[dict] | dict[str,list] | pd.DataFrame | pl.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries (e.g. [{'col1': 'val1'}, ...]), a dict of lists (e.g. {'col1': ['val1', ...], ...}) or a Pandas/Polars DataFrame.
+                For a list of dictionaries, the set of columns is taken from the first row: all rows must have the same keys, keys that appear only in later rows are ignored.
             delete_mode (Literal['no', 'delete', 'mark'], optional): Defines how to handle records that exist in the target table but are missing from the source data.
                 - 'no' (default): Retain existing target rows.
                 - 'delete': Hard delete rows from the target table.
                 - 'mark': Soft delete rows by setting a flag in `delete_mark_field`.
+                Warning: with 'delete' or 'mark', every target row missing from the source is affected. If the source covers only part
+                of the table (or is empty), restrict the scope with the delete_condition argument of exec(), otherwise
+                an empty source with delete_mode='delete' wipes the entire table.
             delete_mark_field (str, optional): The column used to flag a record as deleted. Must be a Boolean or Integer column.
                 A row missing from the source is set to True/1; inserted or resurrected (reappeared) rows are set to False/0.
                 If this column is present in the incoming data, the supplied value is used as-is.
             merged_on_field (str | None, optional): Timestamp column automatically updated to current datetime when a row is inserted, updated, or marked.
+                This column is always managed automatically: if present in the incoming data, the supplied values are ignored.
             inserted_on_field (str | None, optional): Timestamp column automatically set to current datetime when a new row is initially inserted.
+                This column is always managed automatically: if present in the incoming data, the supplied values are ignored.
             skip_update_fields (list, optional): List of column names to exclude from the UPDATE operation.
             key (list | None, optional): List of column names serving as the unique key to compare source and target tables. If omitted, uses the target table's Primary Key.
             data_types (dict[str, types.TypeEngine] | None, optional): Dictionary mapping column names to SQLAlchemy data types. Used when creating missing tables or columns.
@@ -354,7 +356,7 @@ class dbmerge:
                     self._get_fields_from_dict_of_list()              
 
             # PANDAS
-            elif HAS_PANDAS and isinstance(self.data,pd.DataFrame):
+            elif _is_pandas_dataframe(self.data):
                 self.type_of_data = 'pandas'
                 self.total_row_count = len(self.data)
                 if self.total_row_count==0:
@@ -372,7 +374,7 @@ class dbmerge:
                     self._get_fields_from_pandas()
 
             # POLARS
-            elif HAS_POLARS and isinstance(self.data,pl.DataFrame):
+            elif _is_polars_dataframe(self.data):
                 self.type_of_data = 'polars'
                 self.total_row_count = len(self.data)
                 if self.total_row_count==0:
@@ -390,7 +392,8 @@ class dbmerge:
                     self._get_fields_from_polars()
 
             else:
-                raise IncorrectDataError(f'Input "data" should be pandas/polars DataFrame or list of dict')
+                raise IncorrectDataError(f'Input "data" should be pandas/polars DataFrame, '
+                                         f'list of dicts or dict of lists')
 
             self._check_existing_and_new_fields()
 
@@ -469,6 +472,9 @@ class dbmerge:
         
         if self.merge_finished:
             raise IncorrectParameter(f'Merge exec already finished on table {self.table_full_name}')
+
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
+            raise IncorrectParameter(f'chunk_size must be a positive integer, got {chunk_size!r}')
 
         if delete_condition is not None:
             if not isinstance(delete_condition,ColumnElement):
@@ -895,12 +901,14 @@ class dbmerge:
             merged_on_field = self.table.c[self.merged_on_field]
             update_values[merged_on_field]=func.now()
 
-        if self.delete_condition is None:
-            update_stmt = update(self.table).values(update_values).where(not_(exists().where(update_where_clause)))
-        else:
-            update_stmt = update(self.table).values(update_values).\
-                                where(and_(self.delete_condition,
-                                           not_(exists().where(update_where_clause)) ))
+        # Skip rows that are already marked as deleted, so repeated merges do not
+        # re-mark them (inflating deleted_row_count and overwriting merged_on_field).
+        where_conditions = [not_(exists().where(update_where_clause)),
+                            mark_field.is_distinct_from(self.delete_mark_deleted_value)]
+        if self.delete_condition is not None:
+            where_conditions.append(self.delete_condition)
+
+        update_stmt = update(self.table).values(update_values).where(and_(*where_conditions))
         
         self.delete_sql = str(update_stmt)
         
@@ -1066,8 +1074,9 @@ class dbmerge:
                                   for vals in zip(*[v[begin:end] for v in self.data.values()])]
                 
                 elif self.type_of_data == 'pandas':
+                    import numpy as np  # numpy is a hard dependency of pandas, so it is already loaded
                     data_slice = self.data.iloc[begin:end]
-                    data_slice = data_slice.replace({np.nan: None})    
+                    data_slice = data_slice.replace({np.nan: None})
                     data_slice = data_slice.to_dict(orient='records')
                 
                 elif self.type_of_data == 'polars':
@@ -1105,7 +1114,14 @@ class dbmerge:
 
     def _drop_temp_table(self):
         if hasattr(self, 'temp_table') and self.temp_table is not None:
-            self.temp_table.drop(self.engine, checkfirst=True)
+            # TEMPORARY tables (sqlite/mysql/mariadb) are visible only on the connection
+            # that created them: dropping via the engine runs on another pooled connection
+            # where the table does not exist, leaving it alive until the pool recycles.
+            if hasattr(self, 'conn') and not self.conn.closed:
+                self.temp_table.drop(self.conn, checkfirst=True)
+                self.conn.commit()
+            else:
+                self.temp_table.drop(self.engine, checkfirst=True)
             self.temp_table = None
 
 

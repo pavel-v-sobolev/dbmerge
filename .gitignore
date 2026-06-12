@@ -9,6 +9,7 @@ ydb_data
 
 .vscode
 .qwen
+.claude
 
 # C extensions
 *.so
