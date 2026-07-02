@@ -7,7 +7,7 @@ import uuid
 import pytest
 import logging
 
-from sqlalchemy import create_engine, text, select, schema, func
+from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_
 from sqlalchemy import Table, MetaData, Column, String, Date, Integer, Numeric, JSON, Uuid, StaticPool
 
 from sample_data_in_sqlite import get_data, get_modified_data
@@ -69,6 +69,14 @@ def count_deleted_rows(engine, date_from=None, date_to=None):
     stmt = select(func.count()).select_from(tbl).where(tbl.c['Deleted'] == True)
     if date_from is not None and date_to is not None:
         stmt = stmt.where(tbl.c['Date'].between(date_from, date_to))
+    with engine.connect() as conn:
+        return conn.execute(stmt).scalar()
+
+
+def get_qty(engine, shop, product):
+    """Return the 'Qty' value of a single row identified by Shop/Product."""
+    tbl = _reflect_facts(engine)
+    stmt = select(tbl.c['Qty']).where((tbl.c['Shop'] == shop) & (tbl.c['Product'] == product))
     with engine.connect() as conn:
         return conn.execute(stmt).scalar()
 
@@ -482,6 +490,98 @@ def test_delete_mark_field_with_delete_mode_no(engine_name,type_of_data):
 @pytest.mark.parametrize("engine_name,type_of_data", [(engine_name,type_of_data)
                                                      for engine_name in engines
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
+def test_update_condition(engine_name,type_of_data):
+    logger.debug(f'TEST UPDATE_CONDITION {engine_name} {type_of_data}')
+    engine = create_engine(engines[engine_name])
+    prepare_and_clean_data(engine)
+
+    # seed three rows with distinct Qty values
+    data=[{'Shop':'1','Product':'A','Date':date(2025,1,1),'Qty':10},
+          {'Shop':'1','Product':'B','Date':date(2025,1,1),'Qty':20},
+          {'Shop':'2','Product':'A','Date':date(2025,1,1),'Qty':30}]
+    if type_of_data=='dict of list':
+        data = {k:[d[k] for d in data] for k in data[0].keys()}
+    elif type_of_data=='pandas':
+        data = pd.DataFrame(data)
+    elif type_of_data=='polars':
+        data = pl.DataFrame(data)
+
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
+                  key=key, data_types=data_types) as merge:
+        merge.exec()
+        assert merge.inserted_row_count==3, f'Incorrect row count from insert {merge.inserted_row_count}, should be 3'
+
+    # every Qty changes, but update_condition restricts the UPDATE to Shop='1' rows only
+    data=[{'Shop':'1','Product':'A','Date':date(2025,1,1),'Qty':100},
+          {'Shop':'1','Product':'B','Date':date(2025,1,1),'Qty':200},
+          {'Shop':'2','Product':'A','Date':date(2025,1,1),'Qty':300}]
+    if type_of_data=='dict of list':
+        data = {k:[d[k] for d in data] for k in data[0].keys()}
+    elif type_of_data=='pandas':
+        data = pd.DataFrame(data)
+    elif type_of_data=='polars':
+        data = pl.DataFrame(data)
+
+    with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
+                  key=key, data_types=data_types) as merge:
+        merge.exec(update_condition=merge.table.c['Shop'] == '1')
+        assert merge.inserted_row_count==0, f'Incorrect row count from insert {merge.inserted_row_count}, should be 0'
+        assert merge.updated_row_count==2, f'Incorrect row count from update {merge.updated_row_count}, should be 2 (only Shop=1)'
+        assert merge.deleted_row_count==0, f'Incorrect row count from delete {merge.deleted_row_count}, should be 0'
+
+    # rows satisfying update_condition got the new values ...
+    assert get_qty(engine,'1','A')==100, 'Shop=1 row must be updated'
+    assert get_qty(engine,'1','B')==200, 'Shop=1 row must be updated'
+    # ... while the row failing the condition keeps its original value untouched
+    assert get_qty(engine,'2','A')==30, 'Shop=2 row must be left untouched by update_condition'
+
+
+@pytest.mark.parametrize("engine_name,type_of_data", [(engine_name,type_of_data)
+                                                     for engine_name in engines
+                                                     for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
+def test_mark_resurrection_key_only_table(engine_name,type_of_data):
+    # A key-only table (no value columns) must still reset the auto-managed delete flag back to
+    # active when a previously marked-deleted row reappears in the source.
+    logger.debug(f'TEST MARK RESURRECTION ON KEY-ONLY TABLE {engine_name} {type_of_data}')
+    engine = create_engine(engines[engine_name])
+    prepare_and_clean_data(engine)
+
+    def as_type(rows):
+        if type_of_data=='dict of list':
+            return {k:[d[k] for d in rows] for k in rows[0].keys()}
+        elif type_of_data=='pandas':
+            return pd.DataFrame(rows)
+        elif type_of_data=='polars':
+            return pl.DataFrame(rows)
+        return rows
+
+    both=[{'Shop':'1','Product':'A','Date':date(2025,1,1)},
+          {'Shop':'1','Product':'B','Date':date(2025,1,1)}]
+    with dbmerge(engine=engine, data=as_type(both), table_name="Facts", schema='target', temp_schema='tmp',
+                  key=key, data_types=data_types, delete_mark_field='Deleted') as merge:
+        merge.exec()
+    assert count_deleted_rows(engine)==0, 'Freshly inserted rows must be active'
+
+    # drop 'B' -> it must be marked deleted
+    one=[{'Shop':'1','Product':'A','Date':date(2025,1,1)}]
+    with dbmerge(engine=engine, data=as_type(one), table_name="Facts", schema='target', temp_schema='tmp',
+                  delete_mode='mark', delete_mark_field='Deleted') as merge:
+        merge.exec()
+        assert merge.deleted_row_count==1, f'Expected 1 marked deleted, got {merge.deleted_row_count}'
+    assert count_deleted_rows(engine)==1, "'B' must be marked deleted"
+
+    # 'B' reappears -> the flag must be reset back to active despite there being no value columns
+    with dbmerge(engine=engine, data=as_type(both), table_name="Facts", schema='target', temp_schema='tmp',
+                  delete_mode='mark', delete_mark_field='Deleted') as merge:
+        merge.exec()
+        assert merge.updated_row_count==1, f'Reappeared row must be updated (reset), got {merge.updated_row_count}'
+        assert merge.deleted_row_count==0, f'Nothing should be marked deleted, got {merge.deleted_row_count}'
+    assert count_deleted_rows(engine)==0, 'Resurrected row must be reset to Deleted=False'
+
+
+@pytest.mark.parametrize("engine_name,type_of_data", [(engine_name,type_of_data)
+                                                     for engine_name in engines
+                                                     for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_a_set_from_temp_with_deletion(engine_name,type_of_data):
     logger.debug(f'TEST A SET FROM TEMP WITH DELETION {engine_name} {type_of_data}')
     engine = create_engine(engines[engine_name])
@@ -572,6 +672,88 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,type_of_da
         assert merge.updated_row_count>0, f'Incorrect row count from update {merge.updated_row_count}, should be >0'
         assert merge.deleted_row_count==0, f'Incorrect row count from delete {merge.deleted_row_count}, should be 0'
         
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_update_condition(engine_name):
+    # update_condition restricts the update phase: a row is overwritten only when it also satisfies
+    # the condition. Here: overwrite only if the incoming 'version' is not lower than the stored one.
+    logger.debug(f'TEST UPDATE_CONDITION {engine_name}')
+    engine = create_engine(engines[engine_name])
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100)}
+
+    seed = [{'Shop': 'S', 'Product': 'A', 'Qty': 1, 'version': 5}]
+    with dbmerge(engine=engine, data=seed, table_name='Facts', schema='target', temp_schema='tmp',
+                 data_types=dt, key=k) as merge:
+        merge.exec()
+
+    def conditional_merge(qty, version):
+        data = [{'Shop': 'S', 'Product': 'A', 'Qty': qty, 'version': version}]
+        with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                     data_types=dt, key=k) as merge:
+            cond = or_(merge.table.c['version'].is_(None),
+                       merge.temp_table.c['version'] >= merge.table.c['version'])
+            merge.exec(update_condition=cond)
+            return merge.updated_row_count
+
+    # incoming version lower than stored -> update_condition fails -> row left untouched
+    assert conditional_merge(qty=99, version=3) == 0, 'row failing the condition must not be updated'
+    assert get_qty(engine, 'S', 'A') == 1
+
+    # incoming version not lower -> updated
+    assert conditional_merge(qty=42, version=9) == 1, 'row satisfying the condition must be updated'
+    assert get_qty(engine, 'S', 'A') == 42
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_insert_condition(engine_name):
+    # insert_condition restricts the insert phase. With a correlated EXISTS it can inspect other
+    # target rows: here a missing row is inserted only if its group ('Shop') has no row with a
+    # greater 'version'. Combined with matching delete/update conditions, a group that already has a
+    # greater version is left fully untouched, while the rest is refreshed from the source.
+    logger.debug(f'TEST INSERT_CONDITION {engine_name}')
+    engine = create_engine(engines[engine_name])
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100)}
+
+    seed = [{'Shop': 'A', 'Product': '1', 'Qty': 10, 'version': 5},   # group A at version 5
+            {'Shop': 'A', 'Product': '2', 'Qty': 20, 'version': 5},
+            {'Shop': 'B', 'Product': '1', 'Qty': 30, 'version': 1}]   # group B at version 1
+    with dbmerge(engine=engine, data=seed, table_name='Facts', schema='target', temp_schema='tmp',
+                 data_types=dt, key=k) as merge:
+        merge.exec()
+
+    threshold = 3
+    incoming = [{'Shop': 'A', 'Product': '1', 'Qty': 10, 'version': threshold},
+                {'Shop': 'A', 'Product': '3', 'Qty': 999, 'version': threshold},  # new row in group A (version 5 > 3)
+                {'Shop': 'B', 'Product': '1', 'Qty': 31, 'version': threshold}]   # group B (version 1 <= 3)
+    with dbmerge(engine=engine, data=incoming, table_name='Facts', schema='target', temp_schema='tmp',
+                 data_types=dt, key=k, delete_mode='delete') as merge:
+        g = merge.table.alias()
+        upd = or_(merge.table.c['version'].is_(None),
+                  merge.temp_table.c['version'] >= merge.table.c['version'])
+        # delete only within groups present in the source AND not above the threshold
+        dele = and_(merge.table.c['Shop'].in_(select(merge.temp_table.c['Shop'])),
+                    merge.table.c['version'] <= threshold)
+        # don't insert into a group that already has a greater version
+        ins = ~exists().where(and_(g.c['Shop'] == merge.temp_table.c['Shop'],
+                                   g.c['version'] > threshold))
+        merge.exec(update_condition=upd, delete_condition=dele, insert_condition=ins)
+
+    tbl = _reflect_facts(engine)
+    with engine.connect() as conn:
+        rows = {(r.Shop, r.Product): (r.Qty, r.version) for r in conn.execute(
+            select(tbl.c['Shop'], tbl.c['Product'], tbl.c['Qty'], tbl.c['version'])).all()}
+
+    # group A has a greater version -> left untouched: new row (A,3) not inserted, existing rows kept
+    assert ('A', '3') not in rows, 'insert_condition must block inserting into a group with a greater version'
+    assert rows[('A', '1')] == (10, 5)
+    assert rows[('A', '2')] == (20, 5), 'row missing from source must survive (version-scoped delete_condition)'
+    # group B is at/below the threshold -> refreshed from the source
+    assert rows[('B', '1')] == (31, threshold)
 
 
 if __name__ == '__main__':

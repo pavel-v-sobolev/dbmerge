@@ -42,7 +42,7 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 - **`data_types`** *(dict[str, types.TypeEngine] | None, optional)*: A dictionary mapping column names to SQLAlchemy data types (e.g., `{'Name': String(100)}`). Used when creating missing tables or columns. If omitted, data types are auto-detected from the source data.
 - **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name).
 - **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created.
-- **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory (`data` parameter is ignored).
+- **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`.
 - **`source_schema`** *(str | None, optional)*: The database schema of the source table or view.
 - **`can_create_table`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target table if it does not exist.
 - **`can_create_columns`** *(bool, optional)*: Defaults to `True`. Allows the module to append missing columns to the target table.
@@ -77,11 +77,45 @@ with dbmerge(data=data, engine=engine, table_name="YourTable", delete_mode='dele
     result = merge.exec(delete_condition=condition)
 ```
 
+**Conditional Update Example:**
+By default the update phase overwrites a target row whenever any field differs from the source. Pass an `update_condition` to restrict which rows may be overwritten. For example, keep rows a user has marked as protected and refresh everything else:
+
+```python
+with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
+    # Never overwrite rows flagged as protected in the target table.
+    result = merge.exec(update_condition=merge.table.c['is_protected'] == False)
+```
+
+Rows that fail the condition are simply filtered out of the set of rows to update — they are left untouched (never deleted). The condition applies to the update phase only; the insert phase still inserts rows that are missing from the target. You can also compare the incoming value against the stored one (e.g. only overwrite when `merge.temp_table.c['updated_at'] >= merge.table.c['updated_at']`) to keep the freshest write.
+
+**Conditional Insert Example:**
+By default the insert phase adds every source row that is missing from the target. Pass an `insert_condition` to restrict which of those rows are inserted:
+
+```python
+with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
+    # Insert only rows with a positive amount.
+    result = merge.exec(insert_condition=merge.temp_table.c['amount'] > 0)
+```
+
+Build the condition on `merge.temp_table` (the row being inserted). Do **not** reference `merge.table` directly here — during insert the target row is absent (`NULL`) by definition. To look at *other* target rows, use a correlated `EXISTS` over a separate alias of the target:
+
+```python
+from sqlalchemy import exists
+
+with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
+    # Skip inserting into a category that already has a locked row.
+    g = merge.table.alias()
+    guard = ~exists().where((g.c['category'] == merge.temp_table.c['category']) & (g.c['locked'] == True))
+    result = merge.exec(insert_condition=guard)
+```
+
 #### Arguments
 - **`delete_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used in the `WHERE` clause during the delete/mark phase. Essential for chunked or partitioned data syncs.
 - **`source_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used to filter the `SELECT` statement when loading data from a `source_table_name`.
+- **`update_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression added to the `WHERE` clause of the update phase. A target row is updated only when it differs from the source **and** satisfies this condition. Build it on `merge.table` (target) and `merge.temp_table` (staging).
+- **`insert_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression added to the `WHERE` clause of the insert phase. A source row missing from the target is inserted only when it also satisfies this condition. Build it on `merge.temp_table` (the row being inserted); to inspect other target rows use a correlated `EXISTS` over `merge.table.alias()`.
 - **`commit_all_steps`** *(bool, optional)*: Defaults to `True`. If `True`, every step (temp insert, target insert, update, delete) is committed immediately. If `False`, a single commit is issued after all steps complete successfully.
-- **`chunk_size`** *(int, optional)*: Defaults to `10000`. Defines the batch size when inserting raw data (from Lists or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Must be a positive integer.
+- **`chunk_size`** *(int, optional)*: Defaults to `10000`. Defines the batch size when inserting raw data (from lists of dicts, dicts of lists or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Must be a positive integer.
 
 #### Execution Results & Statistics
 `exec()` returns a `mergeResult` dataclass. The same statistics are also available as attributes on the `dbmerge` instance after `exec()` completes.

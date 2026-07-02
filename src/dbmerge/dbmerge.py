@@ -181,7 +181,7 @@ class dbmerge:
             data_types (dict[str, types.TypeEngine] | None, optional): Dictionary mapping column names to SQLAlchemy data types. Used when creating missing tables or columns.
             schema (str | None, optional): The database schema of the target table.
             temp_schema (str | None, optional): The database schema where the temporary staging table will be created.
-            source_table_name (str | None, optional): If provided, data will be sourced directly from another existing database table or view.
+            source_table_name (str | None, optional): If provided, data will be sourced directly from another existing database table or view. Mutually exclusive with the "data" argument (passing both raises IncorrectParameter).
             source_schema (str | None, optional): The database schema of the source table or view.
             can_create_table (bool, optional): Allows the module to automatically create the target table if it does not exist (default is True).
             can_create_columns (bool, optional): Allows the module to append missing columns to the target table (default is True).
@@ -195,6 +195,16 @@ class dbmerge:
 
         try:
             _ensure_logger_handler()
+
+            self._validate_init_params(engine=engine, table_name=table_name, data=data,
+                                       delete_mode=delete_mode, delete_mark_field=delete_mark_field,
+                                       merged_on_field=merged_on_field, inserted_on_field=inserted_on_field,
+                                       skip_update_fields=skip_update_fields, key=key, data_types=data_types,
+                                       schema=schema, temp_schema=temp_schema,
+                                       source_table_name=source_table_name, source_schema=source_schema,
+                                       can_create_table=can_create_table, can_create_columns=can_create_columns,
+                                       can_create_schemas=can_create_schemas)
+
             self.data = data
             self.engine = engine
             self.table_name = table_name
@@ -438,6 +448,7 @@ class dbmerge:
 
 
     def exec(self, delete_condition: ColumnElement=None, source_condition: ColumnElement=None,
+             update_condition: ColumnElement=None, insert_condition: ColumnElement=None,
              commit_all_steps=True, chunk_size: int = 10000) -> mergeResult:
         """
         Executes the merge operation. It returns a mergeResult class with statistical information.
@@ -457,14 +468,30 @@ class dbmerge:
                 merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
 
         Args:
-            delete_condition (ColumnElement, optional): An SQLAlchemy binary expression used in the WHERE clause 
+            delete_condition (ColumnElement, optional): An SQLAlchemy binary expression used in the WHERE clause
                 during the delete/mark phase. Essential for chunked or partitioned data syncs.
-            source_condition (ColumnElement, optional): An SQLAlchemy binary expression used to filter the SELECT statement 
+            source_condition (ColumnElement, optional): An SQLAlchemy binary expression used to filter the SELECT statement
                 when loading data from a source_table_name.
-            commit_all_steps (bool, optional): If set to True (default), then every step (temp insert, target insert, update, delete) 
+            update_condition (ColumnElement, optional): An SQLAlchemy binary expression added to the WHERE clause of the
+                UPDATE phase, so a target row is updated only when this condition also holds (on top of "some field differs").
+                Build it on the target and staging tables exposed as `merge.table` and `merge.temp_table`. Rows that do not
+                satisfy the condition are left untouched (they are filtered out of the set of rows to update, not deleted);
+                the insert phase is unaffected. E.g. never overwrite rows flagged as protected:
+                    merge.exec(update_condition=merge.table.c['is_protected'] == False)
+            insert_condition (ColumnElement, optional): An SQLAlchemy binary expression added to the WHERE clause of the
+                INSERT phase, so a source row missing from the target is inserted only when this condition also holds.
+                Build it on the staging table `merge.temp_table` (the row being inserted), e.g. insert only positive rows:
+                    merge.exec(insert_condition=merge.temp_table.c['amount'] > 0)
+                Do NOT reference `merge.table` directly here: in the insert step the target row is absent (NULL) by
+                definition. To look at other target rows, use a correlated EXISTS over a separate alias of the target,
+                e.g. skip inserting into a category that already has a locked row:
+                    g = merge.table.alias()
+                    guard = ~exists().where((g.c['category'] == merge.temp_table.c['category']) & (g.c['locked'] == True))
+                    merge.exec(insert_condition=guard)
+            commit_all_steps (bool, optional): If set to True (default), then every step (temp insert, target insert, update, delete)
                 is committed immediately. If False, a single commit is issued after all steps complete successfully.
-            chunk_size (int, optional): Defines the batch size when inserting raw data (from Lists or Pandas DataFrames) 
-                into the temporary table to avoid memory/query-size limits. Defaults to 10000.
+            chunk_size (int, optional): Defines the batch size when inserting raw data (from lists of dicts, dicts of lists
+                or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Defaults to 10000.
 
         Returns:
             mergeResult: A dataclass object containing execution statistics (e.g., inserted_row_count, total_time).
@@ -492,6 +519,16 @@ class dbmerge:
                 logger.warning('source_condition is assigned, but source_table is not assigned. '
                                'source_condition will be ignored.')
         self.source_condition = source_condition
+
+        if update_condition is not None:
+            if not isinstance(update_condition,ColumnElement):
+                raise IncorrectParameter('update_condition argument should be sqlalchemy logical expression (ColumnElement type)')
+        self.update_condition = update_condition
+
+        if insert_condition is not None:
+            if not isinstance(insert_condition,ColumnElement):
+                raise IncorrectParameter('insert_condition argument should be sqlalchemy logical expression (ColumnElement type)')
+        self.insert_condition = insert_condition
 
         self.chunk_size = chunk_size
         
@@ -803,6 +840,69 @@ class dbmerge:
             self.table = self._load_table_metadata_from_db(self.table_name,self.schema)
                
 
+    def _validate_init_params(self, engine, table_name, data, delete_mode, delete_mark_field,
+                              merged_on_field, inserted_on_field, skip_update_fields, key,
+                              data_types, schema, temp_schema, source_table_name, source_schema,
+                              can_create_table, can_create_columns, can_create_schemas):
+        """Validate user-supplied arguments up front so that a wrong type raises a
+        clear IncorrectParameter instead of an obscure crash deeper in the merge."""
+
+        if not isinstance(engine, Engine):
+            raise IncorrectParameter(f'"engine" must be a SQLAlchemy Engine (from create_engine()), '
+                                     f'got {type(engine).__name__}.')
+
+        if not isinstance(table_name, str) or table_name.strip() == '':
+            raise IncorrectParameter(f'"table_name" must be a non-empty string, got {table_name!r}.')
+
+        if delete_mode not in ('no', 'delete', 'mark'):
+            raise IncorrectParameter(f'''"delete_mode" must be one of 'no', 'delete', 'mark', got {delete_mode!r}.''')
+
+        # scalar string-or-None parameters
+        for name, value in (('delete_mark_field', delete_mark_field),
+                            ('merged_on_field', merged_on_field),
+                            ('inserted_on_field', inserted_on_field),
+                            ('schema', schema),
+                            ('temp_schema', temp_schema),
+                            ('source_table_name', source_table_name),
+                            ('source_schema', source_schema)):
+            if value is not None and not isinstance(value, str):
+                raise IncorrectParameter(f'"{name}" must be a string or None, got {type(value).__name__}.')
+
+        # list-of-strings-or-None parameters
+        for name, value in (('key', key), ('skip_update_fields', skip_update_fields)):
+            if value is None:
+                continue
+            if not isinstance(value, list):
+                raise IncorrectParameter(f'"{name}" must be a list of column names or None, '
+                                         f'got {type(value).__name__}.')
+            for item in value:
+                if not isinstance(item, str):
+                    raise IncorrectParameter(f'"{name}" must contain only column name strings, '
+                                             f'got element {item!r} of type {type(item).__name__}.')
+
+        if data_types is not None:
+            if not isinstance(data_types, dict):
+                raise IncorrectParameter(f'"data_types" must be a dict mapping column names to SQLAlchemy '
+                                         f'types or None, got {type(data_types).__name__}.')
+            for col, col_type in data_types.items():
+                if not isinstance(col, str):
+                    raise IncorrectParameter(f'"data_types" keys must be column name strings, got key {col!r}.')
+                if not isinstance(col_type, types.TypeEngine):
+                    raise IncorrectParameter(f'"data_types" value for column "{col}" must be a SQLAlchemy type '
+                                             f'instance (e.g. String(100)), got {col_type!r}.')
+
+        # boolean flags
+        for name, value in (('can_create_table', can_create_table),
+                            ('can_create_columns', can_create_columns),
+                            ('can_create_schemas', can_create_schemas)):
+            if not isinstance(value, bool):
+                raise IncorrectParameter(f'"{name}" must be a boolean, got {type(value).__name__}.')
+
+        if data is not None and source_table_name is not None:
+            raise IncorrectParameter('Provide either "data" or "source_table_name", not both '
+                                     '("data" is ignored when a source table is given).')
+
+
     def _check_key(self):
         if self.key is None or len(self.key)==0:
             if self.table is not None:
@@ -846,10 +946,16 @@ class dbmerge:
             join_conditions.append(self.table.c[key_col]==self.temp_table.c[key_col])
         on_clause = and_(*join_conditions)
 
-        select_stmt = select(*source_fields).join(self.table, on_clause, isouter=True).where(first_pk_col.is_(None))  
+        # A source row is "missing" when the outer-joined target row is absent (its PK is NULL).
+        where_clause = first_pk_col.is_(None)
 
-        #alternative version of select, which does not work on postgres
-        #select_stmt = select(*source_fields).where(not_(exists(on_clause))) 
+        # Optional caller-supplied guard: a missing source row is inserted only when it also
+        # satisfies insert_condition. Reference merge.temp_table (and, for target lookups, a
+        # separate alias of the target) — merge.table here is the NULL side of the outer join.
+        if self.insert_condition is not None:
+            where_clause = and_(where_clause, self.insert_condition)
+
+        select_stmt = select(*source_fields).join(self.table, on_clause, isouter=True).where(where_clause)
 
         insert_stmt = insert(self.table).from_select(target_fields, select_stmt) #.returning(*pk_cols)
 
@@ -922,10 +1028,14 @@ class dbmerge:
     def _update_not_matching_data(self):
         
         start_time = time.perf_counter()
-        non_key_cols = [c for c in self.data_fields if c not in self.key and 
+        non_key_cols = [c for c in self.data_fields if c not in self.key and
                                                        c not in self.skip_update_fields]
 
-        if len(non_key_cols)==0:
+        # The auto-managed delete flag still has to be reset to active when a marked-deleted row
+        # reappears, even for key-only tables that have no value columns to compare/update.
+        manage_mark_reset = self.delete_mark_field is not None and not self.delete_mark_from_data
+
+        if len(non_key_cols)==0 and not manage_mark_reset:
             # nothing to update
             self.updated_row_count = 0
             self.update_time = 0
@@ -949,6 +1059,12 @@ class dbmerge:
             where_conditions.append(mark_field.is_distinct_from(self.delete_mark_active_value))
 
         where_clause = or_(*where_conditions)
+
+        # Optional caller-supplied guard: a target row is updated only when it also satisfies
+        # update_condition (e.g. a version guard that keeps the newest write). Rows that fail the
+        # guard drop out of this subquery, so the UPDATE below never touches them.
+        if self.update_condition is not None:
+            where_clause = and_(where_clause, self.update_condition)
 
         select_stmt = select(self.temp_table).join(self.table, on_clause, isouter=False).where(where_clause)
         select_stmt = select_stmt.subquery()

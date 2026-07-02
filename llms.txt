@@ -44,6 +44,34 @@ with dbmerge(engine=engine, data=data, table_name="Sales", key=['id'], delete_mo
     merge.exec(delete_condition=condition)
 ```
 
+## 2b. Conditional Update (`update_condition`)
+By default the update phase overwrites a target row whenever any field differs from the source. Pass an `update_condition` to `exec()` to overwrite a row only when that condition also holds. Like `delete_condition`, it MUST be a SQLAlchemy binary expression built on `merge.table.c` (target) and `merge.temp_table.c` (staging). Rows failing the condition are filtered out of the update set and left untouched (never deleted); the insert phase is unaffected.
+
+```python
+with dbmerge(engine=engine, data=data, table_name="Sales", key=['id']) as merge:
+    # Never overwrite rows flagged as protected in the target table.
+    merge.exec(update_condition=merge.table.c['is_protected'] == False)
+```
+
+You can also compare the incoming value against the stored one — e.g. `merge.temp_table.c['updated_at'] >= merge.table.c['updated_at']` — to keep only the freshest write when several sources update the same rows.
+
+## 2c. Conditional Insert (`insert_condition`)
+By default the insert phase adds every source row missing from the target. Pass an `insert_condition` to `exec()` to insert such a row only when the condition also holds. Build it on `merge.temp_table.c` (the row being inserted). Do NOT reference `merge.table.c` directly — during insert the target row is absent (NULL). To inspect other target rows, use a correlated `EXISTS` over a separate alias `merge.table.alias()`.
+
+```python
+from sqlalchemy import exists
+
+with dbmerge(engine=engine, data=data, table_name="Sales", key=['id']) as merge:
+    # Simple: insert only positive rows.
+    merge.exec(insert_condition=merge.temp_table.c['amount'] > 0)
+
+with dbmerge(engine=engine, data=data, table_name="Sales", key=['id']) as merge:
+    # Correlated: skip inserting into a category that already has a locked row.
+    g = merge.table.alias()
+    guard = ~exists().where((g.c['category'] == merge.temp_table.c['category']) & (g.c['locked'] == True))
+    merge.exec(insert_condition=guard)
+```
+
 ## 3. Materializing a View to a Table
 You can use `dbmerge` to update a target table from a slow view efficiently.
 
