@@ -1,0 +1,139 @@
+# DBMerge 1.0.20 — только вновь найденные дефекты
+
+| | |
+|---|---|
+| **Дата** | 2026-08-07 |
+| **Объект** | `src/dbmerge/dbmerge.py` |
+| **Скоуп** | Дефекты, которых **нет** в `DBMerge_bug_audit_2026-08-02` и `DBMerge_deep_audit_2026-08-02` |
+| **Метод** | Динамическое воспроизведение (SQLite, StaticPool) + разбор кода |
+| **Не включено** | Всё уже описанное в предыдущих отчётах; by-design поведение API |
+
+---
+
+## Сводка
+
+| ID | Уровень | Дефект |
+|---|---|---|
+| **N-01** | HIGH | `update_condition` блокирует resurrection soft-deleted строк |
+| **N-02** | HIGH | `delete_mark_field` ∈ merge-key → mark-фаза обновляет PK |
+| **N-03** | HIGH | Auto-managed mark на бизнес-колонке затирает значения (`5→0`) |
+| **N-04** | MEDIUM | Mark missing на бизнес-колонке пишет `1` поверх бизнес-кода |
+| **N-05** | MEDIUM | `NULL` в mark из data нарушает контракт active = 0 / False |
+
+---
+
+## N-01. `update_condition` блокирует воскрешение soft-delete
+
+**Где:** `_update_not_matching_data` — сброс `delete_mark` в active выполняется только в UPDATE; `update_condition` сужает тот же фильтр.
+
+**LIVE:**
+
+```text
+target:  id=1, v='old', del=1, prot=1
+source:  id=1, v='new'
+delete_mode='mark', delete_mark_field='del'
+exec(update_condition = table.c['prot'] == 0)
+
+после:   id=1, v='old', del=1
+updated_row_count=0, deleted_row_count=0
+```
+
+Строка присутствует в source, но flag остаётся «удалён»: resurrection завязан на update, а update отрезан.
+
+**Почему дефект:** при `delete_mode='mark'` присутствие в source означает active. `update_condition` по доке ограничивает перезапись полей, а не отменяет модель soft-delete → «вечный» soft-delete при защите строк.
+
+**Исправление:** отдельный UPDATE для mark-reset без `update_condition`, либо явный контракт/флаг, что condition не применяется к resurrection.
+
+---
+
+## N-02. `delete_mark_field` может совпадать с merge-key
+
+**Где:** нет проверки в `_validate_init_params` / `_check_key`.  
+Mark-фаза: `UPDATE … SET <mark> = deleted_value` при `mark == key` → запись в PK.
+
+**LIVE:**
+
+```text
+target: (1,'a'), (2,'b')
+source: (1,'a')
+key=['id'], delete_mode='mark', delete_mark_field='id'
+
+→ IntegrityError: UNIQUE constraint failed: t.id
+  UPDATE t SET id=? WHERE NOT EXISTS (...) AND t.id IS NOT ?
+  parameters: (1, 1)
+```
+
+«Пометить удалённой» строку 2 = присвоить ей `id=1`.
+
+**Исправление:** `IncorrectParameter`, если `delete_mark_field in key` (и при совпадении с audit-полями).
+
+---
+
+## N-03. Auto-managed mark на бизнес-колонке затирает данные
+
+Поле mark не обязано быть dedicated flag. Если колонка Integer/Boolean и **не** приходит во входе (`delete_mark_from_data=False`), любое попадание строки в UPDATE выставляет mark = active (`0`).
+
+**LIVE:**
+
+```text
+target: id=1, status=5, name='old'    # status — бизнес-код
+source: {id:1, name:'new'}            # status не передан
+delete_mode='mark', delete_mark_field='status'
+
+после:  id=1, status=0, name='new'    # 5 уничтожен
+```
+
+**Исправление:** preflight/warning, если в mark-колонке уже есть значения ∉ {0,1,true,false,null}; не смешивать auto-reset mark с «чужими» non-binary value sets без явного opt-in.
+
+---
+
+## N-04. Mark-фаза пишет `1` в бизнес-колонку «отсутствующих» строк
+
+**LIVE:**
+
+```text
+target: (1, status=5, 'a'), (2, status=7, 'b')
+source: (1, status=5, 'a')
+delete_mark_field='status', delete_mode='mark'
+
+после:  (1, 5, 'a'), (2, 1, 'b')
+# status=7 заменён на deleted_value=1
+```
+
+**Исправление:** то же, что N-03 — жёстче валидировать назначение mark-поля; документировать, что колонка должна быть только флагом.
+
+---
+
+## N-05. `NULL` в mark при поставке из data
+
+Документация auto-path: active = `False`/`0`, не NULL.  
+При `delete_mark_from_data=True` значение `NULL` из source сохраняется:
+
+```text
+del=None → в target NULL
+```
+
+Трёхзначная логика (NULL / 0 / 1) ломает однозначный active/deleted; `is_distinct_from` и счётчики mark ведут себя иначе, чем для чистого 0/1.
+
+**Исправление:** `IncorrectDataError` на NULL mark или нормализация NULL → active.
+
+---
+
+## Исправления (приоритет)
+
+| P0 | N-01 resurrection ≠ update_condition; N-02 запрет mark∈key |
+| P1 | N-03/N-04 защита business mark-колонки; N-05 NULL mark |
+
+---
+
+## Доказательства
+
+```text
+N-01  rows=[(1,'old',1,1)]  del stuck
+N-02  UPDATE SET id=1 → UNIQUE constraint failed
+N-03  status 5 → 0
+N-04  status 7 → 1 on missing row
+N-05  del=NULL stored and treated outside {0,1}
+```
+
+Код: `_update_not_matching_data`, `_mark_rows_missing_in_source`, `_resolve_delete_mark_values`, отсутствие guard в `_validate_init_params` / `_check_key`.

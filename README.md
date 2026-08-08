@@ -117,6 +117,15 @@ Here is a rough performance comparison for synchronizing data of different sizes
 - **Oracle:** Currently **not supported** (missing support for `JOIN` operations in `UPDATE` statements within the `oracledb` module).
 - **DuckDB:** Currently **not supported** (due to a bug in `duckdb_engine` regarding table definition loading).
 
+## Data Loss Risks
+
+DBMerge modifies your target table in bulk, and three deliberate design trade-offs that may have negative effects on your data:
+- `delete_mode='delete'` without `delete_condition` treats the source as a **complete** snapshot (an empty source wipes the table).
+- automatic schema creation with default `can_create_table=True` and `can_create_columns=True` infers column types from a sample of your data.
+- default `commit_all_steps=True` commits each phase separately, so a failure leaves a partial result.
+
+Read [Data Loss Risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#data-loss-risks) for the full list and the pre-merge checklist.
+
 ## Documentation
 
 - [Full Module Documentation](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md)

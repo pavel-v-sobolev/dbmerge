@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<!-- saved from url=(0070)file:///home/pavel/.cache/.fr-H8KDT3/DBMerge_bug_audit_2026-08-02.html -->
+<html lang="ru"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
+<title>DBMerge 1.0.20 - углубленный аудит дефектов</title>
+<style>
+@page { size: A4; margin: 16mm 16mm 18mm 18mm; }
+* { box-sizing: border-box; }
+body { margin: 0; color: #17212b; font-family: "Liberation Sans", sans-serif; font-size: 10.2pt; line-height: 1.42; }
+h1, h2, h3, h4 { color: #102a43; page-break-after: avoid; }
+h1 { margin: 0 0 8mm; font-size: 28pt; line-height: 1.05; letter-spacing: -0.5pt; }
+h2 { margin: 9mm 0 4mm; padding-bottom: 2mm; border-bottom: 2px solid #0b7285; font-size: 18pt; }
+h3 { margin: 6mm 0 2.5mm; font-size: 13.5pt; }
+h4 { margin: 4mm 0 1.5mm; font-size: 11pt; }
+p { margin: 0 0 3mm; }
+ul, ol { margin: 1.5mm 0 3mm 6mm; padding-left: 5mm; }
+li { margin: 0 0 1.5mm; }
+code { font-family: "Liberation Mono", monospace; font-size: 9pt; color: #7c2d12; }
+pre { margin: 2.5mm 0 4mm; padding: 3mm; border-left: 3px solid #0b7285; background: #f3f7f8; white-space: pre-wrap; word-break: break-word; font-family: "Liberation Mono", monospace; font-size: 8.2pt; line-height: 1.35; }
+table { width: 100%; border-collapse: collapse; margin: 3mm 0 5mm; page-break-inside: auto; }
+tr { page-break-inside: avoid; }
+th { padding: 2.2mm; border: 1px solid #9fb3c8; background: #d9eaf0; color: #102a43; text-align: left; font-size: 9pt; }
+td { padding: 2.2mm; border: 1px solid #b8c7d3; vertical-align: top; font-size: 8.8pt; }
+a { color: #075985; text-decoration: none; }
+.cover { min-height: 255mm; padding: 20mm 10mm 0; background: #eef7f7; page-break-after: always; }
+.cover .kicker { margin-bottom: 5mm; color: #0b7285; font-weight: 700; text-transform: uppercase; letter-spacing: 1.2pt; }
+.cover .subtitle { width: 85%; color: #486581; font-size: 15pt; line-height: 1.35; }
+.cover .verdict { margin-top: 18mm; padding: 6mm; border-left: 6px solid #b42318; background: #fff1f0; font-size: 13pt; font-weight: 700; }
+.cover .meta { margin-top: 24mm; color: #486581; }
+.pagebreak { page-break-before: always; }
+.callout { margin: 3mm 0 5mm; padding: 3.5mm; border-left: 4px solid #0b7285; background: #edf7f8; }
+.danger { border-left-color: #b42318; background: #fff1f0; }
+.good { border-left-color: #2f855a; background: #edf9f1; }
+.badge { display: inline-block; padding: 0.5mm 1.6mm; border-radius: 2mm; color: white; font-size: 7.8pt; font-weight: 700; white-space: nowrap; }
+.p0 { background: #b42318; }
+.p1 { background: #c05621; }
+.p2 { background: #526d82; }
+.ok { background: #2f855a; }
+.mono { font-family: "Liberation Mono", monospace; }
+.finding { page-break-inside: avoid; }
+.footer-note { margin-top: 8mm; padding-top: 3mm; border-top: 1px solid #bcccdc; color: #627d98; font-size: 8.5pt; }
+</style>
+</head>
+<body>
+<section class="cover">
+<div class="kicker">Evidence-based defect audit</div>
+<h1>DBMerge 1.0.20<br>углубленный аудит реальных дефектов</h1>
+<p class="subtitle">Быстродействие, безопасность, поведение на границах и особенности SQLite, PostgreSQL, MySQL, MariaDB и Microsoft SQL Server.</p>
+<div class="verdict">Вердикт: NO-GO для SQL Server и для автоматического создания/расширения схемы в MySQL/MariaDB. Условный GO возможен только для ограниченного профиля с заранее подготовленной схемой и после закрытия P0/P1.</div>
+<div class="meta">
+<p><strong>Дата:</strong> 2 августа 2026</p>
+<p><strong>Репозиторий:</strong> <a href="https://github.com/pavel-v-sobolev/dbmerge">github.com/pavel-v-sobolev/dbmerge</a></p>
+<p><strong>Проверенный checkout:</strong> <span class="mono">/home/blade/Downloads/pavel/dbmerge</span></p>
+<p><strong>Объект:</strong> пакет <span class="mono">dbmerge 1.0.20</span></p>
+<p><strong>Изменения исходного кода:</strong> не выполнялись</p>
+</div>
+</section>
+
+<h2>1. Резюме для принятия решения</h2>
+<div class="callout danger"><strong>Главный вывод.</strong> Базовая set-based логика UPDATE/INSERT/DELETE работает на обычных схемах, но автоматическая работа со схемой и staging содержит дефекты уровня блокера. На MySQL/MariaDB модуль способен успешно завершиться после изменения числового значения и времени. На MySQL он способен изменить сам ключ <code>0</code> на <code>1</code>. На PostgreSQL автосозданная sequence остаётся рассинхронизированной. SQL Server получает заведомо недопустимый DDL временной таблицы.</div>
+
+<table>
+<thead><tr><th>ID</th><th>Приоритет</th><th>Дефект</th><th>Доказательство</th><th>Результат</th></tr></thead>
+<tbody>
+<tr><td>DB-01</td><td><span class="badge p0">P0</span></td><td><code>float</code> выводится как голый <code>NUMERIC</code></td><td>MySQL 8.4.11 и MariaDB 11.4.12 live</td><td><code>1.75</code> сохраняется как <code>2</code></td></tr>
+<tr><td>DB-02</td><td><span class="badge p0">P0</span></td><td>Datetime создаётся без дробной точности и без контракта timezone</td><td>MySQL и MariaDB live</td><td>Потеря microseconds; offset игнорируется</td></tr>
+<tr><td>DB-03</td><td><span class="badge p0">P0</span></td><td>Невалидная staging-таблица SQL Server</td><td>SQLAlchemy MSSQL compiler + Microsoft T-SQL</td><td><code>CREATE TEMPORARY TABLE</code> не поддерживается</td></tr>
+<tr><td>DB-04</td><td><span class="badge p0">P0</span></td><td>Внешний integer key ошибочно превращается в generated/identity</td><td>MySQL и PostgreSQL live; MSSQL compiler</td><td>Подмена <code>0→1</code>, stale sequence, <code>IDENTITY_INSERT</code></td></tr>
+<tr><td>DB-05</td><td><span class="badge p1">P1</span></td><td>Автосоздание строк MySQL/MariaDB не работает</td><td>Обе СУБД live; все DataFrame-форматы</td><td><code>VARCHAR requires a length</code></td></tr>
+<tr><td>DB-06</td><td><span class="badge p1">P1</span></td><td>Валидный снимок не применим из-за порядка DML</td><td>SQLite, PostgreSQL, MySQL live</td><td>Ложный конфликт <code>UNIQUE</code> до DELETE</td></tr>
+<tr><td>DB-07</td><td><span class="badge p1">P1</span></td><td>Source-table ломается на generated columns</td><td>PostgreSQL 18.3 live</td><td><code>GeneratedAlways</code> даже при пустой target</td></tr>
+<tr><td>DB-08</td><td><span class="badge p1">P1</span></td><td>Неоднородный <code>list[dict]</code> молча теряет поля</td><td>SQLite live</td><td>Поле, появившееся после первой строки, исчезает</td></tr>
+<tr><td>DB-09</td><td><span class="badge p1">P1</span></td><td>Дубликаты колонок Pandas молча перезаписываются</td><td>SQLite live</td><td>Из двух <code>value</code> остаётся только второе</td></tr>
+<tr><td>DB-10</td><td><span class="badge p1">P1</span></td><td><code>data_types</code> ломает managed fields</td><td>3 независимых live-сценария</td><td>Сырой <code>AttributeError</code></td></tr>
+<tr><td>DB-11</td><td><span class="badge p2">P2</span></td><td>SQLite <code>:memory:</code> + <code>NullPool</code> не работает</td><td>SQLite live</td><td>Target создаётся в другом соединении</td></tr>
+<tr><td>DB-12</td><td><span class="badge p2">P2</span></td><td>Cleanup может скрыть первичную ошибку</td><td>Fault injection</td><td>Подмена исключения и незакрытое соединение</td></tr>
+<tr><td>DB-13</td><td><span class="badge p2">P2</span></td><td>Метрики и SQL в результате не соответствуют документации</td><td>Wall clock и dialect paramstyle</td><td>3.5 мс вместо 248 мс; SQL не exact</td></tr>
+<tr><td>DB-14</td><td><span class="badge p2">P2</span></td><td>Некорректные комбинации API дают системные исключения</td><td>Live negative probes</td><td><code>TypeError</code>/<code>AttributeError</code></td></tr>
+</tbody>
+</table>
+
+<h3>Что является блокером production</h3>
+<ul>
+<li><strong>SQL Server:</strong> любой запуск до исправления staging DDL и identity-семантики.</li>
+<li><strong>MySQL/MariaDB:</strong> любой запуск с <code>can_create_table=True</code> или <code>can_create_columns=True</code> для строк, float и datetime.</li>
+<li><strong>MySQL:</strong> любой integer key, в котором допустим <code>0</code>, даже при заранее созданной target-таблице.</li>
+<li><strong>PostgreSQL:</strong> автосозданная integer-key таблица, если после merge ожидаются обычные вставки с default sequence.</li>
+<li><strong>Все СУБД:</strong> full-snapshot с перераспределением значений под обычным <code>UNIQUE</code>, source-table с generated columns и входные данные без строгой проверки схемы.</li>
+</ul>
+
+<h3>Что в этом отчёте не названо багом</h3>
+<div class="callout good"><ul>
+<li>Пустой dataset при <code>delete_mode='delete'</code> очищает target. Это заявленная семантика полного снимка.</li>
+<li>Пошаговые commit по умолчанию являются осознанным компромиссом ради размера транзакции/WAL. Частичный результат после поздней ошибки здесь не переименован в дефект.</li>
+<li>Уникальность merge-key и конкурентный доступ должны обеспечиваться схемой и транзакционной политикой БД.</li>
+<li>Но БД не отвечает за staging, который модуль сам ошибочно делает <code>AUTO_INCREMENT/IDENTITY</code>, за неверный тип <code>DECIMAL(10,0)</code> или за порядок DML, не способный достичь валидного конечного состояния.</li>
+</ul></div>
+
+<h2 class="pagebreak">2. Методика и границы доказательств</h2>
+<h3>2.1. Определение дефекта</h3>
+<p>В список включались только случаи, где выполнено хотя бы одно условие: значение молча изменено; документированный сценарий завершается низкоуровневой ошибкой; сгенерирован SQL, недопустимый для заявленной СУБД; результат противоречит публичному контракту; модуль не может достичь валидного конечного состояния из-за собственного порядка операций.</p>
+
+<h3>2.2. Среда</h3>
+<table>
+<thead><tr><th>Компонент</th><th>Версия/режим</th><th>Тип проверки</th></tr></thead>
+<tbody>
+<tr><td>DBMerge</td><td>1.0.20</td><td>Локальный checkout</td></tr>
+<tr><td>Python</td><td>3.13.6; quick start также 3.10.18 и 3.14.6</td><td>Live</td></tr>
+<tr><td>SQLAlchemy</td><td>2.0.51</td><td>Live + dialect compiler</td></tr>
+<tr><td>SQLite</td><td>3.49.1</td><td>Live</td></tr>
+<tr><td>PostgreSQL</td><td>18.3</td><td>Live; session temporary objects</td></tr>
+<tr><td>MySQL Community</td><td>8.4.11</td><td>Одноразовый Docker</td></tr>
+<tr><td>MariaDB</td><td>11.4.12</td><td>Одноразовый Docker</td></tr>
+<tr><td>Microsoft SQL Server</td><td>Dialect <code>mssql</code></td><td>Компиляция реального SQLAlchemy Table; live instance отсутствовал</td></tr>
+</tbody>
+</table>
+
+<h3>2.3. Положительная база</h3>
+<ul>
+<li><code>pytest tests/test_all.py -k sqlite</code>: 54/54 passed, 216 deselected.</li>
+<li>Coverage того же набора: 83% statements, 585/707, 54/54 passed.</li>
+<li>Модельный randomized test: 180/180 сценариев обычного merge с уникальным ненулевым ключом для <code>no/delete/mark</code>.</li>
+<li>Core UPDATE/INSERT/DELETE на заранее созданной схеме: успешно на MySQL 8.4.11 и MariaDB 11.4.12.</li>
+</ul>
+<p>Это подтверждает, что дефекты ниже не являются утверждением «ничего не работает». Они находятся в production-ветках, которые happy-path suite не покрывает.</p>
+
+<h3>2.4. Уровни уверенности</h3>
+<table>
+<thead><tr><th>Маркер</th><th>Смысл</th></tr></thead>
+<tbody>
+<tr><td><strong>LIVE</strong></td><td>Сценарий выполнен на указанной СУБД, результат считан обратно.</td></tr>
+<tr><td><strong>COMPILED</strong></td><td>SQLAlchemy-объект проекта скомпилирован официальным dialect compiler; семантика сверена с документацией СУБД.</td></tr>
+<tr><td><strong>FAULT</strong></td><td>Контролируемая инъекция отказа проверяет ветку обработки ошибок, но не частоту события.</td></tr>
+</tbody>
+</table>
+
+<h2 class="pagebreak">3. P0: блокеры и порча данных</h2>
+<div class="finding">
+<h3>DB-01. Float превращается в DECIMAL(10,0) и округляется</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-01 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #9c2f24;background:#fff8f5;">
+  <h4 style="margin:0 0 8px;">Полный паспорт воспроизведения: исходное состояние, типы и контроль результата</h4>
+  <p><strong>Контур.</strong> Основной запуск выполнен на MySQL 8.4.11, повторяющий запуск — на MariaDB 11.4.12. Это два отдельных запуска с отдельными именами target-таблиц; результат одной СУБД не переносился в другую.</p>
+  <p><strong>Что существовало до вызова.</strong> Сама база и учетная запись существовали, но таблицы <code>auto_float_2c2d1187</code> в MySQL и <code>auto_float_c0e0704f</code> в MariaDB отсутствовали. Это проверялось через каталог СУБД до вызова. Следовательно, до теста не существовали ни столбец <code>amount</code>, ни его SQL-тип, ни primary key, ни default/trigger, способные изменить значение. Источником была структура в памяти процесса, а не исходная SQL-таблица.</p>
+  <p><strong>Точный вход и типы.</strong> В базовом варианте передавался один Python-record <code>{"id": 1, "amount": 1.75}</code>: <code>id</code> имел runtime-тип <code>int</code>, <code>amount</code> — <code>float</code>. Дополнительные независимые прогоны использовали Pandas DataFrame, где <code>amount</code> имел dtype <code>float64</code>, и Polars DataFrame, где этот столбец имел dtype <code>Float64</code>. Значение не поступало строкой <code>"1.75"</code> и не было заранее округлено приложением.</p>
+  <p><strong>Параметры операции.</strong> Был включен штатный путь автосоздания target; ключом сопоставления служил <code>id</code>. Пользовательский <code>data_types</code> для <code>amount</code> намеренно не задавался: проверялось именно документированное автоматическое определение схемы. Таблица не подготавливалась вручную.</p>
+  <p><strong>Как проходил тест.</strong> (1) Проверено отсутствие target. (2) DBMerge проанализировал входные значения и построил metadata target. (3) Модуль создал target и временную staging-таблицу. (4) Одна строка была загружена в staging и перенесена в target. (5) После завершения независимо прочитаны <code>information_schema.columns</code> и сама строка обычным <code>SELECT</code>. (6) Временные и target-объекты удалялись только после фиксации доказательств.</p>
+  <p><strong>Фактический выход.</strong> В обоих серверных диалектах столбец был создан как <code>DECIMAL(10,0)</code>. В target находилось числовое значение <code>2</code>, а не <code>1.75</code>: дробная часть была необратимо потеряна при записи. Та же ветка воспроизвелась для Python, Pandas и Polars, поэтому дефект не сводится к одному адаптеру входных данных.</p>
+  <p><strong>Оракул и локализация дефекта.</strong> Проверялось round-trip равенство: значение после чтения должно быть численно равно входному <code>1.75</code>. Оно не равно. Так как target и поле до запуска отсутствовали, изменение внесено цепочкой «инференс типа → сгенерированный DDL → запись», а не прежней схемой клиента. Ручное задание типа с ненулевым scale является обходом, но не исправляет опасный default автосоздания.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-01 -->
+<p><span class="badge p0">P0 DATA CORRUPTION</span> <strong>LIVE MySQL + MariaDB</strong></p>
+<h4>Как именно проводился тест</h4>
+<p><strong>Состояние MySQL до запуска.</strong> Был поднят одноразовый MySQL Community 8.4.11 с пустой schema <code>dbmerge_audit</code>. Таблицы <code>auto_float_2c2d1187</code> до теста не существовало. Не существовало и staging: её должен был создать сам DBMerge. SQL mode сервера содержал <code>STRICT_TRANS_TABLES</code>, то есть тест выполнялся не в ослабленном режиме.</p>
+<p><strong>Полный вход.</strong> В DBMerge передан Python-объект <code>[{'id': 1, 'amount': 1.75}]</code>. Параметры: <code>table_name='auto_float_2c2d1187'</code>, <code>schema='dbmerge_audit'</code>, <code>key=['id']</code>; <code>can_create_table</code> и <code>can_create_columns</code> оставлены в значении True, <code>delete_mode='no'</code>. Physical source table не было: source находился в памяти.</p>
+<p><strong>Ход.</strong> Конструктор определил типы id и amount. Во время <code>exec()</code> DBMerge создал target и временную staging с generated suffix, загрузил в staging одну строку, выполнил UPDATE для совпавших ключей и INSERT отсутствующих. После возврата success отдельным connection выполнены два независимых запроса: metadata из <code>information_schema.columns</code> и <code>SELECT amount ... WHERE id=1</code>.</p>
+<p><strong>Выход.</strong> Metadata показала <code>COLUMN_TYPE='decimal(10,0)'</code>, precision=10, scale=0. SELECT вернул <code>2</code> вместо входного <code>1.75</code>. Исключения и warning не было. После фиксации результата target удалена, container остановлен и удалён.</p>
+<p><strong>Независимый повтор.</strong> На MariaDB 11.4.12 таблица <code>auto_float_c0e0704f</code> также отсутствовала до теста; вход и параметры были идентичны. Результат снова <code>decimal(10,0)</code> и stored=<code>2</code>. На MySQL отдельно повторены отсутствующие target для Pandas <code>DataFrame({'id':[1], 'amount':[1.75]})</code> и Polars с теми же значениями; обе ветки дали тот же DDL и read-back.</p>
+<p><strong>Сценарий.</strong> Target отсутствует, типы выводятся автоматически. Вход: <code>{'id': 1, 'amount': 1.75}</code>.</p>
+<pre>MySQL 8.4.11:
+metadata = {NUMERIC_PRECISION: 10, NUMERIC_SCALE: 0,
+            COLUMN_TYPE: "decimal(10,0)"}
+input  = 1.75
+stored = 2
+
+MariaDB 11.4.12:
+column_type = "decimal(10,0)"
+input  = 1.75
+stored = 2</pre>
+<p><strong>Область.</strong> Повторено для Python <code>list[dict]</code>, Pandas и Polars. Это общий type inference.</p>
+<p><strong>Корень.</strong> В <code>src/dbmerge/dbmerge.py:732-803</code> float сводится к <code>Numeric()</code> без precision/scale. MySQL определяет голый DECIMAL как <code>DECIMAL(10,0)</code>. См. <a href="https://dev.mysql.com/doc/refman/8.4/en/fixed-point-types.html">MySQL Fixed-Point Types</a>.</p>
+<p><strong>Исправление.</strong> Для Python float использовать dialect-aware double precision. Для Decimal требовать или вычислять явные <code>Numeric(precision, scale)</code>. Regression должен сравнивать round-trip и metadata.</p>
+</div>
+
+<div class="finding">
+<h3>DB-02. Datetime теряет микросекунды и timezone</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-02 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #9c2f24;background:#fff8f5;">
+  <h4 style="margin:0 0 8px;">Полный паспорт воспроизведения: существование поля, Python/dtype и SQL-тип</h4>
+  <p><strong>Контур.</strong> Проведены независимые прогоны на MySQL 8.4.11 и MariaDB 11.4.12. Для каждой СУБД использовалась новая target-таблица и заново сформированный источник.</p>
+  <p><strong>Что существовало до вызова.</strong> Таблица <code>auto_dt_b740bd95</code> в MySQL отсутствовала. Таблица <code>auto_datetime_e74ec74a</code> в MariaDB также отсутствовала. Отсутствие проверялось по системному каталогу до запуска. Поэтому datetime-столбца до DBMerge <em>не было вообще</em>: у него не было заранее заданного <code>DATETIME</code>, precision, default, trigger или timezone-конвертации. Источник не являлся SQL-таблицей.</p>
+  <p><strong>Точный вход и типы.</strong> В Python-варианте передавалась одна строка-словарь с целочисленным <code>id</code> и тем aware-значением даты/времени, полный ISO-литерал которого приведен в строке «Вход» этого кейса. Runtime-тип поля — <code>datetime.datetime</code>; <code>tzinfo is not None</code>; компонент <code>microsecond</code> ненулевой и равен <code>123456</code>. То есть на входе одновременно присутствовали две проверяемые характеристики: дробная часть секунды и смещение часового пояса. В Pandas-контроле применялся timezone-aware datetime dtype, в Polars-контроле — <code>Datetime</code> с временной зоной; это были отдельные новые target-таблицы.</p>
+  <p><strong>Параметры операции.</strong> Включено автосоздание target, ключ — <code>id</code>, явный SQL-тип datetime-поля через <code>data_types</code> не передавался. Тем самым тестировалcя именно default-инференс DBMerge, а не поведение заранее созданного пользовательского столбца.</p>
+  <p><strong>Как проходил тест.</strong> (1) Каталог подтвердил отсутствие target и поля. (2) DBMerge определил тип из source object/dtype. (3) Сгенерировал и выполнил DDL target, затем создал staging. (4) Исходный timestamp был записан без предварительного преобразования тестом в строку или naive datetime. (5) После merge отдельно считаны metadata столбца — базовый SQL-тип, fractional-seconds precision — и значение через <code>SELECT</code>. (6) У считанного Python-значения отдельно сравнивались календарная часть, <code>microsecond</code>, <code>tzinfo</code> и UTC-offset.</p>
+  <p><strong>Фактический выход.</strong> Автосоздание выбрало серверный <code>DATETIME</code> без fractional-seconds precision, то есть фактически <code>fsp=0</code>, и без сохраняемой timezone-семантики. После чтения <code>microsecond == 0</code>, а <code>tzinfo is None</code>. Секундная календарная часть сохранилась, но исходное значение целиком не сохранилось: микросекунды отброшены, aware datetime стал naive. Поведение повторилось на MySQL и MariaDB, а также не исчезло при смене Python-list на DataFrame-вход.</p>
+  <p><strong>Почему это доказательство дефекта модуля.</strong> Ни таблицы, ни поля до теста не было; следовательно, клиентская DDL не могла задать недостаточную precision. Именно DBMerge выбрал тип при автосоздании. Драйвер возвращает то, что реально хранит созданный столбец, поэтому это не только косметика Python-представления. Для корректного round-trip модуль должен либо выводить тип с достаточным <code>fsp</code> и явной политикой timezone, либо отклонять aware datetime без явного типа, а не молча менять значение.</p>
+  <p><strong>Граница доказательства.</strong> Тест доказывает потерю timezone-семантики и микросекунд в указанном пути автосоздания. Он не утверждает, что MySQL нативно умеет хранить timezone в <code>DATETIME</code>; напротив, обязанность библиотеки — выбрать безопасную нормализацию, подходящий тип/сопутствующее поле или явную ошибку. Ручной DDL может обойти проблему, но это иной режим.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-02 -->
+<p><span class="badge p0">P0 DATA CORRUPTION</span> <strong>LIVE MySQL + MariaDB</strong></p>
+<h4>Как именно проводился тест</h4>
+<p><strong>Состояние БД.</strong> На MySQL 8.4.11 target <code>dbmerge_audit.auto_dt_b740bd95</code> отсутствовала. На MariaDB 11.4.12 target <code>dbmerge_audit.auto_datetime_e74ec74a</code> также отсутствовала. В обоих случаях DBMerge должен был создать target и temporary staging полностью по входным Python types.</p>
+<p><strong>Полный вход.</strong> Одна строка: integer id=1 и aware Python datetime <code>2026-08-02 12:34:56.987654+03:00</code>. Параметры DBMerge: schema=<code>dbmerge_audit</code>, key=<code>['id']</code>, auto-create включён, delete mode=<code>no</code>. Source table отсутствовала.</p>
+<p><strong>Ход.</strong> После <code>exec()</code> отдельным SELECT считано сохранённое время, а из <code>information_schema.columns</code> получены <code>column_type</code> и <code>datetime_precision</code>. То есть проверялось не строковое представление result, а реально созданная схема и значение на сервере.</p>
+<p><strong>Выход MySQL.</strong> Колонка создана как <code>datetime</code> с precision=0; сервер вернул <code>2026-08-02 12:34:57</code>. Offset <code>+03:00</code> отсутствует, 987654 microseconds округлены вверх.</p>
+<p><strong>Выход MariaDB.</strong> Колонка также <code>datetime(0)</code>; сервер вернул <code>2026-08-02 12:34:56</code>, то есть offset и дробная часть потеряны, но округление отличается от MySQL. Pandas и Polars проверялись в отдельных отсутствующих target: Pandas Timestamp с <code>+03:00</code> и UTC-aware Polars datetime оба создали <code>datetime(0)</code>.</p>
+<pre>input = 2026-08-02T12:34:56.987654+03:00
+MySQL:   datetime(0) -&gt; 2026-08-02 12:34:57
+MariaDB: datetime(0) -&gt; 2026-08-02 12:34:56</pre>
+<p><strong>Корень.</strong> Generic <code>DateTime(timezone=True)</code> становится MySQL <code>DATETIME</code> без <code>fsp</code>. Default fractional precision равна 0, округление может пройти без warning: <a href="https://dev.mysql.com/doc/refman/8.4/en/fractional-seconds.html">MySQL Fractional Seconds</a>. DATETIME не хранит offset, а модуль не нормализует UTC.</p>
+<p><strong>Исправление.</strong> Использовать <code>DATETIME(fsp=6)</code>. Для aware values зафиксировать контракт: UTC normalization либо явный reject на dialect без timezone type.</p>
+</div>
+
+<div class="finding">
+<h3>DB-03. SQL Server получает недопустимый CREATE TEMPORARY TABLE</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-03 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #9c2f24;background:#fff8f5;">
+  <h4 style="margin:0 0 8px;">Полный паспорт воспроизведения и уровень доказательства</h4>
+  <p><strong>Контур.</strong> Живого Microsoft SQL Server в тестовом окружении не было. Поэтому серверный результат не маркируется как live reproduction: использован SQLAlchemy MSSQL dialect compiler, то есть та же компиляция DDL, которую код DBMerge передал бы драйверу. Отдельный SQLite-запуск подтверждал, что входные данные и общая ветка merge работоспособны вне MSSQL-специфичного DDL.</p>
+  <p><strong>Состояние до теста.</strong> В SQLite-контроле target <code>items</code> существовал заранее со столбцами <code>id INTEGER PRIMARY KEY</code> и <code>value VARCHAR(50)</code>; исходные строки и source snapshot приведены непосредственно в кейсе. Runtime staging-таблицы до вызова не было. Во время выполнения код сгенерировал имя <code>items_67353bd8</code>. Для MSSQL-проверки никакая физическая таблица не создавалась: metadata существующей модели компилировалась в MSSQL SQL.</p>
+  <p><strong>Вход и типы.</strong> Source состоял из records с <code>id: int</code> и <code>value: str</code>; ключом был <code>id</code>. Целевой <code>id</code> был целочисленным primary key. Именно наличие такого ключа существенно для второй части дефекта: SQLAlchemy считает его identity/autoincrement-кандидатом, и DBMerge переносит это свойство в staging.</p>
+  <p><strong>Как проходил тест.</strong> (1) На контроле выполнена обычная подготовка target и merge. (2) Перехвачена metadata временной таблицы, которую строит DBMerge, включая имя и свойства столбцов. (3) Объект <code>CreateTable</code> скомпилирован MSSQL-диалектом без ручного переписывания SQL. (4) Проверены два независимых фрагмента результата: ключевые слова создания временного объекта и наличие <code>IDENTITY</code> у staging-ключа. (5) Затем результат сопоставлен с синтаксисом временных таблиц SQL Server и правилами явной вставки в identity-столбец.</p>
+  <p><strong>Фактический выход.</strong> Получен SQL с <code>CREATE TEMPORARY TABLE</code>, который SQL Server не поддерживает для локальных temp tables, и одновременно staging-колонка получила <code>IDENTITY</code>. Даже после исправления первого фрагмента загрузка явных source-id в такую staging-таблицу потребует специального <code>IDENTITY_INSERT</code> либо отказа от identity. Это две самостоятельные точки отказа одного MSSQL-пути.</p>
+  <p><strong>Что доказано и что не доказано.</strong> Доказано, что текущий код генерирует несовместимый MSSQL DDL до обращения к серверу. Не измерены конкретный номер server error и поведение конкретного ODBC-драйвера, поскольку live SQL Server отсутствовал. Для закрытия кейса после исправления нужен интеграционный тест на поддерживаемой версии SQL Server, но отсутствие live-инстанса не делает скомпилированный запрещенный синтаксис допустимым.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-03 -->
+<p><span class="badge p0">P0 BACKEND BLOCKER</span> <strong>COMPILED</strong></p>
+<h4>Как именно проводился тест</h4>
+<p><strong>Почему не live.</strong> Доступного SQL Server instance в среде не было. Поэтому тест не выдаётся за runtime integration test. Проверялся SQL, который реальный объект DBMerge отдаёт официальному SQLAlchemy MSSQL dialect compiler.</p>
+<p><strong>Исходная таблица.</strong> В SQLite-control заранее создана target <code>items(id INTEGER PRIMARY KEY, value VARCHAR(50))</code> и строки <code>(1,'old')</code>, <code>(2,'remove')</code>. Source в памяти: <code>(1,'new')</code>, <code>(3,'insert')</code>; key=id, delete mode=delete. Это заставило DBMerge построить обычную staging для update/insert/delete.</p>
+<p><strong>Ход.</strong> Только в тестовом экземпляре drop staging был временно заменён no-op после успешного SQLite merge, чтобы сохранить построенный объект <code>temp_table</code>. Его фактическое имя было <code>items_67353bd8</code>, prefixes=<code>['TEMPORARY']</code>, schema=None. Затем выполнен <code>CreateTable(temp_table).compile(dialect=mssql.dialect())</code>. Исходный код DBMerge не менялся.</p>
+<p><strong>Выход.</strong> Compiler выдал показанный ниже <code>CREATE TEMPORARY TABLE</code>, а integer primary key превратил в <code>IDENTITY</code>. Следующий staging insert DBMerge содержит явную колонку id. По T-SQL оба условия несовместимы с текущей реализацией. После проверки SQLite staging была удалена исходным cleanup method.</p>
+<pre>CREATE TEMPORARY TABLE items_67353bd8 (
+  id INTEGER NOT NULL IDENTITY,
+  value VARCHAR(50) NULL,
+  PRIMARY KEY (id)
+)</pre>
+<p>T-SQL не имеет <code>CREATE TEMPORARY TABLE</code>. Локальная temp table создаётся обычным CREATE TABLE с именем <code>#...</code>: <a href="https://learn.microsoft.com/en-us/sql/t-sql/statements/create-table-transact-sql?view=sql-server-ver17">Microsoft CREATE TABLE</a>.</p>
+<p>Даже после исправления имени key остаётся <code>IDENTITY</code>, а DBMerge вставляет id явно. Это запрещено без <a href="https://learn.microsoft.com/en-us/sql/t-sql/statements/set-identity-insert-transact-sql?view=sql-server-ver17">SET IDENTITY_INSERT</a>.</p>
+<p><strong>Исправление.</strong> Dialect adapter: имя <code>#dbmerge_...</code>, без TEMPORARY prefix, key без Identity/autoincrement. Затем обязательный live suite SQL Server.</p>
+</div>
+
+<div class="finding">
+<h3>DB-04. Externally supplied key ошибочно становится generated</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-04 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #9c2f24;background:#fff8f5;">
+  <h4 style="margin:0 0 8px;">Полный паспорт двух независимых PK/sequence-сценариев</h4>
+  <p><strong>MySQL: состояние до запуска.</strong> Target <code>zero_delete_7186ba5c</code> был создан заранее сырым DDL. Столбец <code>id</code> существовал как целочисленный <code>PRIMARY KEY</code>, но принципиально <em>без</em> <code>AUTO_INCREMENT</code>. В таблицу до merge были явно записаны строки с ключами <code>0</code> и <code>1</code>. Staging-таблицы до вызова не существовало. Source snapshot и значения остальных полей приведены в основном тексте кейса; runtime-тип обоих ключей — Python <code>int</code>.</p>
+  <p><strong>MySQL: ход и выход.</strong> (1) До вызова сделан <code>SELECT</code>, подтвердивший наличие обоих ключей, включая настоящий <code>0</code>. (2) DBMerge отразил target metadata и создал staging. (3) Из-за ошибочно перенесенной autoincrement-семантики явный нулевой ключ при загрузке staging был обработан MySQL как запрос на генерацию значения. (4) Дальнейшее сравнение, update/insert/delete выполнялось уже с измененным ключом. (5) Итоговый <code>SELECT</code> показал расхождение с source snapshot. Важно: входной Python-словарь содержал число <code>0</code>, а не <code>None</code>, пустую строку или пропущенный ключ.</p>
+  <p><strong>Почему это не «особенность ключей, которую должна решать БД».</strong> База корректно исполнила DDL staging, созданный модулем. Пользовательская target-схема не имела autoincrement; модуль добавил иную семантику во временный объект и тем самым изменил бизнес-ключ до сравнения. Исправление должно сохранять свойства target, необходимые для данных, но не копировать generation/identity в staging.</p>
+  <p><strong>PostgreSQL: состояние до запуска.</strong> В отдельном соединении использовалась временная схема <code>pg_temp_13</code>. Target <code>auto_seq_1e5fcebf</code> до вызова отсутствовал; следовательно, sequence и столбца <code>id</code> также не существовало. Source был in-memory snapshot с явным целочисленным <code>id</code>. Включено автосоздание, и тип ключа не был задан пользовательским DDL.</p>
+  <p><strong>PostgreSQL: ход и выход.</strong> (1) DBMerge создал target и связанную sequence/default-механику. (2) Source-id был вставлен явно. (3) После успешного завершения merge выполнен независимый контрольный <code>INSERT</code> без <code>id</code>, то есть с серверным <code>DEFAULT</code>. (4) Сервер выдал duplicate-key: sequence осталась позади уже загруженного максимального ключа. Так проверялся не внешний конкурентный writer, а самосогласованность таблицы, которую модуль только что автоматически создал и наполнил.</p>
+  <p><strong>Постусловия и границы.</strong> MySQL-сценарий использует заранее существующую пользовательскую target-схему; PostgreSQL-сценарий — отсутствующую target и автосоздание. Они не смешиваются и доказывают разные дефекты. В обоих случаях проверка выполнена чтением реального состояния БД после операции, а не только анализом SQL.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-04 -->
+<p><span class="badge p0">P0 KEY CORRUPTION</span> <strong>LIVE + COMPILED</strong></p>
+<h4>Как именно проводился тест на MySQL</h4>
+<p><strong>Target до запуска.</strong> В MySQL 8.4.11 тест вручную создал <code>dbmerge_audit.zero_delete_7186ba5c</code> через <code>CREATE TABLE (... id INT NOT NULL PRIMARY KEY, value VARCHAR(30))</code>. У id намеренно не было AUTO_INCREMENT. В target вставлены <code>(0,'zero-old')</code> и <code>(1,'one-old')</code>. Таким образом, БД корректно умела хранить key=0 до участия DBMerge.</p>
+<p><strong>Вход и параметры.</strong> Source table не было; data=<code>[{'id':0,'value':'zero-new'}]</code>, key=<code>['id']</code>, <code>delete_mode='delete'</code>, <code>can_create_table=False</code>, schema=<code>dbmerge_audit</code>.</p>
+<p><strong>Ход.</strong> DBMerge отразил существующую target, создал temporary staging и загрузил единственную source row. Staging получила integer PK с AUTO_INCREMENT. При стандартном sql_mode без <code>NO_AUTO_VALUE_ON_ZERO</code> сервер заменил явный 0 на generated 1. Дальнейшие UPDATE и DELETE работали уже с искажённым staging key. После success отдельный SELECT прочитал всю target с ORDER BY id.</p>
+<p><strong>Выход.</strong> Вместо ожидаемого <code>[(0,'zero-new')]</code> target стала <code>[(1,'zero-new')]</code>. DBMerge сообщил одну обновлённую и одну удалённую строку. Это не ошибка target AUTO_INCREMENT: target была создана без него.</p>
+<h4>Как именно проводился тест на PostgreSQL</h4>
+<p>В PostgreSQL 18.3 создана session temp schema <code>pg_temp_13</code>; target <code>auto_seq_1e5fcebf</code> до DBMerge отсутствовала. Data содержала ids 1/2 и text values a/b; DBMerge auto-created target. После merge из <code>information_schema</code> получен default id=<code>nextval('auto_seq_..._id_seq')</code>. Затем выполнен независимый обычный <code>INSERT(value) VALUES ('external') RETURNING id</code> без id. Он получил sequence value 1 и завершился <code>UniqueViolation</code>. Закрытие session удалило все тестовые объекты.</p>
+<p><strong>Корень.</strong> Integer key создаётся с <code>primary_key=True</code> без <code>autoincrement=False</code>. Но DBMerge всегда загружает явное значение merge-key.</p>
+<h4>MySQL: тихая подмена 0</h4>
+<pre>source         = [(0, "zero-new")]
+target before  = [(0, "zero-old"), (1, "one-old")]
+delete_mode    = "delete"
+target after   = [(1, "zero-new")]
+status         = success</pre>
+<p>Staging принял 0 как генерацию AUTO_INCREMENT, превратил его в 1, payload строки 0 обновил строку 1, а настоящая строка 0 была удалена.</p>
+<h4>PostgreSQL: stale sequence</h4>
+<pre>auto-created id default = nextval('..._id_seq'::regclass)
+merged explicit ids     = 1, 2
+next INSERT without id  = UniqueViolation on id=1</pre>
+<p>Serial назначает default через <code>nextval()</code>, но явные id sequence не двигают: <a href="https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-SERIAL">PostgreSQL Serial Types</a>.</p>
+<h4>SQL Server</h4>
+<p>Staging key компилируется как IDENTITY, а явный insert отклоняется.</p>
+<p><strong>Исправление.</strong> Все staging keys делать <code>autoincrement=False</code>, удаляя Identity, Sequence, Computed и server defaults. Автосозданный target merge-key также должен быть externally assigned PK. Generated surrogate key должен быть отдельной явной функцией.</p>
+</div>
+
+<h2 class="pagebreak">4. P1: функциональные дефекты</h2>
+<div class="finding">
+<h3>DB-05. Обычная строка блокирует auto-create/auto-add MySQL/MariaDB</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-05 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #b05b20;background:#fffaf3;">
+  <h4 style="margin:0 0 8px;">Полный паспорт автосоздания строкового поля</h4>
+  <p><strong>Состояние до запуска.</strong> Для каждого из Python-, Pandas- и Polars-вариантов использовалось отдельное уникальное имя. Target-таблицы отсутствовали, строкового столбца и заранее заданной длины не было. Это исключает влияние прежнего <code>VARCHAR(n)</code>, миграции или server default. Source находился в памяти процесса.</p>
+  <p><strong>Вход и типы.</strong> Source содержал целочисленный <code>id</code> и непустое строковое значение. В Python-варианте runtime-тип — <code>str</code>; в Pandas — строковые значения в соответствующем Series/dtype; в Polars — <code>String/Utf8</code>. Точные records, имена target и варианты контейнера перечислены в этом же кейсе. Строка была короткой и валидной, поэтому ошибка не связана с превышением длины, кодировкой или <code>NULL</code>.</p>
+  <p><strong>Параметры.</strong> Включено автосоздание target, ключ — <code>id</code>; явный <code>data_types</code> и длина строкового поля не передавались. Это штатный advertised path автоматического schema inference.</p>
+  <p><strong>Как проходил тест.</strong> (1) Подтверждено отсутствие target. (2) DBMerge вывел абстрактный строковый тип. (3) SQLAlchemy попытался скомпилировать DDL для MySQL/MariaDB. (4) Компилятор отклонил <code>VARCHAR</code> без обязательной длины до загрузки данных. (5) После исключения каталог проверен повторно, чтобы отличить полный отказ от частично созданной таблицы.</p>
+  <p><strong>Фактический выход.</strong> Все три формы source завершаются ошибкой компиляции/DDL о том, что MySQL-диалекту требуется длина <code>VARCHAR</code>. Строка не импортируется; штатный merge не начинается. Это не «неподдерживаемое значение»: минимальная обычная строка не проходит default автосоздания на заявленном диалекте.</p>
+  <p><strong>Оракул.</strong> Допустимы два безопасных результата: создание переносимого <code>TEXT</code>/обоснованного <code>VARCHAR(n)</code> либо ранняя доменная ошибка DBMerge с указанием обязательного типа. Сырой dialect exception после обещания автосоздания — дефект API и совместимости.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-05 -->
+<p><span class="badge p1">P1</span> <strong>LIVE</strong></p>
+<h4>Как именно проводился тест</h4>
+<p><strong>Состояние БД.</strong> Для каждого запуска создавалось новое имя target, и перед DBMerge таблицы с этим именем не было. В MySQL использовалась target <code>auto_text_4edeea5d</code>; в MariaDB <code>auto_text_4380fe0d</code>. Никакой заранее неверной VARCHAR-колонки в БД не существовало.</p>
+<p><strong>Вход.</strong> Python case получил <code>[{'id':1,'value':'ordinary text'}]</code>. Отдельные MySQL cases получили Pandas и Polars DataFrame с одной строкой id=1/value='text'. Во всех случаях key=<code>['id']</code>, schema=<code>dbmerge_audit</code>, auto-create включён.</p>
+<p><strong>Ход и выход.</strong> DBMerge определил value как generic <code>VARCHAR</code> без length и попытался скомпилировать CREATE TABLE. SQLAlchemy остановил операцию до загрузки staging: MySQL вернул <code>CompileError ... VARCHAR requires a length on dialect mysql</code>, MariaDB - тот же error для dialect mariadb. После exception выполнялся <code>DROP TABLE IF EXISTS</code>; строк в target не появилось.</p>
+<pre>CompileError: (in table '...', column 'value'):
+VARCHAR requires a length on dialect mysql/mariadb</pre>
+<p><code>str</code> выводится как <code>String()</code> без length, а MySQL требует <code>VARCHAR(M)</code>: <a href="https://dev.mysql.com/doc/refman/8.4/en/string-type-syntax.html">String Data Type Syntax</a>. Повторено на Python, Pandas и Polars.</p>
+<p><strong>Исправление.</strong> Ввести explicit string policy. Для non-key возможен Text; для key/indexed fields требовать <code>String(N)</code>, charset и collation. До исправления отключить auto-DDL.</p>
+</div>
+
+<div class="finding">
+<h3>DB-06. UPDATE → INSERT → DELETE создаёт ложные UNIQUE-конфликты</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-06 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #9c2f24;background:#fff8f5;">
+  <h4 style="margin:0 0 8px;">Полный паспорт valid-snapshot под UNIQUE</h4>
+  <p><strong>Контур.</strong> Один логический сценарий воспроизведен на SQLite 3.49.1, PostgreSQL 18.3 и MySQL 8.4.11. Для каждой СУБД target создавался отдельно нативным DDL; результаты не эмулировались одной СУБД.</p>
+  <p><strong>Состояние до запуска.</strong> Target существовал. В нем были целочисленный primary key <code>id</code> и отдельный бизнес-столбец с ограничением <code>UNIQUE</code>. До merge находились две строки: одна владела уникальным значением, которое по входному snapshot должно перейти другой строке; прежняя строка-владелец в source отсутствовала и потому подлежала удалению. Staging до вызова отсутствовал. Точный DDL, исходные строки и target names приведены в теле кейса.</p>
+  <p><strong>Вход и типы.</strong> Source — валидный конечный snapshot: Python records с <code>id: int</code> и уникальным атрибутом строкового типа. В самом source дубликата нет; ожидаемая конечная target также не содержит дубликата. Ключ сопоставления — <code>id</code>; включено удаление target-строк, отсутствующих во входном snapshot.</p>
+  <p><strong>Как проходил тест.</strong> (1) До запуска запрос подтвердил обе исходные строки и действующее UNIQUE-ограничение. (2) Source загружен в staging. (3) DBMerge начал применять изменения в порядке update/insert до удаления obsolete target-row. (4) Попытка присвоить новой строке еще занятое уникальное значение встретила действующее ограничение. (5) Зафиксированы server exception и фактическое состояние target после обработки/rollback. (6) Контрольный вариант с безопасным порядком освобождения значения показал, что сам конечный snapshot допустим.</p>
+  <p><strong>Фактический выход.</strong> Все три СУБД отвергли промежуточное, а не конечное состояние, с unique-violation. Требуемый snapshot не был применен, хотя он удовлетворяет constraint. Это не спор о том, должна ли БД обеспечивать уникальность: БД именно правильно ее обеспечивает; ошибка модуля — порядок построения промежуточных состояний.</p>
+  <p><strong>Постусловие.</strong> В отчете отдельно указано, была ли транзакция откатана и какие строки остались после каждого engine-specific запуска. Критерий исправления: алгоритм должен уметь применить валидное конечное множество без временного нарушения UNIQUE — например, планированием delete/update, deferrable constraint там, где доступно, либо двухфазной заменой с документированными ограничениями.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-06 -->
+<p><span class="badge p1">P1</span> <strong>LIVE SQLite + PostgreSQL + MySQL</strong></p>
+<h4>Как именно проводился тест</h4>
+<p><strong>Таблицы до запуска.</strong> На каждой СУБД target создавалась заранее, а не модулем: <code>id</code> primary key, <code>code</code> NOT NULL UNIQUE. SQLite target называлась <code>items</code>, PostgreSQL session-temp target <code>unique_e1efeb1e</code>, MySQL target <code>dbmerge_audit.unique_bac29f18</code>. В каждую вставлены ровно две строки: <code>(1,'A')</code>, <code>(2,'B')</code>.</p>
+<p><strong>Вход.</strong> Source physical table отсутствовала. Полный snapshot содержал одну строку <code>[{'id':1,'code':'B'}]</code>. Параметры: key=id, <code>delete_mode='delete'</code>, <code>can_create_table=False</code>.</p>
+<p><strong>Oracle до запуска.</strong> Ожидаемая target <code>[(1,'B')]</code> валидна: id уникален, code уникален. Строка 2 должна освободить B в рамках той же операции.</p>
+<p><strong>Ход.</strong> DBMerge создал staging с одной строкой, затем первым выполнил UPDATE id=1 A→B. DELETE id=2 планировался позже и ещё не был выполнен. Каждая СУБД проверила immediate UNIQUE на UPDATE.</p>
+<p><strong>Выход.</strong> SQLite: <code>UNIQUE constraint failed</code>; PostgreSQL: <code>UniqueViolation</code>; MySQL: <code>Duplicate entry 'B'</code>. После exception отдельный SELECT во всех случаях показал исходные строки A/B. Дополнительный SQLite case с source <code>(3,'B')</code> доказал тот же дефект в INSERT-before-DELETE ветке.</p>
+<pre>target: (1,'A'), (2,'B'), UNIQUE(code)
+source full snapshot: (1,'B')
+valid final state: (1,'B')
+
+SQLite:     UNIQUE constraint failed
+PostgreSQL: UniqueViolation
+MySQL:      Duplicate entry 'B'</pre>
+<p>DBMerge пытается присвоить B строке 1 до удаления строки 2. БД корректно защищает constraint, но конечный снимок полностью валиден. Аналогично ломается INSERT нового id со значением, которое освободил бы DELETE.</p>
+<p><strong>Исправление.</strong> Preflight конфликтов. Для atomic delete-mode возможен delete-obsolete-before-upsert после FK preflight. Для swap нужен двухфазный update через sentinel либо deterministic preflight reject. На MySQL deferrable UNIQUE отсутствует, поэтому одной настройкой БД дефект не закрыть.</p>
+</div>
+
+<div class="finding">
+<h3>DB-07. Source-table mode пишет в generated columns</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-07 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #b05b20;background:#fffaf3;">
+  <h4 style="margin:0 0 8px;">Полный паспорт PostgreSQL generated-column</h4>
+  <p><strong>Состояние до запуска.</strong> В PostgreSQL 18.3 заранее существовали две разные таблицы в временной схеме соединения: source-table и target-table. Их DDL приведен в кейсе. В обеих схемах присутствовал обычный primary key, базовые столбцы и <code>GENERATED ALWAYS AS (...) STORED</code> столбец. Target был пуст; source содержал одну валидную строку. Staging-таблицы до вызова не было.</p>
+  <p><strong>Вход и типы.</strong> В этом сценарии source не был list/DataFrame: DBMerge читал настоящую PostgreSQL-таблицу. Пользователь задавал ключ по обычному <code>id</code>; значение generated-column вычислялось сервером из базовых полей и не задавалось внешним кодом. Это важно: ошибка не вызвана попыткой теста вручную записать generated value.</p>
+  <p><strong>Как проходил тест.</strong> (1) Выполнен <code>SELECT</code> source и подтверждено, что вычисляемое поле доступно для чтения. (2) DBMerge отразил колонки source/target. (3) При построении staging или DML модуль включил generated-column в список обычных записываемых полей. (4) PostgreSQL получил явное значение для <code>GENERATED ALWAYS</code> и отклонил statement. (5) После исключения проверены target и наличие/удаление staging-объекта.</p>
+  <p><strong>Фактический выход.</strong> Операция падает на серверной ошибке запрета явной вставки в generated-column; target не получает ожидаемую строку. Наличие такого столбца было известно через reflection, но признак generation не был превращен в правило исключения из write-set.</p>
+  <p><strong>Оракул и область.</strong> Ожидалось, что DBMerge переносит только writable base columns, а generated value вычисляет target-БД. Live-доказательство относится к PostgreSQL; для MySQL/MariaDB/SQL Server нужны отдельные dialect tests, потому что синтаксис и reflection generated columns различаются.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-07 -->
+<p><span class="badge p1">P1</span> <strong>LIVE PostgreSQL 18.3</strong></p>
+<h4>Как именно проводился тест</h4>
+<p><strong>Состояние БД.</strong> В одной PostgreSQL session заранее созданы две разные temporary tables: source и target. Обе имели точный DDL <code>id bigint PRIMARY KEY, a integer, doubled integer GENERATED ALWAYS AS (a*2) STORED</code>. В source обычным SQL вставлены id=1,a=5; PostgreSQL самостоятельно вычислил doubled=10. Target оставалась пустой.</p>
+<p><strong>Параметры.</strong> DBMerge получил <code>source_table_name</code> и <code>table_name</code> этих двух существующих таблиц, key=<code>['id']</code>, <code>can_create_table=False</code>. In-memory data не передавалась.</p>
+<p><strong>Ход.</strong> DBMerge отразил все source columns, включая generated doubled, построил staging и перенёс в неё строку source. Затем сгенерировал UPDATE/INSERT, где doubled рассматривалась как writable. Target была пустой, однако PostgreSQL валидирует запрещённое assignment при подготовке/исполнении statement независимо от rowcount.</p>
+<p><strong>Выход.</strong> Получен <code>ProgrammingError</code> с DBAPI cause <code>GeneratedAlways: column "doubled" can only be updated to DEFAULT</code>. Ожидаемая target <code>(1,5,10)</code> не появилась. Обе temporary tables исчезли при закрытии session.</p>
+<pre>id bigint primary key,
+a integer,
+doubled integer GENERATED ALWAYS AS (a*2) STORED
+
+ProgrammingError / GeneratedAlways:
+column "doubled" can only be updated to DEFAULT</pre>
+<p>Ошибка возникает даже при пустой target: UPDATE включает read-only field. Source-table mode не разделяет source columns и writable target columns.</p>
+<p><strong>Исправление.</strong> Строить отдельные <code>insertable_fields</code> и <code>updatable_fields</code>. Исключать computed/generated/rowversion/identity; generated key должен давать понятную configuration error.</p>
+</div>
+
+<div class="finding">
+<h3>DB-08. Неоднородный list[dict] молча теряет later-only fields</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-08 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #b05b20;background:#fffaf3;">
+  <h4 style="margin:0 0 8px;">Полный паспорт неоднородного list[dict]</h4>
+  <p><strong>Состояние до запуска.</strong> SQLite target отсутствовал. Ни базовых, ни «позднего» столбца до вызова не существовало. Source был именно Python <code>list[dict]</code>, а не SQL-таблица или DataFrame; staging также отсутствовал.</p>
+  <p><strong>Вход и типы.</strong> Список содержал две строки в фиксированном порядке. Первый <code>dict</code> имел только базовые ключи, второй — те же ключи плюс дополнительное поле со значением. Точные словари приведены в кейсе. <code>id</code> — Python <code>int</code>; строковые значения — <code>str</code>; дополнительное значение было непустым и не <code>None</code>. Таким образом, поле реально присутствовало во входе, но отсутствовало только в первой записи.</p>
+  <p><strong>Параметры.</strong> Включено автосоздание, ключ — <code>id</code>, явный перечень columns/data_types не задан. Пользователь не просил игнорировать неизвестные ключи.</p>
+  <p><strong>Как проходил тест.</strong> (1) DBMerge вывел схему по первой записи. (2) Создал target без later-only поля. (3) При нормализации второй записи дополнительный ключ не вызвал ошибку и не расширил схему. (4) После merge выполнены <code>PRAGMA table_info</code> и <code>SELECT</code>. (5) Затем теми же двумя records выполнен независимый запуск в обратном порядке. (6) Отдельный контроль с формой <code>dict[list]</code> проверил, что данные сами по себе поддерживаемы.</p>
+  <p><strong>Фактический выход.</strong> В основном порядке дополнительного столбца в DDL нет и значение второй строки бесследно отсутствует в target; исключение не выбрасывается. При перестановке records результат меняется, что доказывает зависимость схемы от порядка. Это silent data loss: успешный return не означает, что все поля source сохранены.</p>
+  <p><strong>Оракул.</strong> Схема должна строиться по объединению ключей всех records с согласованием типов либо вход должен быть отклонен до DDL с указанием неоднородной записи. Молчаливое отбрасывание поля не является безопасной политикой.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-08 -->
+<p><span class="badge p1">P1 SILENT LOSS</span> <strong>LIVE SQLite</strong></p>
+<h4>Как именно проводился тест</h4>
+<p><strong>Первый case.</strong> Использована новая SQLite in-memory DB; target <code>list_later_extra</code> до запуска отсутствовала. Data состояла ровно из двух dict в указанном порядке: первая строка <code>{'id':1,'a':'first'}</code>, вторая <code>{'id':2,'a':'second','b':'must-not-disappear'}</code>. Key=id, auto-create включён, delete mode=no.</p>
+<p><strong>Ход.</strong> DBMerge построил field set по первой строке, создал target и staging только с id/a, загрузил обе строки и вернул success. После этого PRAGMA table_info проверил physical columns, а SELECT * ORDER BY id проверил данные.</p>
+<p><strong>Выход.</strong> Columns=<code>['id','a']</code>, rows=<code>[(1,'first'),(2,'second')]</code>; поле b и его значение нигде не сохранились, warning/exception отсутствовали.</p>
+<p><strong>Обратный control.</strong> В новой DB первая строка имела id/a/b, вторая только id/a. Target <code>list_later_missing</code> создавалась с b, а staging insert упал <code>StatementError</code> / <code>InvalidRequestError</code> о missing bind b. Следовательно, результат зависит от порядка rows. Отдельный <code>dict[list]</code> с разной длиной был корректно отклонён и finding не является.</p>
+<pre>data = [
+  {'id': 1, 'a': 'first'},
+  {'id': 2, 'a': 'second', 'b': 'must-not-disappear'}
+]
+status = success
+created columns = ['id', 'a']
+stored rows = [(1,'first'), (2,'second')]</pre>
+<p>Если b присутствует в первой строке, но отсутствует во второй, вместо silent loss возникает raw <code>StatementError</code>. Поведение зависит от порядка строк.</p>
+<p><strong>Исправление.</strong> До DDL/DML сравнивать exact key set каждой строки. По умолчанию отклонять mismatch через <code>IncorrectDataError</code> с индексом, missing и extra fields.</p>
+</div>
+
+<div class="finding">
+<h3>DB-09. Duplicate labels Pandas молча выбирают последнее значение</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-09 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #b05b20;background:#fffaf3;">
+  <h4 style="margin:0 0 8px;">Полный паспорт Pandas duplicate-label</h4>
+  <p><strong>Состояние до запуска.</strong> SQLite target отсутствовал, поэтому одноименного SQL-столбца и любых правил разрешения дублей до теста не существовало. Source был новым Pandas DataFrame, не SQL-таблицей. Имена target для независимых вариантов приведены в кейсе.</p>
+  <p><strong>Вход и типы.</strong> DataFrame намеренно имел метки колонок <code>["id", "value", "value"]</code>: <code>id</code> — целочисленный столбец, две физически разные позиции <code>value</code> содержали разные наблюдаемые значения одной строки. Это допустимое состояние объекта Pandas, хотя метки не уникальны. Значения не совпадали, чтобы было видно, какая позиция потеряна. Дополнительные прогоны с <code>pd.NA</code> выполнялись отдельно и не подменяли основной duplicate-label input.</p>
+  <p><strong>Как проходил тест.</strong> (1) До передачи проверены <code>df.columns</code>, число физических колонок и значения обеих позиций. (2) DBMerge преобразовал DataFrame в record-oriented representation. (3) При схлопывании одинаковых labels одна позиция перезаписала другую. (4) Автосоздание сформировало только один SQL-столбец <code>value</code>. (5) После merge проверены <code>PRAGMA table_info</code> и строка target; отдельно фиксировалось, был ли warning превращен API в ошибку.</p>
+  <p><strong>Фактический выход.</strong> Merge считается успешным, но в target остается лишь значение последней одноименной колонки; значение другой физической колонки теряется. SQL-схема принципиально не может иметь два одинаковых имени, поэтому безопасный результат здесь — раннее отклонение DataFrame до преобразования, а не last-write-wins.</p>
+  <p><strong>Граница.</strong> Тест не требует поддержки duplicate SQL columns. Он требует отсутствия тихой потери данных на границе Pandas → records. Проверки с <code>pd.NA</code> в кейсе имеют собственные входы и результаты и не считаются доказательством duplicate-label дефекта.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-09 -->
+<p><span class="badge p1">P1 SILENT LOSS</span> <strong>LIVE SQLite</strong></p>
+<h4>Как именно проводился тест</h4>
+<p>Создана новая SQLite in-memory DB; target <code>pandas_duplicate_columns</code> до запуска отсутствовала. DataFrame был сформирован явно как <code>pd.DataFrame([[1,'first','second']], columns=['id','value','value'])</code>; duplicate labels допустимы самим Pandas. DBMerge получил key=id и default auto-create.</p>
+<p>Во время нормализации две одноимённые колонки превратились в одно поле. DBMerge создал target/staging с id и единственной value, выполнил merge без exception. Независимый SELECT вернул <code>(1,'second')</code>. Oracle теста требовал reject ambiguous schema до DDL; выбор первого или последнего значения не считался допустимым. Отдельные controls с <code>pd.NA</code> в nullable string/int/bool прошли и не смешивались с duplicate-label case.</p>
+<pre>columns = ['id', 'value', 'value']
+row     = [1, 'first', 'second']
+stored  = (1, 'second')</pre>
+<p><strong>Исправление.</strong> До преобразования проверять <code>data.columns.is_unique</code> и перечислять duplicate labels в domain error.</p>
+</div>
+
+<div class="finding">
+<h3>DB-10. data_types для managed field ломает insert</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-10 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #b05b20;background:#fffaf3;">
+  <h4 style="margin:0 0 8px;">Полный паспорт трех ошибок managed fields/data_types</h4>
+  <p><strong>Изоляция сценариев.</strong> Это три самостоятельных запуска на SQLite с тремя новыми именами target. Перед каждым запуском соответствующая target отсутствовала. Никакое поле, упомянутое в <code>managed_fields</code> или <code>data_types</code>, не было унаследовано из старого DDL. Source и конфигурация каждого варианта приведены отдельно в этом кейсе; результаты одного варианта не использовались следующим.</p>
+  <p><strong>Вход.</strong> Data records были минимальными и валидными по обычным полям: целочисленный ключ и простое значение. Менялась именно конфигурация managed fields/type mapping: отсутствие необходимого mapping, несовпадение имени и неподходящая форма/значение type descriptor. Поэтому raw <code>AttributeError</code> нельзя объяснить содержимым бизнес-строки.</p>
+  <p><strong>Как проходил каждый под-тест.</strong> (1) Создавался новый DBMerge с указанными в подпункте <code>managed_fields</code> и <code>data_types</code>. (2) Вызывался merge ровно один раз. (3) Перехватывался тип исключения, текст и стадия — validation, metadata construction или SQL execution. (4) Проверялся каталог SQLite: появилась ли target/частичная схема. (5) Результат сравнивался с публичной ошибкой конфигурации, которую мог бы обработать вызывающий код.</p>
+  <p><strong>Фактический выход.</strong> Вместо ранней детерминированной validation error наружу выходит внутренний <code>AttributeError</code>. В подпунктах кейса зафиксировано, для какого точного input/config это произошло и успела ли появиться таблица. Ошибка раскрывает внутреннюю реализацию и не сообщает пользователю, какое имя/тип исправить.</p>
+  <p><strong>Оракул.</strong> До любого DDL модуль должен проверить: все ли managed names разрешаются, является ли type mapping ожидаемой структурой, являются ли значения SQLAlchemy types/type classes, нет ли конфликтов с ключами и source columns. Для каждого нарушения нужна стабильная DBMerge-specific exception с именем параметра. Проверка не должна зависеть от того, существовала target заранее.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-10 -->
+<p><span class="badge p1">P1 API</span> <strong>LIVE SQLite, 3/3</strong></p>
+<h4>Как именно проводился тест</h4>
+<p>Каждый из трёх cases запускался в новой SQLite in-memory DB, target до запуска отсутствовала, source был in-memory list с обычным integer id и payload. Managed field намеренно отсутствовал в source row: его должен заполнить DBMerge. В первом case заданы <code>merged_on_field='audit_ts'</code> и <code>data_types={'audit_ts': DateTime()}</code>; во втором - inserted-on с DateTime; в третьем - delete mark с Boolean.</p>
+<p>Для каждого case ожидалось: DBMerge использует explicit type при auto-DDL, создаёт managed column и самостоятельно подставляет timestamp/false. Фактически initialization/type processing включал managed name в обычные source fields, а insert path добавлял его повторно. Все три запуска закончились <code>AttributeError: 'NoneType' object has no attribute 'is_sequence'</code>. Это три независимых запуска, а не три сообщения одной exception chain.</p>
+<p>Воспроизведено для отсутствующих <code>merged_on_field</code>, <code>inserted_on_field</code> и <code>delete_mark_field</code> с явным типом.</p>
+<pre>AttributeError: 'NoneType' object has no attribute 'is_sequence'</pre>
+<p><code>_check_given_types</code> (<code>src/dbmerge/dbmerge.py:719-727</code>) добавляет managed field в обычные data_fields. Insert позже добавляет его повторно (<code>src/dbmerge/dbmerge.py:932-942</code>).</p>
+<p><strong>Исправление.</strong> Managed type map должна быть отдельной от source projection. Проверять уникальность всех специальных ролей полей до обращения к БД.</p>
+</div>
+
+<h2 class="pagebreak">5. P2: устойчивость, API и наблюдаемость</h2>
+<h3>DB-11. SQLite :memory: с NullPool теряет target</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-11 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #b05b20;background:#fffaf3;">
+  <h4 style="margin:0 0 8px;">Полный паспорт SQLite :memory: + NullPool</h4>
+  <p><strong>Состояние до запуска.</strong> Создан новый engine для <code>sqlite:///:memory:</code> с явным <code>NullPool</code>. Target отсутствовал; поскольку это in-memory SQLite, сама база также существует только в пределах конкретного DBAPI-соединения. Source — одна in-memory record с целочисленным ключом и простым значением. Никакой файловой SQLite-БД или заранее созданной таблицы не было.</p>
+  <p><strong>Почему pool — часть входных условий.</strong> <code>NullPool</code> закрывает соединение после использования и выдает новое при следующем checkout. Для <code>:memory:</code> это уже другая пустая БД. Этот engine валиден для SQLAlchemy; тест проверяет, удерживает ли одна логическая операция DBMerge единое соединение.</p>
+  <p><strong>Как проходил тест.</strong> (1) DBMerge начал merge и на одном checkout выполнил создание/проверку объекта. (2) Между следующими фазами соединение было возвращено/закрыто. (3) Следующий checkout получил другую in-memory database. (4) Последующий DDL/DML обратился к target или staging, которой в новом соединении нет. (5) Зафиксированы exception и отсутствие устойчивой итоговой таблицы. (6) Контрольный запуск с сохраняющим одно соединение штатным SQLite pool прошел на том же наборе данных.</p>
+  <p><strong>Фактический выход.</strong> Логически единый merge распадается между физическими базами и завершается <code>no such table</code>. Ошибка не связана с именем поля или source value. Она показывает, что операция не закрепляет connection scope, хотя временные таблицы, транзакции и in-memory БД семантически connection-local.</p>
+  <p><strong>Область риска.</strong> Минимальное воспроизведение — SQLite <code>:memory:</code> + <code>NullPool</code>, но архитектурный риск шире: разные checkout могут менять видимость temp objects и транзакционную целостность. Исправление — выполнять один merge через одно явно удерживаемое connection/transaction либо запретить несовместимую конфигурацию до DDL.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-11 -->
+<h4>Как именно проводился тест</h4>
+<p>Engine создан как <code>create_engine('sqlite:///:memory:', poolclass=NullPool)</code>. До запуска target <code>nullpool_case</code> не существовала; source был in-memory list с одной строкой и integer key. Auto-create оставлен включённым.</p>
+<p>DBMerge создал target через <code>self.engine</code>, что при NullPool открыло отдельное physical connection и отдельную in-memory SQLite database. Для staging/DML использовалось <code>self.conn</code> с другим connection. На нём target никогда не существовала. Выход: <code>OperationalError: no such table: nullpool_case</code>. Control с обычной file SQLite и корректным shared connection не демонстрирует эту ошибку.</p>
+<pre>create_engine('sqlite:///:memory:', poolclass=NullPool)
+OperationalError: no such table: nullpool_case</pre>
+<p><code>_create_table</code> использует <code>self.table.create(self.engine)</code> (<code>src/dbmerge/dbmerge.py:1111-1127</code>), а temp/DML используют <code>self.conn</code>. В SQLite :memory: это разные БД.</p>
+<p><strong>Исправление.</strong> Весь lifecycle выполнять через одну Connection.</p>
+
+<h3>DB-12. Cleanup способен скрыть primary error</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-12 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #b05b20;background:#fffaf3;">
+  <h4 style="margin:0 0 8px;">Полный паспорт первичной ошибки и cleanup-failure</h4>
+  <p><strong>Два уровня проверки.</strong> Основной тест — контролируемая fault injection, позволяющая гарантированно получить две разные ошибки в заданном порядке. Отдельный PostgreSQL-контроль использует настоящее <code>CHECK</code>-ограничение и показывает реальный класс первичных server failures. Эти доказательства не смешиваются.</p>
+  <p><strong>Состояние основного теста.</strong> Target и минимальная схема были подготовлены так, как указано в кейсе; staging до вызова отсутствовал. Source содержал строку, достаточную для входа в mutation path. Первая точка была заменена детерминированным исключением A, cleanup/drop — другим исключением B. Типы, сообщения и место обеих инъекций приведены в подпункте теста.</p>
+  <p><strong>Как проходил fault-injection тест.</strong> (1) Запуск доведен до основной операции. (2) В основной фазе выброшено A; оно сохранено тестовым harness как первопричина. (3) Выполнение вошло в <code>finally</code>/cleanup. (4) Удаление staging выбросило B. (5) Вызывающий код получил исключение; сравнивались его type/message, <code>__cause__</code>/<code>__context__</code> и сохранность A. (6) Отдельно зафиксировано состояние target/staging после двойного отказа.</p>
+  <p><strong>Фактический выход.</strong> Наружу выходит cleanup error B, а диагностически важная первичная ошибка A маскируется. Оператор видит проблему удаления временного объекта вместо причины, по которой merge не применил данные. Это усложняет retry: по внешней ошибке нельзя надежно определить, была ли mutation частично выполнена.</p>
+  <p><strong>PostgreSQL-контроль.</strong> Заранее созданная таблица имела реальное <code>CHECK</code>-ограничение; source содержал значение, нарушающее его. Merge дошел до server DML и получил constraint violation. Этот прогон подтверждает, что первичные ошибки такого класса естественно возникают без monkeypatch; fault injection нужна только для воспроизводимого одновременного отказа cleanup.</p>
+  <p><strong>Оракул.</strong> Первичная ошибка должна оставаться основной; cleanup-failure следует присоединять как cause/note, логировать отдельно или агрегировать, но не подменять им исходную причину. В отчете отдельно указаны таблицы и постсостояние для обоих запусков.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-12 -->
+<h4>Как именно проводился тест</h4>
+<p>Это fault-injection test, а не имитация конкретной СУБД. В тестовом экземпляре DBMerge основной исполнитель заменён функцией, которая выбрасывает <code>ValueError('PRIMARY_FAILURE')</code> после создания staging. Cleanup staging заменён функцией с <code>RuntimeError('CLEANUP_FAILURE')</code>. Target имела минимальные id/payload columns.</p>
+<p>Oracle: наружу должен выйти PRIMARY_FAILURE, cleanup failure должен быть сохранён как context/note, connection обязан закрыться в любом случае. Факт: наружу вышел CLEANUP_FAILURE, <code>connection_closed=false</code>, <code>merge_finished=false</code>.</p>
+<p><strong>Контроль области.</strong> На PostgreSQL 18.3 отдельно создана session-temp target <code>id bigint PK, value text CHECK(length(value)&lt;=3)</code>. Source передал <code>'too-long'</code>; staging не имела CHECK, поэтому нарушение произошло именно при target INSERT. В этом обычном DB error case исходный <code>IntegrityError/CheckViolation</code> сохранился, connection закрылся. Поэтому finding относится к двойному отказу cleanup, а не ко всем constraint errors.</p>
+<p>Fault injection: primary stage выбрасывает <code>PRIMARY_FAILURE</code>, drop temp выбрасывает <code>CLEANUP_FAILURE</code>. Наружу выходит cleanup error, <code>connection_closed=false</code>, <code>merge_finished=false</code>. Живой PostgreSQL CHECK violation этот дефект не воспроизвёл, поэтому это P2 robustness, а не частое DB-поведение.</p>
+<p><strong>Исправление.</strong> Guaranteed close во внешнем finally; cleanup error прикреплять к primary exception, не заменять его.</p>
+
+<h3>DB-13. total_time и “exact SQL” не соответствуют документации</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-13 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #52606d;background:#f6f8fa;">
+  <h4 style="margin:0 0 8px;">Полный паспорт измерения времени и сопоставления SQL</h4>
+  <p><strong>Timing setup.</strong> Использовался минимальный merge одной строки; состояние target, ее DDL и входная record приведены в кейсе. К engine/connection были подключены счетчики событий. Перед каждым фактическим commit тестовый hook делал детерминированную задержку <code>40 ms</code>. Зафиксировано шесть commit events, то есть только искусственная commit-задержка составляет около <code>240 ms</code>, не считая SQL и Python-кода.</p>
+  <p><strong>Как измерялось.</strong> (1) Непосредственно перед публичным вызовом снимался monotonic wall-clock. (2) Выполнялся merge без изменения его кода. (3) Hook считал каждый commit и задерживал именно commit, а не statement execution. (4) После возврата снимался wall-clock. (5) Из результата DBMerge извлекалось опубликованное <code>total_time</code>. (6) Сравнивались wall duration, сумма искусственных задержек и reported duration. Один record выбран, чтобы объем данных не маскировал разницу.</p>
+  <p><strong>Фактический выход.</strong> Реальный вызов включил все шесть задержек, но <code>total_time</code> их не включил либо включил не полностью, потому что таймеры охватывают SQL-фрагменты, а пошаговые commits находятся за их границами. Поэтому метрика систематически занижает latency именно при режиме частых commit, который позиционируется как защита от накопления WAL.</p>
+  <p><strong>Отдельный paramstyle-подтест.</strong> Это независимый тест, а не продолжение timing run. Один и тот же смысловой SQL был представлен в формах, которые драйвер/SQLAlchemy сериализует по-разному: placeholder style и/или текстовые различия не меняют операцию, но меняют строку. Механизм учета сопоставлял exact SQL text, поэтому start/finish не связались корректно. Точные строки, входные параметры и наблюдаемый результат приведены в подпункте.</p>
+  <p><strong>Оракул и значение.</strong> <code>total_time</code> публичной операции должен измерять ее wall latency либо быть честно переименован в сумму ограниченных SQL-intervals. Для statement metrics нужен устойчивый execution context/correlation id, а не текстовое равенство SQL. Это observability-дефект: данные могут быть корректны, но SLO, capacity planning и расследование зависаний получают ложные цифры.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-13 -->
+<h4>Как именно проводился тест</h4>
+<p><strong>Timing case.</strong> Новая SQLite in-memory DB, target отсутствовала, source содержал одну строку id/value. На engine установлен SQLAlchemy <code>commit</code> event listener: перед возвратом каждого commit он выполнял sleep 40 ms и увеличивал счётчик. Внешний <code>time.perf_counter()</code> охватывал создание context, <code>exec()</code> и выход из context. Внутреннее значение взято из <code>result.total_time</code>.</p>
+<p><strong>Выход timing.</strong> Listener насчитал 6 commit events; wall=0.248019 s, result=0.003545 s, неучтённая разница=0.244474 s. Искусственная latency использована намеренно, чтобы отделить commit time от CPU noise.</p>
+<p><strong>SQL case.</strong> В отдельном SQLite merge с existing target и source, вызывающим UPDATE/INSERT/DELETE, сохранены result <code>insert_sql/update_sql/delete_sql</code>. В insert template присутствовал named bind <code>:id_1</code>; dialect engine сообщил <code>paramstyle='qmark'</code>. Тест не утверждает, что логика statement неверна; проверялось только документированное слово exact.</p>
+<p><code>DOCUMENTATION.md:129</code> называет <code>total_time</code> временем всей DB operation; строки 137-139 называют SQL exact. Фактически total складывается из DML timers (<code>src/dbmerge/dbmerge.py:571-572</code>) и не включает init, DDL, commit и cleanup.</p>
+<pre>6 commit hooks × 40 ms
+wall time         = 0.248019 s
+result.total_time = 0.003545 s
+unreported        = 0.244474 s</pre>
+<p>Result SQL на SQLite использовал named bind <code>:id_1</code>, тогда как dialect paramstyle был <code>qmark</code>. Это statement template до driver execution.</p>
+<p><strong>Исправление.</strong> Публиковать wall_time и stage timings отдельно. Переименовать SQL в statement template либо компилировать engine dialect с оговоркой о driver rewrite.</p>
+
+<h3>DB-14. Ошибки конфигурации выходят системными исключениями</h3>
+<!-- BEGIN INLINE REPRO PASSPORT DB-14 -->
+<div style="margin:12px 0 16px;padding:12px 14px;border-left:4px solid #52606d;background:#f6f8fa;">
+  <h4 style="margin:0 0 8px;">Полный паспорт validation/edge-case набора</h4>
+  <p><strong>Организация.</strong> Каждый подпункт этого кейса — отдельный экземпляр DBMerge и отдельный запуск. Конфигурации не комбинировались в один вызов, поэтому для каждого raw exception известен конкретный параметр-причина. Там, где проверяется preflight и SQL не нужен, таблица намеренно не создавалась; там, где ветка требует reflection/DML, использовалась отдельная минимальная target, чей DDL и исходное содержимое указаны в соответствующем подпункте.</p>
+  <p><strong>Что фиксировалось на входе.</strong> Для каждого подпункта непосредственно рядом приведены: форма source, число records, имена и runtime-типы ключей, точные значения опций, наличие/отсутствие target и поля, а также ожидаемая фаза отказа. Пустой dataset отдельно не трактуется как ошибка сам по себе: документированная семантика «пустой source + delete = опустошить target» сохранена и не записана в баг.</p>
+  <p><strong>Как проходил каждый тест.</strong> (1) Проверялось предусловие target. (2) Создавался ровно один невалидный или пограничный input/config. (3) Вызывался публичный API. (4) Записывались exception class, message и наличие exception chaining. (5) Проверялось, был ли выполнен DDL/DML до обнаружения проблемы. (6) Если таблица существовала, считывалось ее постсостояние. Такой порядок отличает безопасный ранний отказ от поздней внутренней аварии после побочных эффектов.</p>
+  <p><strong>Фактический общий результат.</strong> В перечисленных подпунктах библиотека выпускает наружу низкоуровневые <code>KeyError</code>, <code>AttributeError</code>, dialect/compiler errors или неоднозначные сообщения вместо стабильной ошибки контракта. Конкретный output и состояние таблицы после каждого варианта находятся в самом подпункте, а не вынесены в общую матрицу.</p>
+  <p><strong>Критерий исправления.</strong> Ошибки структуры source и конфигурации должны выявляться до создания staging и до mutation target. Сообщение обязано назвать параметр/поле и нарушение; документированная destructive-семантика пустого snapshot должна остаться явной и тестироваться как положительный сценарий, а не «исправляться» запретом удаления.</p>
+</div>
+<!-- END INLINE REPRO PASSPORT DB-14 -->
+<h4>Как именно проводились тесты</h4>
+<p><strong>source_schema без source table.</strong> Конструктору передан <code>source_schema</code>, но <code>source_table_name=None</code>. Oracle требовал parameter validation до обращения к БД и <code>IncorrectParameter</code>. Фактически код попытался собрать полное имя с None и вернул raw TypeError. Таблица для воспроизведения не требовалась.</p>
+<p><strong>Конфликт managed names.</strong> В новой SQLite DB передано одинаковое имя для <code>merged_on_field</code> и <code>inserted_on_field</code> вместе с обычной source row. Oracle - reject конфликтующих ролей до DDL. Факт - raw AttributeError с <code>is_sequence</code>.</p>
+<p><strong>Нестрогий bool.</strong> В новой SQLite DB создан обычный merge с одной строкой; до <code>exec()</code> присвоено <code>merge.commit_all_steps='false'</code>. Commit listener считал события. Строка была принята как truthy, операция завершилась и вызвала пять commit events. Oracle - reject значения, тип которого не bool.</p>
+<table>
+<thead><tr><th>Вход</th><th>Факт</th><th>Ожидание</th></tr></thead>
+<tbody>
+<tr><td><code>source_schema</code> без <code>source_table_name</code></td><td>Raw TypeError</td><td><code>IncorrectParameter</code></td></tr>
+<tr><td>Одинаковые merged-on и inserted-on</td><td>Raw AttributeError</td><td>Явный conflict error</td></tr>
+<tr><td><code>commit_all_steps='false'</code></td><td>Строка truthy, step commits выполняются</td><td>Strict bool validation</td></tr>
+</tbody>
+</table>
+
+<h2 class="pagebreak">6. Быстродействие и масштабирование</h2>
+<h3>6.1. Baseline SQLite</h3>
+<table>
+<thead><tr><th>Размер</th><th>Wall time</th><th>Reported total_time</th></tr></thead>
+<tbody>
+<tr><td>1 000</td><td>0.008032 s</td><td>0.005504 s</td></tr>
+<tr><td>10 000</td><td>0.039688 s</td><td>0.037908 s</td></tr>
+<tr><td>50 000</td><td>0.180936 s</td><td>0.177964 s</td></tr>
+</tbody>
+</table>
+<p>Для 50 000 строк cProfile: около 163 ms, из них около 118 ms на staging insert. Локальный happy path быстрый, но это не прогноз сетевой production БД.</p>
+
+<h3>6.2. Форматы и chunk</h3>
+<table>
+<thead><tr><th>20 000 rows</th><th>Время</th><th>Chunk</th><th>Время</th></tr></thead>
+<tbody>
+<tr><td>list[dict]</td><td>0.063769 s</td><td>1</td><td>0.259119 s</td></tr>
+<tr><td>dict[list]</td><td>0.103301 s</td><td>100</td><td>0.060142 s</td></tr>
+<tr><td>Pandas</td><td>0.086273 s</td><td>10 000</td><td>0.062524 s</td></tr>
+<tr><td>Polars</td><td>0.067120 s</td><td></td><td></td></tr>
+</tbody>
+</table>
+
+<h3>6.3. Production-риски</h3>
+<ul>
+<li><strong>Телеметрия.</strong> Network commit latency может доминировать, но result.total_time её скрывает.</li>
+<li><strong>Крупные фазы.</strong> Пошаговый commit уменьшает общий transaction scope, но один массовый UPDATE/INSERT/DELETE всё равно может создать большой WAL/undo. Это предел стратегии, а не отрицание выбранного дизайна.</li>
+<li><strong>Staging statistics.</strong> Для большого PostgreSQL batch следует измерить <code>ANALYZE temp</code>; немедленный запрос может планироваться без репрезентативной статистики.</li>
+<li><strong>Индексы.</strong> PK staging создаётся; индекс/unique на target merge-key остаётся DB prerequisite.</li>
+<li><strong>Hot DDL.</strong> Automatic ALTER может брать metadata locks и не должен быть частью обычного production merge path.</li>
+</ul>
+
+<h2 class="pagebreak">7. Безопасность</h2>
+<h3>7.1. Проверено без finding</h3>
+<div class="callout good"><ul>
+<li>Инъекционные target/helper identifiers проверены на SQLite и PostgreSQL. Sentinel tables сохранились; malicious-name table удалена корректно.</li>
+<li>Bandit: 0 high, 0 medium, 2 low. Low относятся к подавлению исключений в destructor.</li>
+<li><code>pip-audit</code> обязательных runtime dependencies: известных уязвимостей нет.</li>
+<li>Прямой SQL injection в проверенных identifier paths не подтверждён.</li>
+</ul></div>
+
+<h3>7.2. Hardening gaps</h3>
+<ul>
+<li>При аудите всех extras <code>mariadb 1.1.14</code> отмечен <code>PYSEC-2026-217 / CVE-2026-44172</code>. Условия связаны с Big5/text protocol/manual escaping; обычный bound SQLAlchemy path не доказан уязвимым. Нужен upgrade/constraint и отдельная проверка.</li>
+<li>GitHub Actions используют tags без pin на commit SHA; checkout credentials сохраняются; permissions шире минимальных. Это supply-chain risk, не runtime injection.</li>
+<li>Auto-DDL требует повышенных прав. Production должен разделять migrator role и runtime merge role.</li>
+</ul>
+
+<h3>7.3. Почему auto-create сейчас небезопасен</h3>
+<p>Не сам автоматический DDL является дефектом. Дефект в том, что модуль выбирает physical type, precision, timezone, generated semantics и staging structure без полного dialect contract. Live-тесты показали три вида ущерба: DDL не компилируется, данные молча меняются, sequence/identity создаётся с неверной семантикой.</p>
+
+<h2 class="pagebreak">8. Дефекты тестового контура</h2>
+<h3>T-01. Дублированное имя теста удаляет 20 случаев</h3>
+<p>В <code>tests/test_all.py:493</code> и <code>tests/test_all.py:678</code> объявлены функции <code>test_update_condition</code>. Вторая перезаписывает первую при import.</p>
+<pre>collected: 270
+expected without overwrite: 290
+lost: 20 = 4 cases × 5 backend profiles
+Ruff: F811 redefinition</pre>
+
+<h3>T-02. Performance script падает при import</h3>
+<p><code>tests/measure_perf.py:91</code> обращается к <code>result</code> вне main guard:</p>
+<pre>NameError: name 'result' is not defined</pre>
+
+<h3>T-03. Нет негативной DB matrix</h3>
+<p>В <code>tests/test_all.py</code> не найдено <code>pytest.raises</code>. Suite не закрывает malformed row schema, duplicate DataFrame labels, managed-field collisions, generated/identity columns, type round-trip metadata, UNIQUE transitions и dialect DDL.</p>
+
+<h2 class="pagebreak">9. План исправления</h2>
+<h3>Фаза 0. Production guards</h3>
+<ol>
+<li>Для MySQL/MariaDB запретить auto-create/auto-add без explicit dialect-safe <code>data_types</code>.</li>
+<li>Для SQL Server fail-fast до появления рабочей staging implementation.</li>
+<li>Для MySQL временно запретить integer key 0.</li>
+<li>Для PostgreSQL проверить sequence уже автосозданных таблиц контролируемой миграцией.</li>
+<li>До DBMerge валидировать одинаковый key set dict rows и unique DataFrame columns.</li>
+<li>Исключить generated/computed fields из payload.</li>
+</ol>
+
+<h3>Фаза 1. Модель колонок</h3>
+<ol>
+<li>Разделить source type, target DDL type и staging DDL type.</li>
+<li>Staging: копировать physical type, но снимать Identity, Sequence, Computed, defaults и autoincrement.</li>
+<li>Target merge-key: externally assigned PK по умолчанию.</li>
+<li>Float: dialect double; Decimal: explicit precision/scale.</li>
+<li>MySQL/MariaDB datetime: fsp=6 и timezone policy.</li>
+<li>String: configurable policy, explicit length для key/indexed fields.</li>
+</ol>
+
+<h3>Фаза 2. SQL Server adapter</h3>
+<ol>
+<li>Session-local <code>#temp</code>, одна physical connection.</li>
+<li>Staging key без IDENTITY.</li>
+<li>Policy target identity: reject, omit generated id или контролируемый IDENTITY_INSERT.</li>
+<li>Live tests на поддерживаемых SQL Server и pyodbc.</li>
+</ol>
+
+<h3>Фаза 3. UNIQUE-safe snapshot</h3>
+<ol>
+<li>Preflight values, занятых удаляемыми строками.</li>
+<li>В atomic mode рассмотреть delete-obsolete-before-upsert после FK preflight.</li>
+<li>Для swaps реализовать двухфазную стратегию либо fail-fast до изменения данных.</li>
+<li>Тестировать immediate и deferrable constraints.</li>
+</ol>
+
+<h3>Фаза 4. Input/API contract</h3>
+<ol>
+<li>Strict row schema validation до DDL.</li>
+<li>Reject duplicate labels Pandas.</li>
+<li>Проверить конфликт ролей key/delete mark/merged-on/inserted-on.</li>
+<li>Managed <code>data_types</code> хранить отдельно от source fields.</li>
+<li>Перевести parameter failures в public domain exceptions.</li>
+</ol>
+
+<h3>Фаза 5. Release gate</h3>
+<ol>
+<li>True wall-clock и stage/commit/DDL timings.</li>
+<li>Statement template вместо “exact SQL”.</li>
+<li>Устранить overwrite теста; фиксировать collection count.</li>
+<li>Live CI: PostgreSQL, MySQL, MariaDB, SQL Server, SQLite pool variants.</li>
+<li>Release запрещён без round-trip type и negative edge suite.</li>
+</ol>
+
+<h2 class="pagebreak">10. Обязательная регрессионная матрица</h2>
+<table>
+<thead><tr><th>Тест</th><th>Backend</th><th>Проверка</th></tr></thead>
+<tbody>
+<tr><td><code>test_auto_float_preserves_fraction</code></td><td>Все</td><td>Round-trip и metadata</td></tr>
+<tr><td><code>test_auto_datetime_preserves_microseconds</code></td><td>Все</td><td>Без округления</td></tr>
+<tr><td><code>test_aware_datetime_policy</code></td><td>Все</td><td>UTC normalization либо reject</td></tr>
+<tr><td><code>test_auto_string_ddl</code></td><td>MySQL/MariaDB</td><td>DDL и length policy</td></tr>
+<tr><td><code>test_zero_integer_key_round_trip</code></td><td>MySQL/MariaDB</td><td>Key остаётся 0</td></tr>
+<tr><td><code>test_staging_key_not_generated</code></td><td>Все</td><td>Нет serial/identity/autoincrement</td></tr>
+<tr><td><code>test_postgres_auto_key_default</code></td><td>PostgreSQL</td><td>Нет stale sequence</td></tr>
+<tr><td><code>test_mssql_temp_ddl</code></td><td>SQL Server</td><td>#temp live lifecycle</td></tr>
+<tr><td><code>test_unique_reassignment_with_delete</code></td><td>Все</td><td>Валидный final snapshot</td></tr>
+<tr><td><code>test_unique_swap</code></td><td>Все</td><td>Swap либо preflight reject</td></tr>
+<tr><td><code>test_source_generated_column</code></td><td>PG/MySQL/MSSQL</td><td>Generated исключён</td></tr>
+<tr><td><code>test_list_dict_same_keyset</code></td><td>Unit</td><td>Mismatch до БД</td></tr>
+<tr><td><code>test_pandas_duplicate_labels</code></td><td>Unit</td><td>Domain error</td></tr>
+<tr><td><code>test_managed_field_explicit_type</code></td><td>Все</td><td>Три managed roles</td></tr>
+<tr><td><code>test_sqlite_memory_nullpool</code></td><td>SQLite</td><td>Одна connection</td></tr>
+<tr><td><code>test_total_time_includes_commit</code></td><td>Unit/live</td><td>Artificial latency включена</td></tr>
+<tr><td><code>test_cleanup_preserves_primary_exception</code></td><td>Unit</td><td>Primary cause + close</td></tr>
+</tbody>
+</table>
+
+<h2 class="pagebreak">11. Матрица допустимости до исправления</h2>
+<table>
+<thead><tr><th>Профиль</th><th>Решение</th><th>Причина/ограничение</th></tr></thead>
+<tbody>
+<tr><td>SQL Server, любой merge</td><td><span class="badge p0">NO-GO</span></td><td>Невалидная temp DDL + IDENTITY</td></tr>
+<tr><td>MySQL/MariaDB auto schema</td><td><span class="badge p0">NO-GO</span></td><td>String failure, float/datetime corruption</td></tr>
+<tr><td>MySQL pre-created, key допускает 0</td><td><span class="badge p0">NO-GO</span></td><td>Staging меняет 0</td></tr>
+<tr><td>PostgreSQL auto integer PK + default inserts</td><td><span class="badge p0">NO-GO</span></td><td>Stale sequence</td></tr>
+<tr><td>Generated columns в source-table</td><td><span class="badge p0">NO-GO</span></td><td>Read-only columns в DML</td></tr>
+<tr><td>Snapshot с переносом UNIQUE values</td><td><span class="badge p0">NO-GO</span></td><td>Intermediate conflict</td></tr>
+<tr><td>SQLite file DB, pre-created schema</td><td><span class="badge ok">CONDITIONAL GO</span></td><td>Strict input, без найденных edge cases</td></tr>
+<tr><td>PG/MySQL/MariaDB pre-created schema</td><td><span class="badge ok">CONDITIONAL GO</span></td><td>Non-generated fields, positive keys, без UNIQUE transitions, wrapper validation</td></tr>
+</tbody>
+</table>
+
+<h3>Минимальный wrapper до исправлений</h3>
+<ul>
+<li><code>can_create_table=False</code> и <code>can_create_columns=False</code>.</li>
+<li>Запрет SQL Server.</li>
+<li>Одинаковый key set dict rows и unique DataFrame labels.</li>
+<li>Нет generated/identity/computed fields в payload.</li>
+<li>Для MySQL key не равен 0.</li>
+<li>До full snapshot проверка UNIQUE transitions.</li>
+<li>Wall clock измеряется снаружи.</li>
+</ul>
+
+<h2 class="pagebreak">12. Исключённые гипотезы</h2>
+<table>
+<thead><tr><th>Гипотеза</th><th>Результат</th></tr></thead>
+<tbody>
+<tr><td>SQL injection через identifiers/helper</td><td>Не подтверждена; sentinel tables сохранены</td></tr>
+<tr><td>Pandas NaT</td><td>Корректный SQL NULL</td></tr>
+<tr><td>Pandas nullable string/int/bool с pd.NA</td><td>Корректный SQL NULL</td></tr>
+<tr><td>dict[list] разной длины</td><td>Корректный IncorrectDataError</td></tr>
+<tr><td>Extra field при can_create_columns=False</td><td>Корректно игнорируется по политике</td></tr>
+<tr><td>Обычный PostgreSQL constraint error маскируется cleanup</td><td>Не подтверждено; primary error сохранён, connection закрыт</td></tr>
+<tr><td>MySQL UPDATE вызывает error 1093</td><td>Не подтверждено на MySQL 8.4.11</td></tr>
+<tr><td>Legal long target name ломает temp name</td><td>Не подтверждено на MySQL/PostgreSQL</td></tr>
+<tr><td>Обычный merge на unique non-null key</td><td>180/180 randomized cases passed</td></tr>
+</tbody>
+</table>
+
+<!-- Архивный отдельный протокольный раздел скрыт: детали перенесены непосредственно в каждый DB-кейс.
+<h2 class="pagebreak">13. Детальные условия и протоколы тестов</h2>
+
+<h3>13.1. Общие правила воспроизведения</h3>
+<table>
+<thead><tr><th>Параметр</th><th>Условие</th></tr></thead>
+<tbody>
+<tr><td>Версия кода</td><td><code>dbmerge 1.0.20</code> из локального checkout без модификации исходников.</td></tr>
+<tr><td>Python/ORM</td><td>Основные negative probes: Python 3.13.6, SQLAlchemy 2.0.51.</td></tr>
+<tr><td>Изоляция</td><td>SQLite использовался in-memory; PostgreSQL objects создавались как session temporary либо в уникальной тестовой области с cleanup; MySQL/MariaDB запускались в одноразовых Docker containers.</td></tr>
+<tr><td>Начальное состояние</td><td>Каждый сценарий создавал новую таблицу с уникальным именем либо новый in-memory engine. Данные предыдущего сценария не переиспользовались.</td></tr>
+<tr><td>Oracle</td><td>Ожидаемый результат задавался до запуска как точный набор строк, metadata колонки либо класс domain exception.</td></tr>
+<tr><td>Фиксация результата</td><td>После <code>exec()</code> выполнялся независимый SELECT/inspection. Успех DBMerge без read-back не считался доказательством корректности.</td></tr>
+<tr><td>Негативный тест</td><td>Если ожидалась ошибка, фиксировалась полная цепочка типов исключений; состояние target проверялось отдельно, когда соединение оставалось пригодным.</td></tr>
+<tr><td>Секреты</td><td>Пароли и connection URLs не печатались. В отчёте оставлены только версии СУБД, schema metadata и фактические строки.</td></tr>
+</tbody>
+</table>
+
+<h3>13.1.1. Карта существования таблиц до каждого bug-test</h3>
+<p>DBMerge во всех тестах самостоятельно создавал staging с именем вида <code>&lt;target&gt;_&lt;8 hex&gt;</code>. В таблице ниже «target отсутствует» означает, что до конструктора DBMerge в БД не было ни target, ни staging; таким образом одновременно проверялись inference и auto-DDL. «Target существует» означает, что DDL выполнен тестом заранее и DBMerge не определял physical type target columns.</p>
+<table>
+<thead><tr><th>Finding/test</th><th>Таблицы до запуска</th><th>DDL или автоматически ожидаемая схема</th><th>Что создавал DBMerge</th></tr></thead>
+<tbody>
+<tr><td>DB-01 float</td><td>Target отсутствует</td><td>Input columns: id integer-like, amount float</td><td>Target + temporary staging; target amount фактически <code>DECIMAL(10,0)</code></td></tr>
+<tr><td>DB-02 datetime</td><td>Target отсутствует</td><td>Input: id + aware datetime с 6 microseconds digits</td><td>Target + staging; datetime фактически <code>DATETIME(0)</code></td></tr>
+<tr><td>DB-03 MSSQL</td><td>SQLite control target <code>items</code> существует</td><td><code>id INTEGER PRIMARY KEY, value VARCHAR(50)</code></td><td>SQLAlchemy staging object; затем тот же объект скомпилирован MSSQL dialect</td></tr>
+<tr><td>DB-04 MySQL key=0</td><td>Target существует</td><td><code>id INT NOT NULL PRIMARY KEY, value VARCHAR(20/30)</code>, без AUTO_INCREMENT</td><td>Только staging; именно staging ошибочно получила AUTO_INCREMENT</td></tr>
+<tr><td>DB-04 PostgreSQL sequence</td><td>Target отсутствует</td><td>Input ids 1/2 + text payload</td><td>Target с serial-like default + staging</td></tr>
+<tr><td>DB-05 strings</td><td>Target отсутствует</td><td>Input: id + Python/Pandas/Polars string</td><td>Попытка target DDL остановилась на безразмерном VARCHAR; staging не дошла до загрузки</td></tr>
+<tr><td>DB-06 UNIQUE</td><td>Target существует и содержит 2 строки</td><td><code>id PK, code NOT NULL UNIQUE</code></td><td>Только staging с одной source-строкой</td></tr>
+<tr><td>DB-07 generated</td><td>Source и target существуют</td><td>Обе: <code>id PK, a int, doubled GENERATED ALWAYS AS (a*2) STORED</code></td><td>Staging по отражённым source columns</td></tr>
+<tr><td>DB-08 list[dict]</td><td>Target отсутствует</td><td>Первая row задаёт id/a; b появляется только во второй</td><td>Target id/a + staging id/a; b не попала ни в одну таблицу</td></tr>
+<tr><td>DB-09 Pandas duplicate</td><td>Target отсутствует</td><td>DataFrame labels: id/value/value</td><td>Target с одной value-column + staging</td></tr>
+<tr><td>DB-10 managed types</td><td>Target отсутствует</td><td>Source row содержит только обычные поля; managed field задан параметром</td><td>Попытка target/managed setup; сбой до корректного DML</td></tr>
+<tr><td>DB-11 NullPool</td><td>Target отсутствует</td><td>SQLite <code>:memory:</code>, каждый checkout является отдельной БД</td><td>Target на одном connection; DML ищет её на другом</td></tr>
+<tr><td>DB-12 fault</td><td>Обычная тестовая target существует</td><td>Минимальная id/payload schema</td><td>Staging существует к моменту двойной fault</td></tr>
+<tr><td>DB-12 PostgreSQL control</td><td>Target существует</td><td><code>id bigint PK, value text CHECK(length(value)&lt;=3)</code></td><td>Staging без target CHECK, чтобы нарушение возникло при target INSERT</td></tr>
+<tr><td>DB-13 timing</td><td>Target отсутствует</td><td>Одна строка id/value</td><td>Target + staging; commit hooks наблюдают весь lifecycle</td></tr>
+<tr><td>DB-14 validation</td><td>Не требуется</td><td>Некорректная комбинация constructor/options</td><td>Oracle требует остановку до DDL; часть сценариев падает ещё в init</td></tr>
+</tbody>
+</table>
+
+<h3>13.2. DB-01: float → DECIMAL(10,0)</h3>
+<h4>TEST-DB01-MYSQL-LIST</h4>
+<table>
+<tbody>
+<tr><th>Среда</th><td>MySQL Community 8.4.11, новый database <code>dbmerge_audit</code>, default strict sql_mode: <code>ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION</code>.</td></tr>
+<tr><th>Target до запуска</th><td>Таблица отсутствует.</td></tr>
+<tr><th>Вход</th><td><code>[{'id': 1, 'amount': 1.75}]</code>.</td></tr>
+<tr><th>Параметры</th><td><code>schema='dbmerge_audit'</code>, <code>key=['id']</code>, default <code>can_create_table=True</code>, default <code>delete_mode='no'</code>.</td></tr>
+<tr><th>Шаги</th><td>Выполнить DBMerge; запросить <code>information_schema.columns</code> для <code>amount</code>; прочитать <code>amount</code> обратно по id=1.</td></tr>
+<tr><th>Oracle</th><td>Колонка должна сохранять дробную часть; read-back численно равен 1.75.</td></tr>
+<tr><th>Факт</th><td><code>decimal(10,0)</code>, precision=10, scale=0, stored=<code>2</code>; DBMerge вернул success.</td></tr>
+<tr><th>Cleanup</th><td>Target удалена, container удалён.</td></tr>
+</tbody>
+</table>
+
+<h4>TEST-DB01-MARIADB-LIST</h4>
+<p>Те же target, data и параметры на MariaDB 11.4.12. Фактически создан <code>decimal(10,0)</code>, значение <code>1.75</code> считано как <code>2</code>. Это независимое live-подтверждение, а не компиляция MySQL dialect.</p>
+
+<h4>TEST-DB01-DATAFRAMES</h4>
+<p>На MySQL 8.4.11 отдельно переданы <code>pd.DataFrame({'id':[1], 'amount':[1.75]})</code> и <code>pl.DataFrame({'id':[1], 'amount':[1.75]})</code>. Для каждого формата создавалась отдельная отсутствующая target. В обоих случаях metadata стала <code>decimal(10,0)</code>, read-back равен <code>2</code>. Условие доказывает общий дефект inference, но не утверждает, что существующая заранее типизированная DOUBLE-колонка повреждается.</p>
+
+<h3>13.3. DB-02: datetime precision и timezone</h3>
+<h4>TEST-DB02-MYSQL-AWARE</h4>
+<table>
+<tbody>
+<tr><th>Среда</th><td>MySQL 8.4.11, тот же strict sql_mode.</td></tr>
+<tr><th>Target</th><td>Отсутствует; DBMerge полностью определяет DDL.</td></tr>
+<tr><th>Вход</th><td>Python datetime <code>2026-08-02 12:34:56.987654+03:00</code>.</td></tr>
+<tr><th>Параметры</th><td><code>key=['id']</code>, default auto-create.</td></tr>
+<tr><th>Шаги</th><td>Merge; запросить <code>column_type</code>/<code>datetime_precision</code>; SELECT значения.</td></tr>
+<tr><th>Oracle</th><td>Либо точный instant и microseconds сохраняются, либо вход отклоняется как unsupported. Молчаливая потеря недопустима.</td></tr>
+<tr><th>Факт</th><td><code>datetime</code>, precision=0, stored <code>2026-08-02 12:34:57</code>. Offset не сохранён, microseconds округлены.</td></tr>
+</tbody>
+</table>
+
+<h4>TEST-DB02-MARIADB-AWARE</h4>
+<p>MariaDB 11.4.12, тот же aware input. Metadata: <code>datetime</code>, precision=0; read-back <code>2026-08-02 12:34:56</code>. MariaDB отбросила дробную часть без округления вверх. Разница результатов СУБД дополнительно показывает отсутствие общего временного контракта.</p>
+
+<h4>TEST-DB02-PANDAS-POLARS</h4>
+<p>Pandas получил <code>Timestamp('2026-08-02T12:34:56.987654+03:00')</code>; Polars получил UTC-aware datetime <code>2026-08-02 09:34:56.987654+00:00</code>. На MySQL обе target созданы как <code>datetime(0)</code>; результаты соответственно <code>12:34:57</code> и <code>09:34:57</code>. Проверка не смешивала строки разных timezone в одном batch.</p>
+
+<h3>13.4. DB-03: SQL Server staging DDL</h3>
+<h4>TEST-DB03-MSSQL-COMPILE</h4>
+<table>
+<tbody>
+<tr><th>Live SQL Server</th><td>Не использовался. Это явно ограничивает доказательство runtime-цепочки.</td></tr>
+<tr><th>Объект</th><td>Не вручную написанный SQL, а <code>temp_table</code>, который DBMerge построил для target <code>items(id INTEGER PK, value VARCHAR(50))</code>.</td></tr>
+<tr><th>Условие захвата</th><td>Drop staging временно заменён no-op только в экземпляре теста, чтобы сохранить SQLAlchemy Table после <code>exec()</code>; исходники не менялись.</td></tr>
+<tr><th>Шаг</th><td><code>CreateTable(temp_table).compile(dialect=mssql.dialect())</code>.</td></tr>
+<tr><th>Факт</th><td><code>CREATE TEMPORARY TABLE ... id INTEGER NOT NULL IDENTITY ...</code>.</td></tr>
+<tr><th>Oracle</th><td>T-SQL local temp table должна иметь имя <code>#...</code> и обычный <code>CREATE TABLE</code>; staging key, в который загружается id, не должен быть IDENTITY.</td></tr>
+<tr><th>Ограничение</th><td>После исправления DDL необходим live SQL Server test: компиляция не проверяет permissions, pyodbc, rowcount и lifecycle <code>#temp</code>.</td></tr>
+</tbody>
+</table>
+
+<h3>13.5. DB-04: generated semantics merge-key</h3>
+<h4>TEST-DB04-MYSQL-ZERO-SIMPLE</h4>
+<p>MySQL target создавалась заранее raw DDL как <code>id INT NOT NULL PRIMARY KEY, value VARCHAR(20)</code>, то есть target id не имел AUTO_INCREMENT. Source: одна строка <code>id=0</code>. Несмотря на это, DBMerge staging получила AUTO_INCREMENT. После success target содержала <code>(1,'zero')</code>. Это изолирует ошибку именно в staging, а не в target DDL.</p>
+
+<h4>TEST-DB04-MYSQL-ZERO-SNAPSHOT</h4>
+<table>
+<tbody>
+<tr><th>Target до</th><td><code>[(0,'zero-old'), (1,'one-old')]</code>, обычный non-auto PK.</td></tr>
+<tr><th>Source</th><td><code>[(0,'zero-new')]</code>.</td></tr>
+<tr><th>Режим</th><td><code>delete_mode='delete'</code>, <code>can_create_table=False</code>.</td></tr>
+<tr><th>Oracle</th><td><code>[(0,'zero-new')]</code>.</td></tr>
+<tr><th>Факт</th><td><code>[(1,'zero-new')]</code>; результат сообщил update=1/delete=1.</td></tr>
+<tr><th>Критерий</th><td>Тест считается проваленным даже при сохранении количества строк, поскольку identity строки изменена.</td></tr>
+</tbody>
+</table>
+
+<h4>TEST-DB04-POSTGRES-SEQUENCE</h4>
+<table>
+<tbody>
+<tr><th>Среда</th><td>PostgreSQL 18.3, отдельная session temp schema.</td></tr>
+<tr><th>Target</th><td>Отсутствует; DBMerge auto-create.</td></tr>
+<tr><th>Source</th><td><code>[(1,'a'), (2,'b')]</code>, integer merge-key.</td></tr>
+<tr><th>Проверка metadata</th><td><code>information_schema.columns.column_default</code> для id.</td></tr>
+<tr><th>Контроль после merge</th><td>Обычный <code>INSERT(value) VALUES ('external') RETURNING id</code> без явного id.</td></tr>
+<tr><th>Oracle</th><td>Либо key не generated, либо default insert получает id, не конфликтующий с 1/2.</td></tr>
+<tr><th>Факт</th><td>Default=<code>nextval(...)</code>; следующий insert получил id=1 и завершился <code>UniqueViolation</code>.</td></tr>
+<tr><th>Изоляция</th><td>Session закрыта после проверки; постоянные объекты не создавались.</td></tr>
+</tbody>
+</table>
+
+<h3>13.6. DB-05: строковый DDL MySQL/MariaDB</h3>
+<h4>TEST-DB05-STRING-MATRIX</h4>
+<p>Для каждого формата создавалась отдельная отсутствующая target:</p>
+<ul>
+<li>Python: <code>[{'id':1, 'value':'ordinary text'}]</code>.</li>
+<li>Pandas: <code>DataFrame({'id':[1], 'value':['text']})</code>.</li>
+<li>Polars: <code>DataFrame({'id':[1], 'value':['text']})</code>.</li>
+</ul>
+<p>MySQL 8.4.11 во всех трёх случаях завершился <code>CompileError: VARCHAR requires a length on dialect mysql</code>. Python-сценарий независимо повторён на MariaDB 11.4.12 с dialect mariadb. Ошибка возникает при DDL compile до загрузки строк; это fail-closed, но заявленная auto-create функция не работает.</p>
+
+<h3>13.7. DB-06: valid snapshot и UNIQUE</h3>
+<h4>TEST-DB06-UPDATE-REASSIGN</h4>
+<table>
+<tbody>
+<tr><th>СУБД</th><td>SQLite 3.49.1, PostgreSQL 18.3, MySQL 8.4.11; отдельная target на каждой.</td></tr>
+<tr><th>Schema</th><td><code>id</code> primary key, <code>code</code> NOT NULL UNIQUE.</td></tr>
+<tr><th>Target до</th><td><code>[(1,'A'), (2,'B')]</code>.</td></tr>
+<tr><th>Source</th><td><code>[(1,'B')]</code>.</td></tr>
+<tr><th>Режим</th><td><code>delete_mode='delete'</code>, target заранее создана.</td></tr>
+<tr><th>Oracle</th><td><code>[(1,'B')]</code>; это состояние удовлетворяет PK и UNIQUE.</td></tr>
+<tr><th>Факт</th><td>Все три СУБД отклонили UPDATE, потому что строка 2 с B ещё не удалена. Target осталась исходной.</td></tr>
+<tr><th>Исключённая причина</th><td>Ни duplicate source key, ни отсутствие DB constraint: constraint существует и корректно работает.</td></tr>
+</tbody>
+</table>
+
+<h4>TEST-DB06-INSERT-REASSIGN</h4>
+<p>SQLite control: та же target, source=<code>[(3,'B')]</code>. Конечное состояние <code>[(3,'B')]</code> валидно, но INSERT выполняется до DELETE id=2 и получает UNIQUE violation. Тест подтверждает, что дефект затрагивает и UPDATE, и INSERT ветки.</p>
+
+<h3>13.8. DB-07: generated column source-table</h3>
+<h4>TEST-DB07-POSTGRES-GENERATED</h4>
+<table>
+<tbody>
+<tr><th>Среда</th><td>PostgreSQL 18.3, две session temp tables.</td></tr>
+<tr><th>Source/target schema</th><td><code>id bigint PK, a integer, doubled integer GENERATED ALWAYS AS (a*2) STORED</code>.</td></tr>
+<tr><th>Source rows</th><td>В source вставлено <code>(id=1,a=5)</code>; СУБД вычислила <code>doubled=10</code>.</td></tr>
+<tr><th>Target rows</th><td>Пусто.</td></tr>
+<tr><th>DBMerge mode</th><td><code>source_table_name=src</code>, <code>table_name=dst</code>, <code>key=['id']</code>, <code>can_create_table=False</code>.</td></tr>
+<tr><th>Oracle</th><td>Записать id/a, дать target вычислить doubled; результат <code>(1,5,10)</code>.</td></tr>
+<tr><th>Факт</th><td><code>ProgrammingError / GeneratedAlways: column doubled can only be updated to DEFAULT</code>.</td></tr>
+<tr><th>Особенность</th><td>Target пустая, но PostgreSQL валидирует запрещённое присваивание в UPDATE до определения количества совпавших строк.</td></tr>
+</tbody>
+</table>
+
+<h3>13.9. DB-08: неоднородные dict rows</h3>
+<h4>TEST-DB08-LATER-EXTRA</h4>
+<p>SQLite in-memory, target отсутствует. Data: первая строка имеет поля id/a, вторая id/a/b. При auto-create ожидался reject до DDL. Факт: success; создано только id/a; значение b потеряно. Read-back проверял и список колонок через PRAGMA, и строки.</p>
+
+<h4>TEST-DB08-LATER-MISSING</h4>
+<p>Контроль с обратным порядком: первая строка id/a/b, вторая id/a. Факт: SQLAlchemy <code>StatementError</code> с внутренним <code>InvalidRequestError</code> о bind parameter b. Этот control доказывает зависимость результата от порядка строк.</p>
+
+<h4>TEST-DB08-DICT-LISTS-LENGTH</h4>
+<p>Отрицательная контрольная гипотеза: <code>{'id':[1,2,3], 'value':['new1']}</code> при <code>delete_mode='delete'</code>. DBMerge корректно остановился до DML через <code>IncorrectDataError</code> и указал ожидаемую/фактическую длину. Этот случай не является finding.</p>
+
+<h3>13.10. DB-09: duplicate Pandas labels</h3>
+<h4>TEST-DB09-PANDAS-DUPLICATE</h4>
+<table>
+<tbody>
+<tr><th>DataFrame</th><td><code>DataFrame([[1,'first','second']], columns=['id','value','value'])</code>.</td></tr>
+<tr><th>Target</th><td>Отсутствует, SQLite in-memory.</td></tr>
+<tr><th>Oracle</th><td>Reject ambiguous schema до DDL.</td></tr>
+<tr><th>Факт</th><td>Merge success; target row <code>(1,'second')</code>; первое значение исчезло.</td></tr>
+<tr><th>Контроль nullable</th><td>Отдельные Pandas nullable string/int/bool с <code>pd.NA</code> успешно сохранили NULL, поэтому finding не относится ко всем современным Pandas dtype.</td></tr>
+</tbody>
+</table>
+
+<h3>13.11. DB-10: data_types и managed fields</h3>
+<h4>TEST-DB10-MANAGED-TYPE-MATRIX</h4>
+<p>Три независимых сценария на SQLite, каждый с новой target и source row с обычным id:</p>
+<ul>
+<li><code>merged_on_field='audit_ts'</code> + <code>data_types={'audit_ts': DateTime()}</code>.</li>
+<li><code>inserted_on_field='created_ts'</code> + явный <code>DateTime()</code>.</li>
+<li><code>delete_mark_field='deleted'</code> + явный <code>Boolean()</code>.</li>
+</ul>
+<p>Во всех случаях managed field отсутствовал в source row и target до auto-DDL. Oracle: тип используется для managed column, значение назначает DBMerge. Факт: raw <code>AttributeError: NoneType has no attribute is_sequence</code>. Отдельный control с одинаковыми именами merged-on/inserted-on дал тот же класс низкоуровневого сбоя.</p>
+
+<h3>13.12. DB-11: SQLite NullPool</h3>
+<h4>TEST-DB11-SQLITE-NULLPOOL</h4>
+<table>
+<tbody>
+<tr><th>Engine</th><td><code>create_engine('sqlite:///:memory:', poolclass=NullPool)</code>.</td></tr>
+<tr><th>Target</th><td>Отсутствует; data содержит обычную строку с integer key.</td></tr>
+<tr><th>Oracle</th><td>Auto-create и DML используют одну physical connection либо API отклоняет несовместимую конфигурацию до DDL.</td></tr>
+<tr><th>Факт</th><td><code>OperationalError: no such table: nullpool_case</code>.</td></tr>
+<tr><th>Механизм</th><td>Target создана через engine checkout, последующая операция получила другое in-memory соединение.</td></tr>
+<tr><th>Область</th><td>Не распространяется на file SQLite и корректно настроенный StaticPool.</td></tr>
+</tbody>
+</table>
+
+<h3>13.13. DB-12: cleanup fault injection</h3>
+<h4>TEST-DB12-DOUBLE-FAILURE</h4>
+<p>В экземпляре DBMerge исполнитель основной стадии заменён функцией, выбрасывающей <code>ValueError('PRIMARY_FAILURE')</code>; cleanup staging заменён функцией, выбрасывающей <code>RuntimeError('CLEANUP_FAILURE')</code>. Oracle: наружу сохраняется primary failure, cleanup прикреплён context/note, connection закрыт. Факт: наружу вышел cleanup RuntimeError, <code>connection_closed=false</code>, <code>merge_finished=false</code>.</p>
+
+<h4>TEST-DB12-POSTGRES-CONTROL</h4>
+<p>Для оценки реальной области на PostgreSQL 18.3 target имела CHECK <code>length(value)&lt;=3</code>, source передавал <code>'too-long'</code>. Факт: наружу вышел исходный <code>IntegrityError/CheckViolation</code>, connection closed=true, merge_finished=true. Поэтому fault finding не экстраполирован на любую DB error.</p>
+
+<h3>13.14. DB-13: timing и SQL representation</h3>
+<h4>TEST-DB13-COMMIT-LATENCY</h4>
+<table>
+<tbody>
+<tr><th>Engine</th><td>SQLite in-memory.</td></tr>
+<tr><th>Инъекция</th><td>SQLAlchemy <code>commit</code> event sleep 40 ms; счётчик зафиксировал 6 commit events.</td></tr>
+<tr><th>Измерение</th><td><code>time.perf_counter()</code> снаружи всего context/exec против <code>result.total_time</code>.</td></tr>
+<tr><th>Факт</th><td>Wall=0.248019 s; reported=0.003545 s; разница=0.244474 s.</td></tr>
+<tr><th>Oracle</th><td>Поле, документированное как total всей DB operation, должно учитывать commit latency.</td></tr>
+</tbody>
+</table>
+
+<h4>TEST-DB13-SQL-PARAMSTYLE</h4>
+<p>Result <code>insert_sql</code> содержал generic named bind <code>:id_1</code>. Для исполнявшего SQLite engine <code>dialect.paramstyle='qmark'</code>. Проверка не утверждает, что template неверно описывает логику; она опровергает только слово “exact executed SQL”.</p>
+
+<h3>13.15. DB-14: parameter validation</h3>
+<table>
+<thead><tr><th>Тест</th><th>Вход</th><th>Oracle</th><th>Факт</th></tr></thead>
+<tbody>
+<tr><td>TEST-DB14-SOURCE-SCHEMA</td><td><code>source_schema</code> задан, <code>source_table_name=None</code></td><td><code>IncorrectParameter</code> до SQL</td><td>Raw TypeError при конкатенации с None</td></tr>
+<tr><td>TEST-DB14-FIELD-COLLISION</td><td>Одинаковое имя merged-on и inserted-on</td><td>Conflict domain error</td><td>Raw AttributeError</td></tr>
+<tr><td>TEST-DB14-BOOL</td><td><code>merge.commit_all_steps='false'</code></td><td>Strict reject non-bool</td><td>Строка truthy; зафиксировано 5 commit events</td></tr>
+</tbody>
+</table>
+
+<h3>13.16. Положительные и модельные тесты</h3>
+<h4>TEST-POS-UNIT-SQLITE</h4>
+<p>Команда <code>pytest tests/test_all.py -k sqlite</code>. Collection: 270 total, 54 selected, 216 deselected. Результат 54 passed за 198.74 s. Ограничение: выбран только SQLite backend; зелёный результат не подтверждает dialect DDL других СУБД.</p>
+
+<h4>TEST-POS-COVERAGE</h4>
+<p>Тот же selected suite под coverage: 54 passed, statement coverage 83% (585/707), 104 <code>ResourceWarning</code>. Coverage показывает исполненные строки, но не полноту условий и СУБД.</p>
+
+<h4>TEST-POS-RANDOM-MODEL</h4>
+<p>60 deterministic seeds × 3 delete modes = 180 случаев. Для каждого случая генерировались до 8 integer ids, уникальные source/target key sets и values из <code>{None,'a','b','x'}</code>. Target имела реальный PK; для mark mode добавлялся Boolean NOT NULL. После merge таблица сравнивалась с независимо вычисленной Python reference model. Результат 180/180, первый failure отсутствует. Тест сознательно не включал generated columns, secondary UNIQUE, duplicate keys и auto-inferred MySQL types.</p>
+
+<h4>TEST-POS-MYSQL-MARIADB-CORE</h4>
+<p>На каждой СУБД target заранее создавалась как <code>id INTEGER PK, value VARCHAR(50)</code>; before=<code>[(1,'old'),(2,'remove')]</code>; source=<code>[(1,'new'),(3,'insert')]</code>; <code>delete_mode='delete'</code>. Oracle и read-back: <code>[(1,'new'),(3,'insert')]</code>. Обе СУБД прошли. Это изолирует дефекты auto-DDL от core set-based DML.</p>
+
+<h3>13.17. Performance tests: условия интерпретации</h3>
+<p>Замеры 1k/10k/50k выполнялись локально на SQLite in-memory без network latency и без конкурентной нагрузки. Wall time измерялся снаружи, reported time брался из результата DBMerge. Профили форматов на 20k использовали одинаковую логическую выборку, преобразованную в <code>list[dict]</code>, <code>dict[list]</code>, Pandas и Polars. Chunk test менял только размер staging batch: 1, 100, 10 000.</p>
+<p><strong>Ограничения:</strong> тест не моделирует fsync, WAL disk throughput, lock waits, triggers, foreign keys, RLS, network RTT и production query plans. Поэтому цифры используются для сравнения путей внутри одной машины, а не как SLA.</p>
+
+<h3>13.18. Security tests: детальные условия</h3>
+<h4>TEST-SEC-IDENTIFIER-SQLITE</h4>
+<p>Созданы две таблицы: sentinel и таблица с именем <code>evil; DROP TABLE sentinel; --</code> как единым quoted identifier. Вызван public <code>drop_table_if_exists(engine, evil_name)</code>. Oracle: удалить только evil table. Факт: список таблиц после вызова содержал sentinel и не содержал evil.</p>
+
+<h4>TEST-SEC-IDENTIFIER-POSTGRES</h4>
+<p>Тот же сценарий выполнен с двумя session temp tables PostgreSQL. После helper <code>to_regclass(sentinel)</code> вернул существующую таблицу, <code>to_regclass(evil)</code> вернул NULL. Пароли, schema и permanent tables не использовались.</p>
+
+<h4>TEST-SEC-STATIC</h4>
+<ul>
+<li>Bandit по Python source: 0 high, 0 medium, 2 low; low относятся к <code>except Exception: pass</code> в destructor cleanup.</li>
+<li><code>pip-audit</code> mandatory dependency set: 0 известных vulnerabilities.</li>
+<li><code>pip-audit</code> all extras: finding в <code>mariadb 1.1.14</code>; reachability через normal bound SQL не доказана.</li>
+<li>Ruff: 90 findings; security-значимый для assurance пункт - F811, перезапись теста.</li>
+<li>Zizmor: unpinned actions, broad workflow permissions и persisted checkout credentials; это CI hardening, не runtime exploit proof.</li>
+</ul>
+
+<h3>13.19. Проверки, намеренно не засчитанные как дефекты</h3>
+<table>
+<thead><tr><th>Контроль</th><th>Условия</th><th>Фактический результат</th></tr></thead>
+<tbody>
+<tr><td>Empty full snapshot</td><td>Пустой source + <code>delete_mode='delete'</code></td><td>Target очищена; соответствует документации</td></tr>
+<tr><td>Pandas NaT</td><td>Datetime missing value</td><td>SQL NULL</td></tr>
+<tr><td>Pandas pd.NA</td><td>Nullable string/int/bool</td><td>SQL NULL во всех трёх</td></tr>
+<tr><td>Extra field, columns disabled</td><td><code>can_create_columns=False</code></td><td>Extra field игнорируется, schema не меняется</td></tr>
+<tr><td>Identifier length</td><td>Legal near-limit names MySQL/PostgreSQL</td><td>Merge success; temp naming ограничено корректно</td></tr>
+<tr><td>MySQL core update</td><td>Existing typed target, changed/null-safe values</td><td>Нет error 1093; expected rows</td></tr>
+<tr><td>PostgreSQL normal constraint failure</td><td>CHECK violation в target</td><td>Primary error сохранён, connection закрыт</td></tr>
+</tbody>
+</table>
+
+<h3>13.20. Требования к повторному независимому прогону</h3>
+<ol>
+<li>Использовать чистые database/schema names и фиксировать server version, driver version, SQL mode/isolation level.</li>
+<li>Для каждого negative test сначала записать expected target, затем выполнять merge, затем read-back отдельным SELECT.</li>
+<li>Не считать exception достаточным: фиксировать, какие DDL/DML уже были committed.</li>
+<li>На SQL Server провести live-прогон non-identity PK, identity PK, composite PK и <code>#temp</code> lifecycle на одном pooled connection.</li>
+<li>На MySQL/MariaDB повторить при <code>NO_AUTO_VALUE_ON_ZERO</code> как control, но исправление не должно зависеть от session sql_mode.</li>
+<li>На PostgreSQL повторить sequence test для source ids 1/2 и 1000/1001, затем проверить default INSERT.</li>
+<li>Сохранять DDL из <code>SHOW CREATE TABLE</code>/<code>information_schema</code> вместе с read-back values.</li>
+<li>После исправлений запускать весь backend suite; denominator и skips публиковать отдельно.</li>
+</ol>
+
+-->
+<h2 class="pagebreak">13. Итог</h2>
+<p>Основная идея проекта - компактный set-based merge через staging - подтверждается happy-path тестами. Production-риск находится не в полном снимке и не в пошаговых commit, а в неразделённой модели типов и колонок между Python, target и staging, а также в отсутствии dialect-specific DDL.</p>
+<p><strong>Приоритет:</strong> generated semantics ключей, типы MySQL/MariaDB, SQL Server staging, затем UNIQUE-safe snapshot и строгая валидация входа. До этого auto-DDL и SQL Server нельзя считать production-ready.</p>
+<div class="footer-note">Отчёт основан на локальном коде, документации проекта, статье <a href="https://habr.com/ru/articles/985306/">Habr</a>, live negative tests и официальной документации СУБД. PostgreSQL objects были session-temporary; Docker containers удалялись после сценариев. Исходный код DBMerge не изменялся.</div>
+
+
+</body></html>
