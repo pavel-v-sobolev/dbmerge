@@ -35,9 +35,19 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
   
   > ⚠️ With `'delete'` or `'mark'`, **every** target row missing from the source is affected. If the source covers only part of the table (or is empty), restrict the scope with the `delete_condition` argument of `exec()` — otherwise an empty source with `delete_mode='delete'` wipes the entire table.
 - **`delete_mark_field`** *(str, optional)*: The column used to flag a record as deleted. Must be a **Boolean** or **Integer** column. A row missing from the source is set to `True`/`1`; inserted or resurrected (reappeared) rows are set to `False`/`0` (an active row is `False`/`0`, never `NULL`). If this column is present in the incoming `data`, the supplied value is used as-is.
+- **`delete_mark_values`** *(dict[str, Any] | None, optional)*: Extra columns to write when a row is marked as deleted, as `{column name: value}`. Requires `delete_mode='mark'`. Without it, a marked row keeps the values of the last load that still contained it; with it, you can also record something about the marking itself — for example `delete_mark_values={'load_id': 42}` writes `42` into the `load_id` column of every row that disappeared from the source. The columns must exist in the target table; `delete_mark_field`, `merged_on_field` and `inserted_on_field` are managed automatically and cannot be listed here.
 - **`merged_on_field`** *(str | None, optional)*: The name of a timestamp column. Automatically updated to the current datetime whenever a row is inserted, updated, or marked as deleted. This column is always managed automatically: if present in the incoming `data`, the supplied values are ignored.
 - **`inserted_on_field`** *(str | None, optional)*: The name of a timestamp column. Automatically set to the current datetime when a new row is initially inserted. It is ignored during updates or deletions. This column is always managed automatically: if present in the incoming `data`, the supplied values are ignored.
-- **`skip_update_fields`** *(list, optional)*: A list of column names to exclude from the `UPDATE` operation. These fields will only be written during the initial `INSERT`.
+- **`skip_update_fields`** *(list, optional)*: A list of column names to exclude from the `UPDATE` operation. These fields will only be written during the initial `INSERT`. Such a column is also never compared, so a difference in it alone does not update the row — a column that is never written cannot be a reason to update it.
+- **`skip_compare_fields`** *(list, optional)*: A list of column names that are written, but never compared. The row is updated only when some **other** column differs; then these columns are written together with the rest. A row whose only difference is in these columns is not updated at all, so `merged_on_field` is not bumped and the row does not look changed.
+
+  Use it for a column that gets a new value on every load — a load id, an import timestamp — which would otherwise make every row look modified:
+
+  ```python
+  skip_compare_fields=['load_id']   # written on update, but never causes one
+  ```
+
+  The difference from `skip_update_fields` is what happens when the row does change: skipped-update columns are still not written and keep their inserted value, skipped-compare columns are written.
 - **`key`** *(list | None, optional)*: A list of column names serving as the unique key to compare source and target tables. If omitted, the module attempts to use the target table's Primary Key. *Note: If the table does not exist yet, this parameter is required to create the Primary Key.*
 - **`data_types`** *(dict[str, types.TypeEngine] | None, optional)*: A dictionary mapping column names to SQLAlchemy data types (e.g., `{'Name': String(100)}`). Used when creating missing tables or columns. If omitted, data types are auto-detected from the source data.
 - **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name).

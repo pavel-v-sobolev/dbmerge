@@ -30,7 +30,9 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB. **Not 
 | `delete_mode` | `'no'` (default), `'delete'`, `'mark'`. |
 | `delete_mark_field` | Column flagged when a row is missing from the source. Must be a **dedicated** Boolean or Integer column. |
 | `merged_on_field` / `inserted_on_field` | Timestamp columns managed automatically; values supplied in `data` are ignored. |
-| `skip_update_fields` | Columns written on insert only, never on update. |
+| `delete_mark_values` | `{'col': value}` written on a row when it is marked deleted, in addition to the flag (e.g. a load id). Requires `delete_mode='mark'`. |
+| `skip_update_fields` | Columns written on insert only, never on update — and therefore never compared either. |
+| `skip_compare_fields` | Columns written but never compared: they do not cause an update on their own, but are written when the row is updated for another reason. For a column that changes on every load (a load id) and would otherwise make every row look modified. |
 | `data_types` | `{'col': SQLAlchemyType()}` used when creating tables/columns. |
 | `schema` / `temp_schema` | Target and staging schema. `schema` is **required** for MySQL/MariaDB (set it to the database name). |
 | `can_create_table` / `can_create_columns` / `can_create_schemas` | All default to `True`. Set to `False` in production against a migration-managed schema. |

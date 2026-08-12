@@ -131,9 +131,11 @@ class dbmerge:
                  data: list[dict[str,Any]] | dict[str,list] | PandasDataFrame | PolarsDataFrame | None = None,
                  delete_mode: Literal['no', 'delete', 'mark']='no',
                  delete_mark_field: str | None = None,
+                 delete_mark_values: dict[str,Any] | None = None,
                  merged_on_field: str | None = None,
                  inserted_on_field: str | None = None,
                  skip_update_fields: list | None = None,
+                 skip_compare_fields: list | None = None,
                  key: list | None = None,
                  data_types: dict[str,types.TypeEngine] | None = None,
                  schema: str | None = None, 
@@ -172,11 +174,21 @@ class dbmerge:
             delete_mark_field (str, optional): The column used to flag a record as deleted. Must be a Boolean or Integer column.
                 A row missing from the source is set to True/1; inserted or resurrected (reappeared) rows are set to False/0.
                 If this column is present in the incoming data, the supplied value is used as-is.
+            delete_mark_values (dict[str, Any] | None, optional): Extra columns to write when a row is marked as deleted,
+                as {column name: value}. Requires delete_mode='mark'. Without it, a marked row keeps the values of the
+                last load that still contained it.
             merged_on_field (str | None, optional): Timestamp column automatically updated to current datetime when a row is inserted, updated, or marked.
                 This column is always managed automatically: if present in the incoming data, the supplied values are ignored.
             inserted_on_field (str | None, optional): Timestamp column automatically set to current datetime when a new row is initially inserted.
                 This column is always managed automatically: if present in the incoming data, the supplied values are ignored.
-            skip_update_fields (list, optional): List of column names to exclude from the UPDATE operation.
+            skip_update_fields (list, optional): List of column names to exclude from the UPDATE operation: they are
+                written by the initial INSERT and never touched again. Such a column is also never compared, so a
+                difference in it alone does not update the row - a column that is never written can not be a reason
+                to update it.
+            skip_compare_fields (list, optional): List of column names that are written, but never compared. The row is
+                updated only when some other column differs; then these columns are written together with the rest.
+                Use it for a column that gets a new value on every load (a load id, an import timestamp) and 
+                would otherwise make every row look modified.
             key (list | None, optional): List of column names serving as the unique key to compare source and target tables. If omitted, uses the target table's Primary Key.
             data_types (dict[str, types.TypeEngine] | None, optional): Dictionary mapping column names to SQLAlchemy data types. Used when creating missing tables or columns.
             schema (str | None, optional): The database schema of the target table.
@@ -198,8 +210,10 @@ class dbmerge:
 
             self._validate_init_params(engine=engine, table_name=table_name, data=data,
                                        delete_mode=delete_mode, delete_mark_field=delete_mark_field,
+                                       delete_mark_values=delete_mark_values,
                                        merged_on_field=merged_on_field, inserted_on_field=inserted_on_field,
-                                       skip_update_fields=skip_update_fields, key=key, data_types=data_types,
+                                       skip_update_fields=skip_update_fields,
+                                       skip_compare_fields=skip_compare_fields, key=key, data_types=data_types,
                                        schema=schema, temp_schema=temp_schema,
                                        source_table_name=source_table_name, source_schema=source_schema,
                                        can_create_table=can_create_table, can_create_columns=can_create_columns,
@@ -263,7 +277,8 @@ class dbmerge:
             self.delete_sql = ''
             
             self.skip_update_fields = skip_update_fields if skip_update_fields is not None else []
-            
+            self.skip_compare_fields = skip_compare_fields if skip_compare_fields is not None else []
+
             self.conn = engine.connect()
 
             if self.schema is not None:
@@ -294,16 +309,21 @@ class dbmerge:
             self.delete_mode = delete_mode
 
             self.delete_mark_field = delete_mark_field
+            self.delete_mark_values = delete_mark_values if delete_mark_values is not None else {}
             self.merged_on_field = merged_on_field
             self.inserted_on_field = inserted_on_field
             
             self.special_fields = [f for f in [self.merged_on_field,self.inserted_on_field]
                                    if f is not None]
 
-            if self.delete_mode=='mark': 
+            if self.delete_mode=='mark':
                 if self.delete_mark_field is None:
                     raise IncorrectParameter(f"delete_mode='mark', but delete_mark_field is not set.")
-                
+            elif self.delete_mark_values:
+                # Nothing gets marked outside 'mark' mode, so the values would be silently ignored.
+                raise IncorrectParameter(f"delete_mark_values is set, but delete_mode is '{self.delete_mode}'. "
+                                         f"It only applies to rows marked as deleted (delete_mode='mark').")
+
 
             self.max_type_detection_rows = MAX_TYPE_DETECTION_ROWS
 
@@ -715,6 +735,18 @@ class dbmerge:
             raise IncorrectParameter(f'delete_mark_field "{self.delete_mark_field}" must be a Boolean or Integer '
                                      f'column, but its type is {col_type}.')
 
+        # Extra columns stamped on a marked row must exist, and must not collide with the columns
+        # the mark itself writes (otherwise one column would get two values in the same UPDATE).
+        managed = {f for f in (self.delete_mark_field, self.merged_on_field, self.inserted_on_field)
+                   if f is not None}
+        for col in self.delete_mark_values:
+            if col not in self.table.c:
+                raise IncorrectParameter(f'delete_mark_values column "{col}" does not exist in table '
+                                         f'"{self.table_full_name}".')
+            if col in managed:
+                raise IncorrectParameter(f'delete_mark_values column "{col}" is managed automatically '
+                                         f'and can not be set manually.')
+
 
     def _check_given_types(self):
 
@@ -841,7 +873,8 @@ class dbmerge:
                
 
     def _validate_init_params(self, engine, table_name, data, delete_mode, delete_mark_field,
-                              merged_on_field, inserted_on_field, skip_update_fields, key,
+                              delete_mark_values, merged_on_field, inserted_on_field,
+                              skip_update_fields, skip_compare_fields, key,
                               data_types, schema, temp_schema, source_table_name, source_schema,
                               can_create_table, can_create_columns, can_create_schemas):
         """Validate user-supplied arguments up front so that a wrong type raises a
@@ -869,7 +902,8 @@ class dbmerge:
                 raise IncorrectParameter(f'"{name}" must be a string or None, got {type(value).__name__}.')
 
         # list-of-strings-or-None parameters
-        for name, value in (('key', key), ('skip_update_fields', skip_update_fields)):
+        for name, value in (('key', key), ('skip_update_fields', skip_update_fields),
+                            ('skip_compare_fields', skip_compare_fields)):
             if value is None:
                 continue
             if not isinstance(value, list):
@@ -879,6 +913,15 @@ class dbmerge:
                 if not isinstance(item, str):
                     raise IncorrectParameter(f'"{name}" must contain only column name strings, '
                                              f'got element {item!r} of type {type(item).__name__}.')
+
+        if delete_mark_values is not None:
+            if not isinstance(delete_mark_values, dict):
+                raise IncorrectParameter(f'"delete_mark_values" must be a dict mapping column names to values '
+                                         f'or None, got {type(delete_mark_values).__name__}.')
+            for col in delete_mark_values:
+                if not isinstance(col, str):
+                    raise IncorrectParameter(f'"delete_mark_values" keys must be column name strings, '
+                                             f'got key {col!r}.')
 
         if data_types is not None:
             if not isinstance(data_types, dict):
@@ -1007,6 +1050,11 @@ class dbmerge:
             merged_on_field = self.table.c[self.merged_on_field]
             update_values[merged_on_field]=func.now()
 
+        # Caller-supplied columns written together with the mark (e.g. a load id), so that the
+        # marking itself can be recorded and not just the flag.
+        for col, value in self.delete_mark_values.items():
+            update_values[self.table.c[col]] = value
+
         # Skip rows that are already marked as deleted, so repeated merges do not
         # re-mark them (inflating deleted_row_count and overwriting merged_on_field).
         where_conditions = [not_(exists().where(update_where_clause)),
@@ -1046,8 +1094,13 @@ class dbmerge:
             join_conditions.append(self.table.c[c]==self.temp_table.c[c])
         on_clause = and_(*join_conditions)
 
+        # Columns listed in skip_compare_fields are still written (they stay in non_key_cols and in
+        # update_values below), but are left out of the comparison, so a difference in them alone
+        # does not make the row "changed" and does not get it updated.
         where_conditions = []
         for c in non_key_cols:
+            if c in self.skip_compare_fields:
+                continue
             col = self.table.c[c]
             temp_col = self.temp_table.c[c]
             where_conditions.append(col.is_distinct_from(temp_col))
@@ -1057,6 +1110,12 @@ class dbmerge:
         if self.delete_mark_field is not None and not self.delete_mark_from_data:
             mark_field = self.table.c[self.delete_mark_field]
             where_conditions.append(mark_field.is_distinct_from(self.delete_mark_active_value))
+
+        if len(where_conditions)==0:
+            # Every comparable column is skipped, so no row can ever qualify as changed.
+            self.updated_row_count = 0
+            self.update_time = 0
+            return
 
         where_clause = or_(*where_conditions)
 

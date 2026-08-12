@@ -756,6 +756,105 @@ def test_insert_condition(engine_name):
     assert rows[('B', '1')] == (31, threshold)
 
 
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_skip_compare_fields(engine_name):
+    # skip_compare_fields: a column that is written on update but never causes one. Here 'version'
+    # changes on every load; without the parameter every row would look modified and 'Merged On'
+    # would be bumped, making unchanged rows look fresh to downstream incremental consumers.
+    logger.debug(f'TEST SKIP_COMPARE_FIELDS {engine_name}')
+    engine = create_engine(engines[engine_name])
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100)}
+
+    def merge_row(qty, version):
+        data = [{'Shop': 'S', 'Product': 'A', 'Qty': qty, 'version': version}]
+        with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                     data_types=dt, key=k, merged_on_field='Merged On',
+                     skip_compare_fields=['version']) as merge:
+            merge.exec()
+            return merge.updated_row_count
+
+    def get_row():
+        tbl = _reflect_facts(engine)
+        with engine.connect() as conn:
+            return conn.execute(select(tbl.c['Qty'], tbl.c['version'], tbl.c['Merged On'])
+                                .where(tbl.c['Shop'] == 'S')).one()._mapping
+
+    merge_row(qty=1, version=5)
+    seeded = get_row()
+    assert seeded['version'] == 5, 'insert writes the skipped column as usual'
+
+    # same data, new version only -> not a change: row untouched, 'Merged On' not bumped
+    assert merge_row(qty=1, version=6) == 0, 'a difference only in skip_compare_fields must not update'
+    quiet = get_row()
+    assert quiet['version'] == 5, 'the skipped column is not written when nothing else changed'
+    assert quiet['Merged On'] == seeded['Merged On'], 'merged_on must not be bumped by a no-op load'
+
+    # real change -> row updated and the skipped column is written along with it
+    time.sleep(1)   # some engines keep merged_on at second resolution
+    assert merge_row(qty=42, version=7) == 1, 'a real difference must still update'
+    changed = get_row()
+    assert changed['Qty'] == 42
+    assert changed['version'] == 7, 'the skipped column is written when the row is updated'
+    assert changed['Merged On'] > seeded['Merged On'], 'merged_on is bumped by a real change'
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_delete_mark_values(engine_name):
+    # delete_mark_values: extra columns stamped on a row when it is marked as deleted, so a row
+    # leaving the source carries the same bookkeeping ('version') as a row that was updated.
+    logger.debug(f'TEST DELETE_MARK_VALUES {engine_name}')
+    engine = create_engine(engines[engine_name])
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100)}
+
+    seed = [{'Shop': 'S', 'Product': 'A', 'Qty': 1, 'version': 5},
+            {'Shop': 'S', 'Product': 'B', 'Qty': 2, 'version': 5}]
+    with dbmerge(engine=engine, data=seed, table_name='Facts', schema='target', temp_schema='tmp',
+                 data_types=dt, key=k, merged_on_field='Merged On',
+                 delete_mark_field='Deleted') as merge:
+        merge.exec()
+
+    tbl = _reflect_facts(engine)
+    with engine.connect() as conn:
+        seeded_merged_on = conn.execute(select(tbl.c['Merged On'])
+                                        .where(tbl.c['Product'] == 'B')).scalar()
+
+    # product B is gone from the source -> marked, and stamped with the new version
+    time.sleep(1)   # some engines keep merged_on at second resolution
+    with dbmerge(engine=engine, data=[{'Shop': 'S', 'Product': 'A', 'Qty': 1, 'version': 9}],
+                 table_name='Facts', schema='target', temp_schema='tmp',
+                 data_types=dt, key=k, merged_on_field='Merged On',
+                 delete_mode='mark', delete_mark_field='Deleted',
+                 delete_mark_values={'version': 9}) as merge:
+        merge.exec()
+
+    tbl = _reflect_facts(engine)
+    with engine.connect() as conn:
+        rows = {r.Product: r._mapping for r in conn.execute(
+            select(tbl.c['Product'], tbl.c['Deleted'], tbl.c['version'], tbl.c['Merged On'])).all()}
+
+    assert rows['B']['Deleted'], 'row missing from the source must be marked'
+    assert rows['B']['version'] == 9, 'delete_mark_values must be stamped on the marked row'
+    assert rows['B']['Merged On'] > seeded_merged_on, 'marking bumps merged_on'
+
+    # delete_mark_values outside 'mark' mode is a mistake, not a silent no-op
+    with pytest.raises(Exception):
+        with dbmerge(engine=engine, data=seed, table_name='Facts', schema='target', temp_schema='tmp',
+                     data_types=dt, key=k, delete_mark_field='Deleted',
+                     delete_mark_values={'version': 1}) as merge:
+            merge.exec()
+
+    # unknown column is a mistake too
+    with pytest.raises(Exception):
+        with dbmerge(engine=engine, data=seed, table_name='Facts', schema='target', temp_schema='tmp',
+                     data_types=dt, key=k, delete_mode='mark', delete_mark_field='Deleted',
+                     delete_mark_values={'NoSuchColumn': 1}) as merge:
+            merge.exec()
+
+
 if __name__ == '__main__':
 
     test_date_range_with_delete_mark('cockroachdb','list of dict')
