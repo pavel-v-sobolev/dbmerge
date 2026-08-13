@@ -690,15 +690,15 @@ class dbmerge:
 
     def _create_schema_if_not_exists(self,schema_name):
         if self.conn.dialect.name not in ['sqlite']:
-            if not self.conn.dialect.has_schema(self.conn, schema_name):
+            schema_exists = self.conn.dialect.has_schema(self.conn, schema_name)
+            # The check just opened a transaction on the connection. It is closed here whether or
+            # not anything gets created, so that the DDL below - and any DDL later in __init__ -
+            # stays alone in its own transaction. CockroachDB refuses a multi-statement transaction
+            # that contains a schema change under a weak isolation level.
+            self.conn.commit()
+            if not schema_exists:
                 if self.can_create_schemas:
                     logger.info(f"""Creating schema "{schema_name}".""")
-                    # A schema change is committed on its own, whatever commit_all_steps says: that
-                    # argument is about the merge data, not the schema. It also has to be alone in
-                    # its transaction - CockroachDB refuses a multi-statement transaction that
-                    # contains a schema change under a weak isolation level - so the commit below
-                    # closes the transaction the has_schema() check just opened.
-                    self.conn.commit()
                     self.conn.execute(schema.CreateSchema(schema_name))
                     self.conn.commit()
                 else:
@@ -1362,9 +1362,12 @@ class dbmerge:
         # database a second connection is a different database, so the table has to be made here.
         # Created on the merge connection rather than through the engine: with an in-memory SQLite
         # database a second connection is a different database, so the table has to be made here.
+        # A schema change is committed on its own, whatever commit_all_steps says, and is kept
+        # alone in its transaction - the commit before matters as much as the one after.
         # checkfirst=False on purpose: it would put an existence query in front of the CREATE, and
-        # the two together form a multi-statement transaction that CockroachDB rejects under a weak
-        # isolation level. The table is known to be missing - that is why we are here.
+        # the two together form the multi-statement transaction that CockroachDB rejects under a
+        # weak isolation level. The table is known to be missing - that is why we are here.
+        self.conn.commit()
         self.table.create(self.conn, checkfirst=False)
         self.conn.commit()
 
@@ -1389,6 +1392,9 @@ class dbmerge:
         # with the key values of the source, never with generated ones.
         cols = [Column(c.name, c.type, primary_key = c.name in self.key, autoincrement=False)
                 for c in self.table.c]
+
+        # As everywhere else, the schema change is kept alone in its own transaction.
+        self.conn.commit()
 
         if self.engine.dialect.name =='postgresql':
             self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
@@ -1484,8 +1490,12 @@ class dbmerge:
                 self.conn.commit()
                 self.temp_table.drop(self.conn, checkfirst=False)
                 self.conn.commit()
-            else:
-                self.temp_table.drop(self.engine, checkfirst=True)
+            elif inspect(self.engine).has_table(self.temp_table.name, self.temp_table.schema):
+                # The connection is gone, so this runs on another one from the pool. A TEMPORARY
+                # table would not be visible there at all - only a regular staging table can still
+                # be dropped. Existence is checked separately, so the DROP stays alone in its
+                # transaction.
+                self.temp_table.drop(self.engine, checkfirst=False)
             self.temp_table = None
 
 
@@ -1511,7 +1521,10 @@ def drop_table_if_exists(engine,table_name,schema=None):
     if table_exists:
         table = Table(table_name, metadata, autoload_with=engine, schema=schema)
         logger.debug(f'Deleting table "{table_full_name}"')
-        table.drop(engine, checkfirst=True)
+        # checkfirst=False: has_table above has already answered that question, and asking again
+        # would put a second statement in the transaction that carries the DROP - which CockroachDB
+        # rejects under a weak isolation level.
+        table.drop(engine, checkfirst=False)
 
   
 def format_ms(seconds):
