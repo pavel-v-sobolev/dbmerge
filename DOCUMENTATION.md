@@ -34,8 +34,8 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
   - `'mark'`: Soft delete rows by setting a flag in `delete_mark_field`.
   
   > ⚠️ With `'delete'` or `'mark'`, **every** target row missing from the source is affected. If the source covers only part of the table (or is empty), restrict the scope with the `delete_condition` argument of `exec()` — otherwise an empty source with `delete_mode='delete'` wipes the entire table.
-- **`delete_mark_field`** *(str, optional)*: The column used to flag a record as deleted. Must be a **Boolean** or **Integer** column. A row missing from the source is set to `True`/`1`; inserted or resurrected (reappeared) rows are set to `False`/`0` (an active row is `False`/`0`, never `NULL`). If this column is present in the incoming `data`, the supplied value is used as-is.
-- **`delete_mark_values`** *(dict[str, Any] | None, optional)*: Extra columns to write when a row is marked as deleted, as `{column name: value}`. Requires `delete_mode='mark'`. Without it, a marked row keeps the values of the last load that still contained it; with it, you can also record something about the marking itself — for example `delete_mark_values={'load_id': 42}` writes `42` into the `load_id` column of every row that disappeared from the source. The columns must exist in the target table; `delete_mark_field`, `merged_on_field` and `inserted_on_field` are managed automatically and cannot be listed here.
+- **`delete_mark_field`** *(str, optional)*: The column used to flag a record as deleted. Must be a **Boolean** or **Integer** column. A row missing from the source is set to `True`/`1`; inserted or resurrected (reappeared) rows are set to `False`/`0` (an active row is `False`/`0`, never `NULL`). If this column is present in the incoming `data`, the supplied value is used as-is. It must be a column of its own: it cannot be part of `key`, nor the same column as `merged_on_field` or `inserted_on_field`. On MySQL/MariaDB a `BOOLEAN` column is really `TINYINT(1)` and is read back as an integer, so the flag there is `0`/`1` rather than `False`/`True`.
+- **`delete_mark_values`** *(dict[str, Any] | None, optional)*: Extra columns to write when a row is marked as deleted, as `{column name: value}`. Requires `delete_mode='mark'`. Without it, a marked row keeps the values of the last load that still contained it; with it, you can also record something about the marking itself — for example `delete_mark_values={'load_id': 42}` writes `42` into the `load_id` column of every row that disappeared from the source. The columns must exist in the target table. They cannot be part of `key` (that would rewrite the identity of the row being marked), and `delete_mark_field`, `merged_on_field` and `inserted_on_field` are managed automatically and cannot be listed here either.
 - **`merged_on_field`** *(str | None, optional)*: The name of a timestamp column. Automatically updated to the current datetime whenever a row is inserted, updated, or marked as deleted. This column is always managed automatically: if present in the incoming `data`, the supplied values are ignored.
 - **`inserted_on_field`** *(str | None, optional)*: The name of a timestamp column. Automatically set to the current datetime when a new row is initially inserted. It is ignored during updates or deletions. This column is always managed automatically: if present in the incoming `data`, the supplied values are ignored.
 - **`skip_update_fields`** *(list, optional)*: A list of column names to exclude from the `UPDATE` operation. These fields will only be written during the initial `INSERT`. Such a column is also never compared, so a difference in it alone does not update the row — a column that is never written cannot be a reason to update it.
@@ -49,7 +49,13 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 
   The difference from `skip_update_fields` is what happens when the row does change: skipped-update columns are still not written and keep their inserted value, skipped-compare columns are written.
 - **`key`** *(list | None, optional)*: A list of column names serving as the unique key to compare source and target tables. If omitted, the module attempts to use the target table's Primary Key. *Note: If the table does not exist yet, this parameter is required to create the Primary Key.*
+
+  The key is always supplied by your data, so a key column DBMerge creates is never a generated one: no `AUTO_INCREMENT`, `SERIAL` or `IDENTITY`. If you want the database to generate surrogate ids, add that column to your schema yourself — it is not part of the merge key.
 - **`data_types`** *(dict[str, types.TypeEngine] | None, optional)*: A dictionary mapping column names to SQLAlchemy data types (e.g., `{'Name': String(100)}`). Used when creating missing tables or columns. If omitted, data types are auto-detected from the source data.
+
+  A type given here is authoritative: it is used exactly as written and is never substituted, even when the engine then refuses to create a column from it. Types that were auto-detected instead are adapted to the target engine where the generic type would not work — on MySQL/MariaDB a string of unknown length becomes `LONGTEXT`, and on MySQL/MariaDB/MS SQL a number of unknown precision becomes a double and a datetime keeps its microseconds.
+
+  On MySQL/MariaDB a **string column of the merge key** must be given an explicit length here: InnoDB indexes at most 3072 bytes per key, shared by all of its columns, so no default length is safe.
 - **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name).
 - **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created.
 - **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`.
@@ -57,6 +63,20 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 - **`can_create_table`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target table if it does not exist.
 - **`can_create_columns`** *(bool, optional)*: Defaults to `True`. Allows the module to append missing columns to the target table.
 - **`can_create_schemas`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target schema in the database if it does not exist.
+
+#### Exceptions
+
+All exceptions subclass `RuntimeError`. They are **not** re-exported from the package root — import them from `dbmerge.dbmerge`:
+
+```python
+from dbmerge.dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError, TableNotFoundError, TempTableAlreadyExists
+```
+
+- **`IncorrectParameter`**: arguments are wrong, missing, or conflict with each other (two roles on one column, `delete_mark_values` pointing at a key or managed column, a non-boolean `commit_all_steps`, `source_schema` without `source_table_name`).
+- **`NoKeyError`**: no usable merge key could be determined, or a key column is also used for another role.
+- **`IncorrectDataError`**: the input data has an unsupported shape, or a column type could not be resolved.
+- **`TableNotFoundError`**: the target table does not exist and `can_create_table=False`.
+- **`TempTableAlreadyExists`**: a staging table with the generated name already exists.
 
 #### Instance Attributes (Available after initialization)
 - **`table`**: The SQLAlchemy `Table` object representing your target table.
@@ -124,7 +144,9 @@ with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
 - **`source_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used to filter the `SELECT` statement when loading data from a `source_table_name`.
 - **`update_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression added to the `WHERE` clause of the update phase. A target row is updated only when it differs from the source **and** satisfies this condition. Build it on `merge.table` (target) and `merge.temp_table` (staging).
 - **`insert_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression added to the `WHERE` clause of the insert phase. A source row missing from the target is inserted only when it also satisfies this condition. Build it on `merge.temp_table` (the row being inserted); to inspect other target rows use a correlated `EXISTS` over `merge.table.alias()`.
-- **`commit_all_steps`** *(bool, optional)*: Defaults to `True`. If `True`, every step (temp insert, target insert, update, delete) is committed immediately. If `False`, a single commit is issued after all steps complete successfully.
+- **`commit_all_steps`** *(bool, optional)*: Defaults to `True`. If `True`, every step (temp insert, target insert, update, delete) is committed immediately. If `False`, a single commit is issued after all steps complete successfully. Must be a real boolean — a string such as `'false'` is rejected rather than silently treated as truthy.
+
+  It applies to the **data only**. Schema changes — creating the target table, adding columns, creating and dropping the staging table — are always committed on their own and are never part of the merge transaction, so `commit_all_steps=False` does not make them roll back with the data.
 - **`chunk_size`** *(int, optional)*: Defaults to `10000`. Defines the batch size when inserting raw data (from lists of dicts, dicts of lists or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Must be a positive integer.
 
 #### Execution Results & Statistics
@@ -147,6 +169,47 @@ The executed SQL statements are exposed only on the `dbmerge` instance (not in `
 - **`insert_sql`**: The exact SQL `INSERT` statement executed against the database.
 - **`update_sql`**: The exact SQL `UPDATE` statement executed against the database.
 - **`delete_sql`**: The exact SQL `DELETE` (or mark) statement executed against the database.
+
+---
+
+## Audit Timestamps
+
+`merged_on_field` and `inserted_on_field` are filled by the **database**, not by the Python process: DBMerge emits the engine's own "current time" function as part of the `INSERT` and `UPDATE` statements. Nothing is normalized on the way — the timezone and the resolution of the stored value are whatever that engine's clock gives.
+
+This is deliberate. The timestamp then reflects the moment the database applied the change, is immune to clock skew between application hosts, and stays consistent with any other column your schema fills with a database default. The cost is that the exact meaning of the value is engine-specific:
+
+When DBMerge creates the audit column itself, it creates a **naive** timestamp (`DATETIME`, or `timestamp without time zone` on PostgreSQL), so the offset the clock function carried is dropped at write time. The table below describes that default.
+
+You can change it by giving the column a timezone-aware type instead — either pre-create it in your schema, or pass `data_types={'Merged On': DateTime(timezone=True)}`. On PostgreSQL and CockroachDB the column then becomes `timestamptz`, `now()` supplies a real offset, and the instant is preserved:
+
+```python
+from sqlalchemy import DateTime
+
+with dbmerge(engine=engine, data=data, table_name="Facts", key=['id'],
+             merged_on_field='Merged On',
+             data_types={'Merged On': DateTime(timezone=True)}) as merge:
+    result = merge.exec()
+# stored: 2026-08-12 22:26:34.416479+03:00
+```
+
+This does not help everywhere: MySQL/MariaDB have no type that stores an offset, and on MS SQL `CURRENT_TIMESTAMP` itself returns a value without one, so a `datetimeoffset` column would merely label server-local time as UTC.
+
+| Engine | Emitted SQL | Timezone of the stored value | Resolution |
+|---|---|---|---|
+| PostgreSQL | `now()` | session `TimeZone` — `now()` returns a `timestamptz`, which the naive column converts to local time and strips | microseconds |
+| CockroachDB | `now()` | session `TimeZone`, which defaults to UTC | microseconds |
+| MySQL / MariaDB | `NOW(6)` | server/session `time_zone` | microseconds |
+| SQLite | `CURRENT_TIMESTAMP` | **always UTC** | whole seconds |
+| MS SQL Server | `CURRENT_TIMESTAMP` | server timezone | ~3.3 ms (it returns a `datetime`) |
+
+Two consequences worth planning around:
+
+- **With the default naive column, the same code stores a different wall-clock value on different engines.** SQLite records UTC; every other engine records its server's local time, and nothing in the column says which. Moving a pipeline between engines shifts these columns by the server's UTC offset, silently. On PostgreSQL/CockroachDB use a `timezone=True` column as shown above; elsewhere, run the servers in UTC.
+- **Resolution limits incremental reads.** A consumer polling `WHERE merged_on > :watermark` cannot distinguish rows written within the same tick — one second on SQLite, about 3 ms on MS SQL. Either accept re-reading the boundary tick (make the consumer idempotent) or advance the watermark by row key as well as by timestamp.
+
+On PostgreSQL and CockroachDB, `now()` returns the *transaction* start time. With the default `commit_all_steps=True` each phase is its own transaction, so rows touched by the update phase and rows added by the insert phase get slightly different timestamps; with `commit_all_steps=False` the whole merge shares one.
+
+If you need a single timestamp with guaranteed semantics across every engine, do not use these parameters — pass your own column in `data` with a value you computed (e.g. `datetime.now(timezone.utc)`), and it will be stored as an ordinary field.
 
 ---
 
@@ -217,6 +280,8 @@ Automatic DDL is a convenience for development and ad-hoc loads. For production,
 
 `exec()` defaults to `commit_all_steps=True`, which commits after **each** phase: staging load, update, insert, delete/mark. This keeps transactions, locks and WAL/undo small on large datasets, and it is a deliberate trade-off.
 
+It covers the data and nothing else. Every schema change is committed as it happens, whichever value you pass: the target table, any column added to it, and the staging table are already permanent by the time the first row is written. `commit_all_steps=False` therefore makes the *rows* all-or-nothing, not the schema.
+
 The cost is that a failure leaves everything committed before it in place. Because the order is update → insert → delete:
 
 `exec()` rolls back only the phase that failed; it cannot undo earlier commits, and there is no compensating logic. Treat a raised exception as "the target is in an unknown intermediate state", then re-run the full merge once the cause is fixed — repeating the same complete snapshot converges to the correct result.
@@ -235,5 +300,5 @@ Any failure then rolls the whole merge back. The cost is one large transaction h
 1. The key columns have a primary key or unique index in the target table.
 2. `delete_mode` matches whether your source is a complete snapshot; if it is partial, `delete_condition` is set.
 3. `data_types` is explicit for every decimal, float, datetime and string column — or the schema is pre-created with `can_create_table=False` and `can_create_columns=False`.
-4. `commit_all_steps` is chosen deliberately for the size of the dataset.
+4. `commit_all_steps` is chosen deliberately for the size of the dataset — remembering that it never covers schema changes.
 5. The merge is safe to re-run, so a partial failure can be resolved by repeating it.

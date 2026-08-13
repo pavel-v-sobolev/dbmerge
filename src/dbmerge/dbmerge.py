@@ -21,9 +21,9 @@ import logging
 from datetime import datetime, date
 from dataclasses import dataclass
 
-from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists, literal
+from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists, literal, literal_column
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
-from sqlalchemy import String, Integer, BigInteger, Numeric, Boolean, DateTime, Date, Time, JSON, Uuid, LargeBinary
+from sqlalchemy import String, Text, Integer, BigInteger, Numeric, Double, Boolean, DateTime, Date, Time, JSON, Uuid, LargeBinary
 from sqlalchemy import types, dialects, func, text, schema
 
 POLARS_TO_SQLALCHEMY_TYPE_MAP = {
@@ -72,6 +72,17 @@ def _is_polars_dataframe(data) -> bool:
     pl = sys.modules.get('polars')
     return pl is not None and isinstance(data, pl.DataFrame)
 
+def _is_string_without_length(field_type) -> bool:
+    # Text and its dialect variants (TEXT, LONGTEXT, ...) are lengthless by nature rather than by
+    # omission, so they are not treated as a string whose length is still unknown.
+    return isinstance(field_type, String) and not isinstance(field_type, Text) \
+           and field_type.length is None
+
+def _is_numeric_without_precision(field_type) -> bool:
+    # Integer, BigInteger and Boolean are not Numeric subclasses, so only the decimal/float
+    # family is matched here.
+    return isinstance(field_type, Numeric) and field_type.precision is None
+
 
 logger = logging.getLogger('dbmerge')
 
@@ -110,6 +121,17 @@ MAX_TEMP_TABLE_NAME_LEN = 58
 # Dialects that require JSONB (not plain JSON) so values can be compared with IS DISTINCT FROM.
 # CockroachDB speaks the postgres wire protocol and natively supports JSONB.
 JSONB_DIALECTS = ('postgresql', 'cockroachdb')
+
+# Dialects that need generic types adapted before a column can be created from them.
+MYSQL_DIALECTS = ('mysql', 'mariadb')
+
+# Dialects that resolve a NUMERIC with no precision to a whole-number decimal:
+# DECIMAL(10,0) on MySQL/MariaDB and NUMERIC(18,0) on MS SQL. Both round every value.
+ROUNDING_NUMERIC_DIALECTS = ('mysql', 'mariadb', 'mssql')
+
+# InnoDB indexes a key of at most this many bytes, shared by all columns of the key.
+# With utf8mb4 a character takes up to 4 bytes, so a single-column key fits VARCHAR(768).
+MYSQL_MAX_KEY_BYTES = 3072
 
 @dataclass
 class mergeResult:
@@ -174,9 +196,12 @@ class dbmerge:
             delete_mark_field (str, optional): The column used to flag a record as deleted. Must be a Boolean or Integer column.
                 A row missing from the source is set to True/1; inserted or resurrected (reappeared) rows are set to False/0.
                 If this column is present in the incoming data, the supplied value is used as-is.
+                It must be a column of its own: it can not be part of "key", nor the same column as
+                merged_on_field or inserted_on_field.
             delete_mark_values (dict[str, Any] | None, optional): Extra columns to write when a row is marked as deleted,
                 as {column name: value}. Requires delete_mode='mark'. Without it, a marked row keeps the values of the
-                last load that still contained it.
+                last load that still contained it. The columns must exist in the target table, can not be part of
+                "key", and can not be the automatically managed delete_mark_field/merged_on_field/inserted_on_field.
             merged_on_field (str | None, optional): Timestamp column automatically updated to current datetime when a row is inserted, updated, or marked.
                 This column is always managed automatically: if present in the incoming data, the supplied values are ignored.
             inserted_on_field (str | None, optional): Timestamp column automatically set to current datetime when a new row is initially inserted.
@@ -191,6 +216,12 @@ class dbmerge:
                 would otherwise make every row look modified.
             key (list | None, optional): List of column names serving as the unique key to compare source and target tables. If omitted, uses the target table's Primary Key.
             data_types (dict[str, types.TypeEngine] | None, optional): Dictionary mapping column names to SQLAlchemy data types. Used when creating missing tables or columns.
+                A type given here is authoritative: it is used as written and never substituted, even if the engine then
+                refuses to create a column from it. Auto-detected types are adapted to the target engine instead, where
+                the generic type would not work (on MySQL/MariaDB a string of unknown length becomes LONGTEXT; on
+                MySQL/MariaDB/MS SQL a number of unknown precision becomes a double and a datetime keeps microseconds).
+                On MySQL/MariaDB a string column of the merge key must be given an explicit length here, because InnoDB
+                indexes at most 3072 bytes per key, shared by all of its columns.
             schema (str | None, optional): The database schema of the target table.
             temp_schema (str | None, optional): The database schema where the temporary staging table will be created.
             source_table_name (str | None, optional): If provided, data will be sourced directly from another existing database table or view. Mutually exclusive with the "data" argument (passing both raises IncorrectParameter).
@@ -200,8 +231,14 @@ class dbmerge:
             can_create_schemas (bool, optional): Allows the module to automatically create target and temp schema if they don't exist (default is True).
 
         Raises:
-            IncorrectParameter: Raised when arguments are not correct or missing.
+            IncorrectParameter: Raised when arguments are not correct, missing, or conflict with each other.
+            NoKeyError: Raised when no usable merge key can be determined, or when a key column is also used for another role.
+            IncorrectDataError: Raised when the input data has an unsupported shape or a type that can not be resolved.
+            TableNotFoundError: Raised when the target table does not exist and can_create_table=False.
             TempTableAlreadyExists: Raised if a temporary table with the generated name already exists (a very unlikely case, since the name includes a random unique id).
+
+        All of these subclass RuntimeError. They live in dbmerge.dbmerge and are not re-exported from
+        the package root, so import them as: from dbmerge.dbmerge import IncorrectParameter
         """
         
 
@@ -440,6 +477,7 @@ class dbmerge:
                     self._check_given_types()    
                     if self.type_of_data in ['list of dict','dict of list','pandas','polars']: #data types from source table are already known
                         self._detect_missing_data_types()
+                    self._adapt_types_to_dialect()
                     self._create_table()
                 else:
                     raise TableNotFoundError(f"Table not found {self.table_full_name} and can_create_table=False")
@@ -449,6 +487,7 @@ class dbmerge:
                         self._check_given_types()
                         if self.type_of_data in ['list of dict','dict of list','pandas','polars']:
                             self._detect_missing_data_types()
+                        self._adapt_types_to_dialect()
                         self._create_new_fields()
                     else:
                         self._remove_new_fields()
@@ -510,6 +549,9 @@ class dbmerge:
                     merge.exec(insert_condition=guard)
             commit_all_steps (bool, optional): If set to True (default), then every step (temp insert, target insert, update, delete)
                 is committed immediately. If False, a single commit is issued after all steps complete successfully.
+                Must be a real boolean: a string such as 'false' is rejected instead of being treated as truthy.
+                It applies to the data only - schema changes (creating the target table, adding columns, creating and
+                dropping the staging table) are always committed on their own and never roll back with the data.
             chunk_size (int, optional): Defines the batch size when inserting raw data (from lists of dicts, dicts of lists
                 or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Defaults to 10000.
 
@@ -522,6 +564,11 @@ class dbmerge:
 
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
             raise IncorrectParameter(f'chunk_size must be a positive integer, got {chunk_size!r}')
+
+        # Anything non-empty passed here would be truthy, so commit_all_steps='false' would turn
+        # step commits on - the opposite of what such a call means.
+        if not isinstance(commit_all_steps, bool):
+            raise IncorrectParameter(f'commit_all_steps must be True or False, got {commit_all_steps!r}.')
 
         if delete_condition is not None:
             if not isinstance(delete_condition,ColumnElement):
@@ -646,6 +693,12 @@ class dbmerge:
             if not self.conn.dialect.has_schema(self.conn, schema_name):
                 if self.can_create_schemas:
                     logger.info(f"""Creating schema "{schema_name}".""")
+                    # A schema change is committed on its own, whatever commit_all_steps says: that
+                    # argument is about the merge data, not the schema. It also has to be alone in
+                    # its transaction - CockroachDB refuses a multi-statement transaction that
+                    # contains a schema change under a weak isolation level - so the commit below
+                    # closes the transaction the has_schema() check just opened.
+                    self.conn.commit()
                     self.conn.execute(schema.CreateSchema(schema_name))
                     self.conn.commit()
                 else:
@@ -697,8 +750,8 @@ class dbmerge:
 
         for f in self.data_fields:
             if f in existing_fields:
-                self.data_fields[f]=existing_fields[f]
                 self._check_type_is_supported(existing_fields[f])
+                self.data_fields[f]=existing_fields[f]
             else:
                 self.new_fields[f]=self.data_fields[f]
 
@@ -746,6 +799,11 @@ class dbmerge:
             if col in managed:
                 raise IncorrectParameter(f'delete_mark_values column "{col}" is managed automatically '
                                          f'and can not be set manually.')
+            if col in self.key:
+                # Stamping a key column would rewrite the identity of every row being marked,
+                # silently when the new key value happens to be free.
+                raise IncorrectParameter(f'delete_mark_values column "{col}" is part of the merge key '
+                                         f'and can not be overwritten: it identifies the row being marked.')
 
 
     def _check_given_types(self):
@@ -754,9 +812,11 @@ class dbmerge:
             if f in self.given_data_types:
                 given_type = self.given_data_types[f]
                 if isinstance(given_type, types.TypeEngine):
-                    self.new_fields[f]=given_type
-                    self.data_fields[f]=given_type
                     self._check_type_is_supported(given_type)
+                    # An automatically managed column (the audit timestamps, the auto-managed delete
+                    # flag) is created from this type, but must not become a data field: its value
+                    # comes from the merge itself, not from the source row.
+                    self._set_new_field_type(f, given_type)
                 else:
                     raise IncorrectDataError(f'Incorrect type {given_type} given for field {f}. '+\
                                               'Should be sqlalchemy data type')
@@ -835,6 +895,86 @@ class dbmerge:
                 raise IncorrectDataError(f'Could not detect data type for column {f}')
 
 
+    def _adapt_types_to_dialect(self):
+        # A type detected from the data or mapped from a dataframe is generic, and not every engine
+        # can create a column from it as is: the DDL may fail to compile, or the engine may resolve
+        # the generic type to something that silently changes the values. Here the types of the
+        # fields we are about to create are adjusted to what the target engine actually supports.
+        # Only new fields are touched - a column that already exists in the table keeps the type
+        # the table gives it.
+        dialect_name = self.engine.dialect.name
+
+        for f in self.new_fields:
+            # A type listed in data_types is the caller's own decision about how the column must be
+            # stored, so it is never substituted here. If the engine can not create a column from
+            # it, that is reported by the engine rather than silently worked around.
+            if f in self.given_data_types:
+                continue
+
+            field_type = self.new_fields[f]
+
+            # MySQL/MariaDB can not create a VARCHAR without a length, while on the other engines
+            # String() already means "text of unlimited length". LONGTEXT is that same unlimited
+            # text, so the column is switched to it instead of inventing a VARCHAR size: any size
+            # would be a limit the other engines do not have, and a longer value arriving on a
+            # later load fails on an already created table.
+            # A key column can not be switched, because MySQL/MariaDB refuse to index a TEXT column
+            # without a prefix length. No default size is safe there either, since InnoDB shares
+            # MYSQL_MAX_KEY_BYTES between all columns of the key, so the caller has to state it.
+            if dialect_name in MYSQL_DIALECTS and _is_string_without_length(field_type):
+                if f in self.key:
+                    raise IncorrectParameter(
+                        f'Column "{f}" is part of the merge key, so "{dialect_name}" needs an '
+                        f'explicit length for it: data_types={{"{f}": String(255)}}. '
+                        f'InnoDB indexes at most {MYSQL_MAX_KEY_BYTES} bytes per key, shared by all '
+                        f'{len(self.key)} column(s) of this key, and utf8mb4 takes up to 4 bytes per character.')
+
+                logger.info(f'Field "{f}" - string of unknown length, '
+                            f'creating it as LONGTEXT on "{dialect_name}"')
+                self._set_new_field_type(f, dialects.mysql.LONGTEXT())
+
+            # A NUMERIC with no precision is rounded to a whole number by these engines, so 1.75
+            # would be stored as 2. A float carries no precision or scale to declare, and a double
+            # is the type the value already has in Python, so it is used instead of inventing one.
+            elif dialect_name in ROUNDING_NUMERIC_DIALECTS and _is_numeric_without_precision(field_type):
+                logger.info(f'Field "{f}" - number of unknown precision, '
+                            f'creating it as a double on "{dialect_name}" to keep the fraction')
+                self._set_new_field_type(f, Double())
+
+            # MySQL/MariaDB default DATETIME to whole seconds and drop microseconds without a
+            # warning. The fractional precision has to be declared explicitly to keep them.
+            elif dialect_name in MYSQL_DIALECTS and isinstance(field_type, DateTime):
+                logger.info(f'Field "{f}" - datetime, '
+                            f'creating it as DATETIME(6) on "{dialect_name}" to keep microseconds')
+                self._set_new_field_type(f, dialects.mysql.DATETIME(fsp=6))
+
+            # MS SQL DATETIME rounds to about 3 ms, while DATETIME2 keeps the full fraction.
+            # A timezone-aware value already compiles to DATETIMEOFFSET, which keeps both the
+            # offset and the fraction, so only the naive one is replaced here.
+            elif dialect_name == 'mssql' and isinstance(field_type, DateTime) and not field_type.timezone:
+                logger.info(f'Field "{f}" - datetime, '
+                            f'creating it as DATETIME2 on "{dialect_name}" to keep microseconds')
+                self._set_new_field_type(f, dialects.mssql.DATETIME2())
+
+
+    def _now(self):
+        # The audit timestamps are produced by the database, so their timezone and resolution are
+        # the engine's, not ours. The only thing asked for here is the fractional precision that an
+        # engine hides behind a default: MySQL/MariaDB NOW() drops the fraction unless NOW(fsp) is
+        # used. The argument has to be a literal - a bind parameter is not accepted there.
+        if self.engine.dialect.name in MYSQL_DIALECTS:
+            return func.now(literal_column('6'))
+        return func.now()
+
+
+    def _set_new_field_type(self, field_name, field_type):
+        # A field about to be created is listed in new_fields, and - unless it is one of the
+        # automatically managed columns - also in data_fields, so both have to stay in sync.
+        self.new_fields[field_name] = field_type
+        if field_name in self.data_fields:
+            self.data_fields[field_name] = field_type
+
+
     def _remove_new_fields(self):
 
         new_data_fields={}
@@ -859,16 +999,23 @@ class dbmerge:
             from alembic.migration import MigrationContext
             from alembic.operations import Operations
 
+            # Each ALTER commits on its own here, so a failure part way through leaves the columns
+            # added so far. They are exactly the columns the incoming data asked for, and a repeated
+            # merge adds the remaining ones, so the target converges.
+            self.conn.commit()
             op=Operations(MigrationContext.configure(self.conn))
             for field_name in self.new_fields:
-                logger.info(f'Creating new field "{field_name}" - {self.new_fields[field_name]}')       
+                logger.info(f'Creating new field "{field_name}" - {self.new_fields[field_name]}')
                 primary_key = field_name in self.key
                 op.add_column(
                         self.table_name,
                         Column(field_name, self.new_fields[field_name], primary_key=primary_key),
                         schema=self.schema
                     )
-            self.conn.commit()
+                # Committed one ALTER at a time, so each stays alone in its transaction. A failure
+                # part way through therefore leaves the columns added so far - they are exactly the
+                # ones the incoming data asked for, and a repeated merge adds the rest.
+                self.conn.commit()
             self.table = self._load_table_metadata_from_db(self.table_name,self.schema)
                
 
@@ -945,6 +1092,24 @@ class dbmerge:
             raise IncorrectParameter('Provide either "data" or "source_table_name", not both '
                                      '("data" is ignored when a source table is given).')
 
+        if source_schema is not None and source_table_name is None:
+            raise IncorrectParameter('"source_schema" is set, but "source_table_name" is not. '
+                                     'The schema only says where the source table lives, so it has '
+                                     'nothing to apply to on its own.')
+
+        # Each of these columns is written by a rule of its own, so one column can not play two of
+        # these roles at once: the merge would have to give it two different values in one statement.
+        roles = (('delete_mark_field', delete_mark_field),
+                 ('merged_on_field', merged_on_field),
+                 ('inserted_on_field', inserted_on_field))
+        for i, (name, value) in enumerate(roles):
+            if value is None:
+                continue
+            for other_name, other_value in roles[i+1:]:
+                if value == other_value:
+                    raise IncorrectParameter(f'"{name}" and "{other_name}" are both set to column '
+                                             f'"{value}". Each of them needs a column of its own.')
+
 
     def _check_key(self):
         if self.key is None or len(self.key)==0:
@@ -957,6 +1122,11 @@ class dbmerge:
             for c in self.key:
                 if c in self.special_fields:
                     raise NoKeyError(f'Key field "{c}" is a special field, which can not be used in the primary key.')
+                elif c == self.delete_mark_field:
+                    # The mark phase would run "UPDATE ... SET <key column> = <deleted value>",
+                    # assigning the flag value to the key of every row missing from the source.
+                    raise NoKeyError(f'Key field "{c}" is also the delete_mark_field, which can not be used '
+                                     f'in the primary key: marking a row deleted would overwrite its key.')
                 elif c not in self.data_fields:
                     raise NoKeyError(f'Key field "{c}" not found in data')
                 elif c in self.new_fields and self.table is not None:
@@ -973,11 +1143,11 @@ class dbmerge:
         target_fields = [self.table.c[f] for f in self.data_fields]
 
         if self.merged_on_field is not None:
-            source_fields.append(func.now().label(self.merged_on_field))
+            source_fields.append(self._now().label(self.merged_on_field))
             target_fields.append(self.table.c[self.merged_on_field])
 
         if self.inserted_on_field is not None:
-            source_fields.append(func.now().label(self.inserted_on_field))
+            source_fields.append(self._now().label(self.inserted_on_field))
             target_fields.append(self.table.c[self.inserted_on_field])
 
         if self.delete_mark_field is not None and not self.delete_mark_from_data:
@@ -1048,7 +1218,7 @@ class dbmerge:
 
         if self.merged_on_field is not None:
             merged_on_field = self.table.c[self.merged_on_field]
-            update_values[merged_on_field]=func.now()
+            update_values[merged_on_field]=self._now()
 
         # Caller-supplied columns written together with the mark (e.g. a load id), so that the
         # marking itself can be recorded and not just the flag.
@@ -1138,7 +1308,7 @@ class dbmerge:
 
         if self.merged_on_field is not None:
             merged_on_field = self.table.c[self.merged_on_field]
-            update_values[merged_on_field]=func.now()
+            update_values[merged_on_field]=self._now()
 
         update_join_conditions = []
         for c in self.key:
@@ -1168,7 +1338,13 @@ class dbmerge:
             
     
     def _create_table(self):
-        cols = [Column(c, self.data_fields[c], primary_key = c in self.key) for c in self.data_fields]
+        # autoincrement=False: the key value always comes from the source data, so the database must
+        # not generate it. Left at its default, a single-column integer key is created as
+        # AUTO_INCREMENT / SERIAL / IDENTITY - which turns a key of 0 into 1 on MySQL, leaves the
+        # PostgreSQL sequence behind the rows that were written, and makes MS SQL reject the
+        # explicit insert altogether.
+        cols = [Column(c, self.data_fields[c], primary_key = c in self.key, autoincrement=False)
+                for c in self.data_fields]
 
         special_cols = [Column(c, self.new_fields[c]) for c in self.new_fields if c not in self.data_fields]
 
@@ -1182,8 +1358,15 @@ class dbmerge:
                 logger.info(f'Table field "{f.name}" - {f.type}')
 
         self.table = Table(self.table_name, self.metadata, *all_cols, schema = self.schema)
-        self.table.create(self.engine, checkfirst=True)
-        self.conn.commit() 
+        # Created on the merge connection rather than through the engine: with an in-memory SQLite
+        # database a second connection is a different database, so the table has to be made here.
+        # Created on the merge connection rather than through the engine: with an in-memory SQLite
+        # database a second connection is a different database, so the table has to be made here.
+        # checkfirst=False on purpose: it would put an existence query in front of the CREATE, and
+        # the two together form a multi-statement transaction that CockroachDB rejects under a weak
+        # isolation level. The table is known to be missing - that is why we are here.
+        self.table.create(self.conn, checkfirst=False)
+        self.conn.commit()
 
  
     @staticmethod
@@ -1202,7 +1385,10 @@ class dbmerge:
 
         temp_table_name = self._truncate_to_bytes(self.table_name, max_bytes) + '_' + self.unique_id
 
-        cols = [Column(c.name, c.type, primary_key = c.name in self.key) for c in self.table.c]
+        # autoincrement=False for the same reason as in _create_table: the staging table is loaded
+        # with the key values of the source, never with generated ones.
+        cols = [Column(c.name, c.type, primary_key = c.name in self.key, autoincrement=False)
+                for c in self.table.c]
 
         if self.engine.dialect.name =='postgresql':
             self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
@@ -1211,22 +1397,22 @@ class dbmerge:
             # but looks like UNLOGGED is performing better then TEMP.
             # Note: UNLOGGED is a persistent table (unlike TEMP), so if the process crashes before
             # _drop_temp_table() runs, the table is left behind in temp_schema and is not auto-cleaned.
-            self.temp_table.create(bind=self.conn)
-        
+            self.temp_table.create(bind=self.conn, checkfirst=False)
+
         elif self.engine.dialect.name in ('mariadb','mysql','sqlite'):
             self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
                                     prefixes=['TEMPORARY'])
-            self.temp_table.create(bind=self.conn)
+            self.temp_table.create(bind=self.conn, checkfirst=False)
         
         else:
             table_exists = self.inspector.has_table(temp_table_name, self.temp_schema)
             if table_exists:
                 raise TempTableAlreadyExists(f'Temp table "{temp_table_name}" already exists in schema "{self.temp_schema}"')
             self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema)
-            self.temp_table.create(bind=self.conn, checkfirst=True)
+            self.temp_table.create(bind=self.conn, checkfirst=False)
 
         self.conn.commit()        
- 
+
 
     def _insert_data_to_temp(self):
 
@@ -1293,7 +1479,10 @@ class dbmerge:
             # that created them: dropping via the engine runs on another pooled connection
             # where the table does not exist, leaving it alive until the pool recycles.
             if hasattr(self, 'conn') and not self.conn.closed:
-                self.temp_table.drop(self.conn, checkfirst=True)
+                # checkfirst=False for the same reason as on creation, and there is nothing to
+                # check anyway: the name carries a unique id, so this table is ours and exists.
+                self.conn.commit()
+                self.temp_table.drop(self.conn, checkfirst=False)
                 self.conn.commit()
             else:
                 self.temp_table.drop(self.engine, checkfirst=True)

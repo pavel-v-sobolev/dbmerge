@@ -110,10 +110,13 @@ Here is a rough performance comparison for synchronizing data of different sizes
 - **MariaDB / MySQL:** 
   - Does not detect changes in uppercase vs. lowercase or space padding by default (e.g., `'test' == ' Test'`). If this is important, you need to change the collation settings in your database.
   - The schema is treated the same as the database, but schema settings are still supported by this library.
-  - Does not allow strings with unlimited size. You must explicitly define `data_types` if you want to create a table or field automatically (e.g., `data_types={'Your Field': String(100)}`).
+  - A **string column of the merge key** needs an explicit length, because InnoDB shares one 3072-byte index budget between all columns of the key (e.g., `data_types={'Your Key Field': String(100)}`). Other string columns are created as `LONGTEXT` automatically.
+  - Timezone-aware datetimes lose their UTC offset: no MySQL/MariaDB type stores one. Normalize to UTC before merging if the offset matters.
+  - A `BOOLEAN` column is stored as `TINYINT(1)`, so a `delete_mark_field` there holds `0`/`1` rather than `False`/`True`.
 - **SQLite:** Does not support schemas. If a schema setting is provided, it is automatically reset to `None` with a warning.
 - **MS SQL Server:** Bulk insert operations may have lower performance due to specific `pyodbc` driver limitations.
 - **CockroachDB:** Uses the official `sqlalchemy-cockroachdb` dialect (over `psycopg2`); speaks the PostgreSQL wire protocol.
+  - `exec(commit_all_steps=False)` is noticeably faster here. On a single-node instance, merging 200 000 rows took ~6s against ~16s with the default, because one commit costs a consensus round regardless of how much it carries. The update phase showed no difference. It also makes the merge all-or-nothing; the trade-off is one larger transaction, which raises the chance of a serialization retry.
 - **Oracle:** Currently **not supported** (missing support for `JOIN` operations in `UPDATE` statements within the `oracledb` module).
 - **DuckDB:** Currently **not supported** (due to a bug in `duckdb_engine` regarding table definition loading).
 

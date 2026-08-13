@@ -1,18 +1,20 @@
 import pandas as pd
 import polars as pl
 import numpy as np
-from datetime import date
+from datetime import date, datetime
 import time
 import uuid
 import pytest
 import logging
 
 from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_
-from sqlalchemy import Table, MetaData, Column, String, Date, Integer, Numeric, JSON, Uuid, StaticPool
+from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, JSON, Uuid, StaticPool
 
 from sample_data_in_sqlite import get_data, get_modified_data
 import urllib
 from dbmerge import dbmerge, drop_table_if_exists, format_ms
+# The exceptions are not re-exported from the package root.
+from dbmerge.dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
 
@@ -40,6 +42,16 @@ engines = {'sqlite':"""sqlite:///data/data.sqlite""",
          }
 
 
+def make_engine(engine_name):
+    # CockroachDB runs SERIALIZABLE by default. A merge step here reads the staging table and
+    # updates tens of thousands of target rows, so a single step can stay open for tens of seconds -
+    # long enough for an unrelated commit (e.g. the background GC of a dropped temp table) to break
+    # the transaction's read-timestamp refresh and fail COMMIT with a transient RETRY_SERIALIZABLE.
+    # CockroachDB expects the client to retry such transactions; dbmerge does not, so the tests ask
+    # for READ COMMITTED, where CockroachDB retries statements internally.
+    if engine_name == 'cockroachdb':
+        return create_engine(engines[engine_name], isolation_level='READ COMMITTED')
+    return create_engine(engines[engine_name])
 
 
 
@@ -92,7 +104,7 @@ def prepare_and_clean_data(engine):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_table_create_from_data_with_various_types(engine_name,type_of_data):
     logger.debug(f'TEST TABLE CREATE FROM DATA WITH VARIOUS TYPES {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':None,'Price':1.1,'Data':{'a':1},'uuid':uuid.uuid4()},
@@ -117,7 +129,7 @@ def test_table_create_from_data_with_various_types(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_table_with_long_name(engine_name,type_of_data):
     logger.debug(f'TEST TABLE CREATE FROM DATA WITH VARIOUS TYPES {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':None},
@@ -145,7 +157,7 @@ def test_table_with_long_name(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_empty_data_updates(engine_name,type_of_data):
     logger.debug(f'TEST TABLE CREATE FROM DATA WITH VARIOUS TYPES {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
 
@@ -188,7 +200,7 @@ def test_empty_data_updates(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_case_sensitive_and_spaces(engine_name,type_of_data):
     logger.debug(f'TEST CASE SENSITIVE AND SPACES {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     data_types = {'Shop':String(100),'Product':String(100),'Test Field':String(100)}
@@ -229,7 +241,7 @@ def test_case_sensitive_and_spaces(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_table_only_key_no_other_fields(engine_name,type_of_data):
     logger.debug(f'TEST ONLY KEY NO OTHER FIELDS {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     data=[{'Shop':'123 ','Product':'123','Date':date(2025,1,1)},
@@ -264,7 +276,7 @@ def test_table_only_key_no_other_fields(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_insert_to_existing_table_and_test_new_field(engine_name,type_of_data):
     logger.debug(f'TEST INSERT TO EXISTING TABLE AND TEST NEW FIELD {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     logger.debug('Create table from first merge')
@@ -302,7 +314,7 @@ def test_insert_to_existing_table_and_test_new_field(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_change_data_and_mark_deleted_data(engine_name,type_of_data):
     logger.debug(f"TEST CHANGE DATA AND DELETE DATA with delete_mode='mark' {engine_name} {type_of_data}")
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     data = get_data(limit=10001)
@@ -339,7 +351,7 @@ def test_change_data_and_mark_deleted_data(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_date_range_with_deletion(engine_name,type_of_data):
     logger.debug(f'TEST DATE RANGE WITH DELETION {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     data = get_data(start_date=date(2025,1,1),end_date=date(2025,7,10))
@@ -375,7 +387,7 @@ def test_date_range_with_deletion(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_date_range_with_delete_mark(engine_name,type_of_data):
     logger.debug(f'TEST DATE RANGE WITH MISSING MARK {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     data = get_data(start_date=date(2025,1,1),end_date=date(2025,7,10))
@@ -445,7 +457,7 @@ def test_date_range_with_delete_mark(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_delete_mark_field_with_delete_mode_no(engine_name,type_of_data):
     logger.debug(f"TEST delete_mark_field is always populated with delete_mode='no' {engine_name} {type_of_data}")
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     # Part A: 'Deleted' is NOT in the data -> every row must default to False
@@ -492,7 +504,7 @@ def test_delete_mark_field_with_delete_mode_no(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_update_condition(engine_name,type_of_data):
     logger.debug(f'TEST UPDATE_CONDITION {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     # seed three rows with distinct Qty values
@@ -543,7 +555,7 @@ def test_mark_resurrection_key_only_table(engine_name,type_of_data):
     # A key-only table (no value columns) must still reset the auto-managed delete flag back to
     # active when a previously marked-deleted row reappears in the source.
     logger.debug(f'TEST MARK RESURRECTION ON KEY-ONLY TABLE {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     def as_type(rows):
@@ -584,7 +596,7 @@ def test_mark_resurrection_key_only_table(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_a_set_from_temp_with_deletion(engine_name,type_of_data):
     logger.debug(f'TEST A SET FROM TEMP WITH DELETION {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     data = get_data(limit=10000)
@@ -620,7 +632,7 @@ def test_a_set_from_temp_with_deletion(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_update_from_source_table_with_delete_in_a_period(engine_name,type_of_data):
     logger.debug(f'TEST UPDATE FROM SOURCE TABLE WITH DELETE/UPDATE OF IN A SET {engine_name} {type_of_data}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
     logger.debug('Create source table')
@@ -675,11 +687,11 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,type_of_da
 
 
 @pytest.mark.parametrize("engine_name", list(engines))
-def test_update_condition(engine_name):
+def test_update_condition_version_guard(engine_name):
     # update_condition restricts the update phase: a row is overwritten only when it also satisfies
     # the condition. Here: overwrite only if the incoming 'version' is not lower than the stored one.
-    logger.debug(f'TEST UPDATE_CONDITION {engine_name}')
-    engine = create_engine(engines[engine_name])
+    logger.debug(f'TEST UPDATE_CONDITION_VERSION_GUARD {engine_name}')
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
     k = ['Shop', 'Product']
     dt = {'Shop': String(100), 'Product': String(100)}
@@ -714,7 +726,7 @@ def test_insert_condition(engine_name):
     # greater 'version'. Combined with matching delete/update conditions, a group that already has a
     # greater version is left fully untouched, while the rest is refreshed from the source.
     logger.debug(f'TEST INSERT_CONDITION {engine_name}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
     k = ['Shop', 'Product']
     dt = {'Shop': String(100), 'Product': String(100)}
@@ -762,7 +774,7 @@ def test_skip_compare_fields(engine_name):
     # changes on every load; without the parameter every row would look modified and 'Merged On'
     # would be bumped, making unchanged rows look fresh to downstream incremental consumers.
     logger.debug(f'TEST SKIP_COMPARE_FIELDS {engine_name}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
     k = ['Shop', 'Product']
     dt = {'Shop': String(100), 'Product': String(100)}
@@ -805,7 +817,7 @@ def test_delete_mark_values(engine_name):
     # delete_mark_values: extra columns stamped on a row when it is marked as deleted, so a row
     # leaving the source carries the same bookkeeping ('version') as a row that was updated.
     logger.debug(f'TEST DELETE_MARK_VALUES {engine_name}')
-    engine = create_engine(engines[engine_name])
+    engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
     k = ['Shop', 'Product']
     dt = {'Shop': String(100), 'Product': String(100)}
@@ -841,18 +853,252 @@ def test_delete_mark_values(engine_name):
     assert rows['B']['Merged On'] > seeded_merged_on, 'marking bumps merged_on'
 
     # delete_mark_values outside 'mark' mode is a mistake, not a silent no-op
-    with pytest.raises(Exception):
+    with pytest.raises(IncorrectParameter):
         with dbmerge(engine=engine, data=seed, table_name='Facts', schema='target', temp_schema='tmp',
                      data_types=dt, key=k, delete_mark_field='Deleted',
                      delete_mark_values={'version': 1}) as merge:
             merge.exec()
 
     # unknown column is a mistake too
-    with pytest.raises(Exception):
+    with pytest.raises(IncorrectParameter):
         with dbmerge(engine=engine, data=seed, table_name='Facts', schema='target', temp_schema='tmp',
                      data_types=dt, key=k, delete_mode='mark', delete_mark_field='Deleted',
                      delete_mark_values={'NoSuchColumn': 1}) as merge:
             merge.exec()
+
+    # a key column identifies the row being marked, so stamping it would rewrite that identity
+    with pytest.raises(IncorrectParameter):
+        with dbmerge(engine=engine, data=seed, table_name='Facts', schema='target', temp_schema='tmp',
+                     data_types=dt, key=k, delete_mode='mark', delete_mark_field='Deleted',
+                     delete_mark_values={'Shop': 'X'}) as merge:
+            merge.exec()
+
+    # an automatically managed column would get two values in the same UPDATE
+    with pytest.raises(IncorrectParameter):
+        with dbmerge(engine=engine, data=seed, table_name='Facts', schema='target', temp_schema='tmp',
+                     data_types=dt, key=k, delete_mode='mark', delete_mark_field='Deleted',
+                     merged_on_field='Merged On',
+                     delete_mark_values={'Merged On': None}) as merge:
+            merge.exec()
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_managed_field_roles_must_be_distinct(engine_name):
+    # delete_mark_field, merged_on_field and inserted_on_field are each written by a rule of their
+    # own, so one column can not play two of these roles: the merge would have to give it two
+    # different values in a single statement.
+    logger.debug(f'TEST MANAGED FIELD ROLES MUST BE DISTINCT {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    data = [{'Shop': 'S', 'Product': 'A', 'Qty': 1}]
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100)}
+
+    for clashing in ({'merged_on_field': 'Stamp', 'inserted_on_field': 'Stamp'},
+                     {'delete_mode': 'mark', 'delete_mark_field': 'Stamp', 'merged_on_field': 'Stamp'},
+                     {'delete_mode': 'mark', 'delete_mark_field': 'Stamp', 'inserted_on_field': 'Stamp'}):
+        with pytest.raises(IncorrectParameter):
+            dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                    data_types=dt, key=k, **clashing)
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_data_types_for_managed_field(engine_name):
+    # A type given for an automatically managed column is used to create it, and must not turn that
+    # column into a data field: its value comes from the merge itself, not from the source row.
+    logger.debug(f'TEST DATA TYPES FOR MANAGED FIELD {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    data = [{'Shop': 'S', 'Product': 'A', 'Qty': 1}]
+    dt = {'Shop': String(100), 'Product': String(100),
+          'Merged On': DateTime(), 'Inserted On': DateTime(), 'Deleted': Integer()}
+
+    with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                 data_types=dt, key=k, merged_on_field='Merged On',
+                 inserted_on_field='Inserted On',
+                 delete_mode='mark', delete_mark_field='Deleted') as merge:
+        merge.exec()
+        assert merge.inserted_row_count == 1, 'the row must be inserted, not rejected'
+
+    tbl = _reflect_facts(engine)
+    for col in ('Merged On', 'Inserted On', 'Deleted'):
+        assert col in tbl.c, f'managed column "{col}" was not created from data_types'
+
+    with engine.connect() as conn:
+        row = conn.execute(select(tbl.c['Merged On'], tbl.c['Inserted On'], tbl.c['Deleted'])).one()
+    assert row[0] is not None and row[1] is not None, 'the merge must fill the audit timestamps'
+    assert not row[2], 'a freshly inserted row must not be marked as deleted'
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_delete_mark_field_can_not_be_in_key(engine_name):
+    # The mark phase would compile to "UPDATE ... SET <key column> = <deleted value>", overwriting
+    # the key of every row missing from the source.
+    logger.debug(f'TEST DELETE MARK FIELD CAN NOT BE IN KEY {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+
+    with pytest.raises(NoKeyError):
+        dbmerge(engine=engine, data=[{'Shop': 'S', 'Product': 'A', 'Qty': 1}], table_name='Facts',
+                schema='target', temp_schema='tmp', key=['Shop', 'Product'],
+                data_types={'Shop': String(100), 'Product': String(100)},
+                delete_mode='mark', delete_mark_field='Shop')
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_parameter_conflicts_raise_domain_errors(engine_name):
+    # A wrong combination of arguments has to surface as a dbmerge error, not as a raw TypeError or
+    # as a silently wrong setting.
+    logger.debug(f'TEST PARAMETER CONFLICTS {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100)}
+    data = [{'Shop': 'S', 'Product': 'A', 'Qty': 1}]
+
+    # a schema for the source table says nothing without the source table itself
+    with pytest.raises(IncorrectParameter):
+        dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                data_types=dt, key=k, source_schema='source')
+
+    # a non-empty string is truthy, so commit_all_steps='false' would switch step commits ON
+    with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                 data_types=dt, key=k) as merge:
+        with pytest.raises(IncorrectParameter):
+            merge.exec(commit_all_steps='false')
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_auto_types_keep_fraction_and_microseconds(engine_name):
+    # A column created automatically must keep the value it was created from. The generic types are
+    # resolved differently per engine, and some of them round unless the precision is stated.
+    logger.debug(f'TEST AUTO TYPES KEEP PRECISION {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    stamp = datetime(2026, 8, 2, 12, 34, 56, 987654)
+    data = [{'Shop': 'S', 'Product': 'A', 'Price': 1.75, 'Stamp': stamp}]
+
+    with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                 data_types={'Shop': String(100), 'Product': String(100)},
+                 key=['Shop', 'Product']) as merge:
+        merge.exec()
+
+    tbl = _reflect_facts(engine)
+    with engine.connect() as conn:
+        row = conn.execute(select(tbl.c['Price'], tbl.c['Stamp'])).one()
+
+    assert float(row[0]) == 1.75, f'the fraction must survive the round trip, got {row[0]!r}'
+    assert row[1].microsecond == 987654, f'microseconds must survive the round trip, got {row[1]!r}'
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_auto_string_length_policy(engine_name):
+    # A string column created automatically must accept a value longer than any length the module
+    # could have guessed. On MySQL/MariaDB a string key still needs an explicit length, because
+    # InnoDB shares one index budget between all columns of the key.
+    logger.debug(f'TEST AUTO STRING LENGTH POLICY {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+
+    if engine.dialect.name in ('mysql', 'mariadb'):
+        with pytest.raises(IncorrectParameter):
+            dbmerge(engine=engine, data=[{'Shop': 'S', 'Qty': 1}], table_name='Facts',
+                    schema='target', temp_schema='tmp', key=['Shop'])
+
+    long_note = 'x' * 5000
+    with dbmerge(engine=engine, data=[{'Shop': 'S', 'Product': 'A', 'Note': long_note}],
+                 table_name='Facts', schema='target', temp_schema='tmp',
+                 data_types={'Shop': String(100), 'Product': String(100)},
+                 key=['Shop', 'Product']) as merge:
+        merge.exec()
+
+    tbl = _reflect_facts(engine)
+    with engine.connect() as conn:
+        stored = conn.execute(select(tbl.c['Note'])).scalar()
+    assert len(stored) == len(long_note), f'the string was truncated to {len(stored)} characters'
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_skip_compare_fields_covering_every_column(engine_name):
+    # When every comparable column is skipped, no row can qualify as changed and nothing is written.
+    logger.debug(f'TEST SKIP COMPARE FIELDS COVERING EVERY COLUMN {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100)}
+
+    def merge_row(version):
+        with dbmerge(engine=engine, data=[{'Shop': 'S', 'Product': 'A', 'version': version}],
+                     table_name='Facts', schema='target', temp_schema='tmp',
+                     data_types=dt, key=k, skip_compare_fields=['version']) as merge:
+            merge.exec()
+            return merge.updated_row_count
+
+    merge_row(5)
+    assert merge_row(6) == 0, 'nothing is comparable, so no row may be updated'
+
+    tbl = _reflect_facts(engine)
+    with engine.connect() as conn:
+        assert conn.execute(select(tbl.c['version'])).scalar() == 5, 'the skipped column stays as inserted'
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_skip_compare_fields_still_resurrects_marked_row(engine_name):
+    # The delete flag is reset inside the update phase. Even when every comparable column is
+    # skipped, a row that reappears in the source must come back to active.
+    logger.debug(f'TEST SKIP COMPARE FIELDS RESURRECTION {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100)}
+
+    def merge_rows(rows, version):
+        data = [{'Shop': 'S', 'Product': p, 'version': version} for p in rows]
+        with dbmerge(engine=engine, data=data, table_name='Facts', schema='target',
+                     temp_schema='tmp', data_types=dt, key=k, skip_compare_fields=['version'],
+                     delete_mode='mark', delete_mark_field='Deleted') as merge:
+            merge.exec()
+
+    def deleted_flags():
+        tbl = _reflect_facts(engine)
+        with engine.connect() as conn:
+            return {r.Product: r.Deleted for r in
+                    conn.execute(select(tbl.c['Product'], tbl.c['Deleted'])).all()}
+
+    merge_rows(['A', 'B'], 5)
+    merge_rows(['A'], 6)
+    assert deleted_flags()['B'], 'a row missing from the source must be marked'
+
+    merge_rows(['A', 'B'], 7)
+    assert not deleted_flags()['B'], 'a row back in the source must be reset to active'
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_skip_update_wins_over_skip_compare(engine_name):
+    # A column named in both lists follows skip_update_fields: it is written by the insert and
+    # never touched again, even when the row is updated for another reason.
+    logger.debug(f'TEST SKIP UPDATE WINS OVER SKIP COMPARE {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100)}
+
+    def merge_row(qty, note):
+        with dbmerge(engine=engine, data=[{'Shop': 'S', 'Product': 'A', 'Qty': qty, 'Note': note}],
+                     table_name='Facts', schema='target', temp_schema='tmp', data_types=dt, key=k,
+                     skip_update_fields=['Note'], skip_compare_fields=['Note']) as merge:
+            merge.exec()
+            return merge.updated_row_count
+
+    merge_row(1, 'first')
+    assert merge_row(42, 'second') == 1, 'a real change in Qty must still update the row'
+
+    tbl = _reflect_facts(engine)
+    with engine.connect() as conn:
+        row = conn.execute(select(tbl.c['Qty'], tbl.c['Note'])).one()
+    assert row[0] == 42, 'the compared column is updated'
+    assert row[1] == 'first', 'skip_update_fields wins: the column keeps its inserted value'
 
 
 if __name__ == '__main__':

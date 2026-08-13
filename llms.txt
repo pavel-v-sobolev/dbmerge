@@ -12,7 +12,7 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB. **Not 
 2. **Always use a context manager:** `with dbmerge(...) as merge:` and call `merge.exec()` inside it. `exec()` may be called only once per instance.
 3. **Never enable deletion implicitly.** `delete_mode` defaults to `'no'`. Only pass `'delete'`/`'mark'` when the user explicitly wants missing rows removed — and then see rule 4.
 4. **A partial source needs a `delete_condition`.** With `delete_mode='delete'`, every target row missing from the source is deleted; an empty source wipes the whole table.
-5. **Pass `data_types` for decimal, float, datetime and string columns** whenever `dbmerge` may create the table or column. Auto-detection infers a generic type from a sample value and cannot know precision, scale, length or timezone policy.
+5. **Pass `data_types` when the exact column type matters** and `dbmerge` may create the table or column. Auto-detection infers a type from a sample value, so it cannot know the precision and scale of a decimal, the length of a string, or your timezone policy. A type given in `data_types` is never second-guessed, even if the engine then refuses to create the column from it.
 6. **`key` must be non-null and unique**, and should be backed by a primary key or unique index in the target table.
 7. Conditions (`delete_condition`, `update_condition`, `insert_condition`, `source_condition`) must be SQLAlchemy expressions built on `merge.table.c`, `merge.temp_table.c` or `merge.source_table.c` — never strings.
 
@@ -26,10 +26,10 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB. **Not 
 | `table_name` | Target table. |
 | `data` | Source rows. Mutually exclusive with `source_table_name` (passing both raises). |
 | `source_table_name` / `source_schema` | Read the source straight from a table or view instead of Python memory. |
-| `key` | List of column names forming the unique key. Defaults to the target's primary key; **required** when the table does not exist yet. |
+| `key` | List of column names forming the unique key. Defaults to the target's primary key; **required** when the table does not exist yet. Key values always come from your data, so a key column DBMerge creates is never `AUTO_INCREMENT`/`SERIAL`/`IDENTITY`. |
 | `delete_mode` | `'no'` (default), `'delete'`, `'mark'`. |
-| `delete_mark_field` | Column flagged when a row is missing from the source. Must be a **dedicated** Boolean or Integer column. |
-| `merged_on_field` / `inserted_on_field` | Timestamp columns managed automatically; values supplied in `data` are ignored. |
+| `delete_mark_field` | Column flagged when a row is missing from the source. Must be a **dedicated** Boolean or Integer column. On MySQL/MariaDB a `BOOLEAN` is really `TINYINT(1)`, so the flag reads back as `0`/`1`. |
+| `merged_on_field` / `inserted_on_field` | Timestamp columns managed automatically; values supplied in `data` are ignored. Filled by the database clock, so timezone and resolution are the engine's — see Audit timestamps below. |
 | `delete_mark_values` | `{'col': value}` written on a row when it is marked deleted, in addition to the flag (e.g. a load id). Requires `delete_mode='mark'`. |
 | `skip_update_fields` | Columns written on insert only, never on update — and therefore never compared either. |
 | `skip_compare_fields` | Columns written but never compared: they do not cause an update on their own, but are written when the row is updated for another reason. For a column that changes on every load (a load id) and would otherwise make every row look modified. |
@@ -127,19 +127,35 @@ with dbmerge(engine=engine, data=data, table_name="Facts", key=['id'],
 
 - **`delete_mode='delete'`/`'mark'` treats the source as a complete snapshot.** Every target row missing from the source is affected, and an empty source wipes the table. Scope a partial source with `delete_condition`.
 - **`commit_all_steps=True` (the default) is not atomic.** Each phase commits separately, so a failure in a later phase leaves the earlier ones applied and cannot be rolled back. Use `commit_all_steps=False` for an all-or-nothing merge, at the cost of one large transaction. Design merges to be safe to re-run.
+- **`commit_all_steps` covers the data, never the schema.** Creating the target table, adding a column and creating or dropping the staging table are always committed on their own, whichever value you pass.
 - **The merge key must be unique in the target table.** Duplicates in the *source* are caught automatically by the staging table's primary key, but if the target has no primary key or unique index on the key columns, duplicate rows there are all overwritten with the same source row, silently. That is the database schema's responsibility.
 - **Automatic schema creation is a convenience, not a schema tool.** It infers types from sample values and cannot recover precision, scale, length or timezone policy, and each backend resolves the resulting generic type differently. In production, manage the schema with migrations and pass `can_create_table=False, can_create_columns=False`.
-- **`delete_mark_field` must be a dedicated flag column.** The mark phase writes `1`/`True` into it and the update phase writes `0`/`False` back, so any other meaning the column carries is destroyed.
+- **`delete_mark_field` must be a dedicated flag column.** The mark phase writes `1`/`True` into it and the update phase writes `0`/`False` back, so any other meaning the column carries is destroyed. It cannot be part of `key`, nor the same column as `merged_on_field`/`inserted_on_field` — those combinations are rejected.
 - **PostgreSQL/CockroachDB need `JSONB`, not `JSON`** (`from sqlalchemy.dialects.postgresql import JSONB`) — plain `JSON` cannot be compared to detect changes and is rejected.
 - **Exceptions are not exported from the package root.** Import them as `from dbmerge.dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError, TableNotFoundError, TempTableAlreadyExists`, or simply catch `RuntimeError` — all of them subclass it. The package root exports only `dbmerge`, `mergeResult`, `drop_table_if_exists`, `format_ms`, `__version__`.
+
+## Audit timestamps
+
+`merged_on_field` and `inserted_on_field` are written by the database's own clock function, not by Python, and nothing is normalized. The value therefore means something slightly different per engine:
+
+An auto-created audit column is a **naive** timestamp, so the offset is dropped. Give it a timezone-aware type instead — pre-create it, or `data_types={'Merged On': DateTime(timezone=True)}` — and on PostgreSQL/CockroachDB it becomes `timestamptz` and keeps the instant. MySQL/MariaDB have no type that stores an offset; on MS SQL `CURRENT_TIMESTAMP` returns no offset either, so a `datetimeoffset` column would only mislabel server-local time as UTC. The table describes the naive default:
+
+| Engine | Emitted SQL | Timezone of the stored value | Resolution |
+|---|---|---|---|
+| PostgreSQL / CockroachDB | `now()` | session `TimeZone` (the naive column strips the `timestamptz` offset); CockroachDB defaults to UTC | microseconds |
+| MySQL / MariaDB | `NOW(6)` | server `time_zone` | microseconds |
+| SQLite | `CURRENT_TIMESTAMP` | always UTC | whole seconds |
+| MS SQL Server | `CURRENT_TIMESTAMP` | server timezone | ~3.3 ms |
+
+So SQLite records UTC while every other engine records server-local time, and the column carries no offset to tell them apart — moving a pipeline between engines shifts these columns silently. On PostgreSQL/CockroachDB `now()` is the transaction start time, so with the default `commit_all_steps=True` the update and insert phases get slightly different values. If you need one timestamp with identical meaning everywhere, skip these parameters and pass your own UTC value as an ordinary column in `data`.
 
 ## Database-specific notes
 
 - **PostgreSQL:** staging tables are created `UNLOGGED` (persistent, so a hard crash can leave one behind in `temp_schema`).
-- **MySQL/MariaDB:** `schema` is required. Strings need an explicit length, so pass `data_types={'col': String(100)}` when creating tables or columns automatically. Default collation ignores case and trailing spaces, so `'test'` and `' Test'` may not register as a change.
+- **MySQL/MariaDB:** `schema` is required. A **string column of the merge key** needs an explicit length (`data_types={'col': String(100)}`) because InnoDB shares one 3072-byte index budget between all key columns; other string columns become `LONGTEXT` automatically. Timezone-aware datetimes lose their UTC offset — no MySQL type stores one. Default collation ignores case and trailing spaces, so `'test'` and `' Test'` may not register as a change.
 - **SQLite:** no schema support; `schema`/`temp_schema` are reset to `None` with a warning.
 - **MS SQL Server:** bulk inserts are slower because of `pyodbc` limitations.
-- **CockroachDB:** uses the `sqlalchemy-cockroachdb` dialect over the PostgreSQL wire protocol.
+- **CockroachDB:** uses the `sqlalchemy-cockroachdb` dialect over the PostgreSQL wire protocol. `exec(commit_all_steps=False)` is markedly faster: one commit costs a consensus round whatever it carries (200 000 rows inserted in ~6s against ~16s on a single node; no difference on the update phase).
 
 ## Docs
 
