@@ -37,7 +37,9 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB. **Not 
 | `schema` / `temp_schema` | Target and staging schema. `schema` is **required** for MySQL/MariaDB (set it to the database name). |
 | `can_create_table` / `can_create_columns` / `can_create_schemas` | All default to `True`. Set to `False` in production against a migration-managed schema. |
 
-`exec(delete_condition=None, source_condition=None, update_condition=None, insert_condition=None, commit_all_steps=True, chunk_size=10000)` returns a `mergeResult` with `total_row_count`, `inserted_row_count`, `updated_row_count`, `deleted_row_count`, `total_time`, `temp_insert_time`, `insert_time`, `update_time`, `delete_time`.
+`exec(delete_condition=None, source_condition=None, update_condition=None, insert_condition=None, commit_all_steps=True, chunk_size=10000)` returns a `mergeResult` with `total_row_count`, `inserted_row_count`, `updated_row_count`, `deleted_row_count`, `total_time`, `temp_insert_time`, `insert_time`, `update_time`, `delete_time`, `table_created`, `added_fields`.
+
+`table_created` / `added_fields` report the schema changes the merge made to the target table. `added_fields` is a `{column name: SQLAlchemy type}` mapping — the type each column was really created with, after any adjustment for the target engine. It covers only columns added to an already existing table, never the auto-managed timestamp/delete-flag columns, and stays empty with `can_create_columns=False`. Use them downstream: a dataset built incrementally from a `merged_on_field` watermark can not detect a new column by itself — adding a column moves no watermark — so `added_fields` is the signal to rebuild it in full.
 
 Phases run in this order: staging load → `UPDATE` → `INSERT` → `DELETE`/mark.
 

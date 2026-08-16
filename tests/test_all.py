@@ -9,6 +9,7 @@ import logging
 
 from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_
 from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, JSON, Uuid, StaticPool
+from sqlalchemy import types
 
 from sample_data_in_sqlite import get_data, get_modified_data
 import urllib
@@ -1099,6 +1100,55 @@ def test_skip_update_wins_over_skip_compare(engine_name):
         row = conn.execute(select(tbl.c['Qty'], tbl.c['Note'])).one()
     assert row[0] == 42, 'the compared column is updated'
     assert row[1] == 'first', 'skip_update_fields wins: the column keeps its inserted value'
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_reported_schema_changes(engine_name):
+    # A merge reports what it changed in the target schema: a downstream consumer that rebuilds a
+    # derived dataset from the merged_on watermark can not see a new column otherwise - adding a
+    # column changes no values, so no watermark moves.
+    logger.debug(f'TEST REPORTED SCHEMA CHANGES {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    k = ['Shop', 'Product']
+    dt = {'Shop': String(100), 'Product': String(100), 'Note': String(100)}
+
+    def merge_row(row, **kwargs):
+        with dbmerge(engine=engine, data=[row], table_name='Facts', schema='target',
+                     temp_schema='tmp', data_types=dt, key=k, **kwargs) as merge:
+            return merge.exec()
+
+    result = merge_row({'Shop': 'S', 'Product': 'A', 'Qty': 1},
+                       merged_on_field='Merged On', inserted_on_field='Inserted On')
+    assert result.table_created is True, 'the target table did not exist and was created'
+    assert result.added_fields == {}, 'a new table reports no added columns - it has no previous version'
+
+    result = merge_row({'Shop': 'S', 'Product': 'A', 'Qty': 2},
+                       merged_on_field='Merged On', inserted_on_field='Inserted On')
+    assert result.table_created is False, 'the table already exists'
+    assert result.added_fields == {}, 'nothing was added to the schema'
+
+    # A new data column, alongside a newly requested auto-managed one: only the data column is
+    # reported - the delete flag carries no source data to recompute over.
+    result = merge_row({'Shop': 'S', 'Product': 'A', 'Qty': 2, 'Note': 'n'},
+                       merged_on_field='Merged On', inserted_on_field='Inserted On',
+                       delete_mark_field='Deleted')
+    assert result.table_created is False
+    assert list(result.added_fields) == ['Note'], f'unexpected added_fields {result.added_fields}'
+    # the value is the SQLAlchemy type the column was really created with
+    added_type = result.added_fields['Note']
+    assert isinstance(added_type, types.TypeEngine), f'expected a SQLAlchemy type, got {added_type!r}'
+    tbl = _reflect_facts(engine)
+    assert isinstance(tbl.c['Note'].type, String), f'"Note" is {tbl.c["Note"].type} in the database'
+
+    # can_create_columns=False: the column is dropped from the merge instead of being created,
+    # so there is no schema change to report.
+    result = merge_row({'Shop': 'S', 'Product': 'A', 'Qty': 2, 'Note': 'n', 'Extra': 1},
+                       can_create_columns=False)
+    assert result.added_fields == {}, 'nothing may be reported when no DDL was allowed'
+
+    tbl = _reflect_facts(engine)
+    assert 'Extra' not in tbl.c, 'the column was really not created'
 
 
 if __name__ == '__main__':

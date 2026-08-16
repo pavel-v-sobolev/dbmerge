@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 import logging
 from datetime import datetime, date
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists, literal, literal_column
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
@@ -139,11 +139,17 @@ class mergeResult:
     inserted_row_count: int 
     updated_row_count: int 
     deleted_row_count: int 
-    total_time: float 
+    total_time: float
     temp_insert_time: float
     insert_time: float
     update_time: float
     delete_time: float
+    # Schema changes this merge made to the target table. A downstream consumer that keeps a
+    # derived dataset (a mart built incrementally from a "merged on" watermark) can not notice a
+    # new column on its own: the watermark only moves on rows whose values changed, and adding a
+    # column changes no values. These two fields are that missing signal.
+    table_created: bool = False
+    added_fields: dict[str, types.TypeEngine] = field(default_factory=dict)
 
 
 class dbmerge:
@@ -343,6 +349,12 @@ class dbmerge:
             self.data_fields = {}
             self.new_fields = {}
 
+            # Reported schema changes (see mergeResult). Both are filled by the fact of the DDL,
+            # not by what the incoming data asked for: with can_create_columns=False the missing
+            # columns are dropped from the merge instead of being created, and nothing is reported.
+            self.table_created = False
+            self.added_fields = {}
+
             self.delete_mode = delete_mode
 
             self.delete_mark_field = delete_mark_field
@@ -479,6 +491,9 @@ class dbmerge:
                         self._detect_missing_data_types()
                     self._adapt_types_to_dialect()
                     self._create_table()
+                    # The whole table is new, so its columns are not reported as added ones:
+                    # there was no previous version of the table to add them to.
+                    self.table_created = True
                 else:
                     raise TableNotFoundError(f"Table not found {self.table_full_name} and can_create_table=False")
             else:
@@ -556,7 +571,9 @@ class dbmerge:
                 or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Defaults to 10000.
 
         Returns:
-            mergeResult: A dataclass object containing execution statistics (e.g., inserted_row_count, total_time).
+            mergeResult: A dataclass object containing execution statistics (e.g., inserted_row_count, total_time)
+                and the schema changes this merge made to the target table (table_created, added_fields:
+                a {column name: SQLAlchemy type} mapping of the columns that were added).
         """
         
         if self.merge_finished:
@@ -650,7 +667,11 @@ class dbmerge:
                                temp_insert_time = self.temp_insert_time,
                                insert_time = self.insert_time,
                                update_time = self.update_time,
-                               delete_time = self.delete_time)
+                               delete_time = self.delete_time,
+                               table_created = self.table_created,
+                               # copied, so that the result stays a snapshot: the same mapping is
+                               # also readable on the instance, and the two should not share it
+                               added_fields = dict(self.added_fields))
     
         
         except Exception:
@@ -1004,6 +1025,12 @@ class dbmerge:
             # merge adds the remaining ones, so the target converges.
             self.conn.commit()
             op=Operations(MigrationContext.configure(self.conn))
+            # The automatically managed columns are left out of the reported added_fields: they
+            # carry no source data, so a consumer watching for a schema change has nothing to
+            # recompute over them. A delete flag supplied in the data is a data column, and stays.
+            managed = {f for f in (self.merged_on_field, self.inserted_on_field) if f is not None}
+            if self.delete_mark_field is not None and not self.delete_mark_from_data:
+                managed.add(self.delete_mark_field)
             for field_name in self.new_fields:
                 logger.info(f'Creating new field "{field_name}" - {self.new_fields[field_name]}')
                 primary_key = field_name in self.key
@@ -1016,6 +1043,12 @@ class dbmerge:
                 # part way through therefore leaves the columns added so far - they are exactly the
                 # ones the incoming data asked for, and a repeated merge adds the rest.
                 self.conn.commit()
+                # Recorded after the commit, so the mapping holds the columns that are really in
+                # the table - a failed ALTER stops here and does not report the column it did not
+                # add. The type stored is the one the column was created with, after any adjustment
+                # made for the target engine, so it is what the database actually holds.
+                if field_name not in managed:
+                    self.added_fields[field_name] = self.new_fields[field_name]
             self.table = self._load_table_metadata_from_db(self.table_name,self.schema)
                
 

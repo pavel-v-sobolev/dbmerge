@@ -163,6 +163,20 @@ Fields of the returned `mergeResult` (and matching instance attributes):
 - **`insert_time`**: Time taken (in seconds) to perform the target `INSERT` step.
 - **`update_time`**: Time taken (in seconds) to perform the target `UPDATE` step.
 - **`delete_time`**: Time taken (in seconds) to perform the `DELETE` or `MARK` step.
+- **`table_created`**: `True` when this merge created the target table. Its columns are **not** listed in `added_fields` — there was no previous version of the table to add them to.
+- **`added_fields`**: A `{column name: SQLAlchemy type}` mapping of the columns this merge added to an already existing target table. The type is the one the column was really created with, after any adjustment made for the target engine — so on MySQL/MariaDB a string of unknown length appears as `LONGTEXT`, not as the generic `String`. The automatically managed columns (`merged_on_field`, `inserted_on_field`, and an auto-managed `delete_mark_field`) are left out — they carry no source data. A delete flag supplied in `data` is a data column and is reported. With `can_create_columns=False` the mapping stays empty: the missing columns are dropped from the merge instead of being created.
+
+`table_created` and `added_fields` are known once the context manager is entered, so they can also be read off the `dbmerge` instance before `exec()`.
+
+They exist for consumers that maintain a derived dataset incrementally from a `merged_on_field` watermark. Such a consumer can not notice a new column on its own: the watermark only moves on rows whose **values** changed, and adding a column changes no values — every row already in the table keeps its old timestamp and stays outside the increment. `added_fields` is that missing signal, and is typically used to flag the derived dataset for a full recalculation:
+
+```python
+with dbmerge(engine=engine, data=data, table_name="Facts", merged_on_field='merged_on') as merge:
+    result = merge.exec()
+
+if result.added_fields:
+    logger.info(f"Facts gained columns {result.added_fields} - marts built on it need a full rebuild")
+```
 
 The executed SQL statements are exposed only on the `dbmerge` instance (not in `mergeResult`):
 
