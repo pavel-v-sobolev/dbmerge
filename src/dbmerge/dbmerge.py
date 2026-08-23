@@ -118,6 +118,15 @@ MAX_TYPE_DETECTION_ROWS = 10000
 # Maximum length of postgres table name is 63, postgres might need some symbols for "_pkey" suffix.
 MAX_TEMP_TABLE_NAME_LEN = 58
 
+# Staging tables are named tmp_<yymmddHHMMSS>_<table>_<hex8> (see _create_temp_table). The prefix
+# says the table is disposable, the timestamp says when it was created, and the hex keeps parallel
+# merges of one table apart. Postgres records no creation time for a table, so the name is the only
+# place that can carry it - which is what lets a leftover from a crashed process be recognized and
+# dropped by its name alone. The timestamp comes before the table name on purpose: a plain listing
+# of the schema then sorts by age, which is what somebody cleaning up by hand goes by.
+TEMP_TABLE_PREFIX = 'tmp_'
+TEMP_TABLE_TIMESTAMP_FORMAT = '%y%m%d%H%M%S'
+
 # Dialects that require JSONB (not plain JSON) so values can be compared with IS DISTINCT FROM.
 # CockroachDB speaks the postgres wire protocol and natively supports JSONB.
 JSONB_DIALECTS = ('postgresql', 'cockroachdb')
@@ -230,6 +239,10 @@ class dbmerge:
                 indexes at most 3072 bytes per key, shared by all of its columns.
             schema (str | None, optional): The database schema of the target table.
             temp_schema (str | None, optional): The database schema where the temporary staging table will be created.
+                Defaults to schema. The staging table is named tmp_<yymmddHHMMSS>_<table>_<hex8>: a fixed prefix marking it
+                as disposable, the moment of creation by the database clock (first, so that a listing sorts by age), the target
+                table name (truncated to fit the identifier limit) and a random suffix. On PostgreSQL it is UNLOGGED, i.e. persistent, so a process that dies mid-merge leaves it
+                behind - and the name is then the only thing a cleanup job can go by (PostgreSQL stores no creation time).
             source_table_name (str | None, optional): If provided, data will be sourced directly from another existing database table or view. Mutually exclusive with the "data" argument (passing both raises IncorrectParameter).
             source_schema (str | None, optional): The database schema of the source table or view.
             can_create_table (bool, optional): Allows the module to automatically create the target table if it does not exist (default is True).
@@ -1393,8 +1406,6 @@ class dbmerge:
         self.table = Table(self.table_name, self.metadata, *all_cols, schema = self.schema)
         # Created on the merge connection rather than through the engine: with an in-memory SQLite
         # database a second connection is a different database, so the table has to be made here.
-        # Created on the merge connection rather than through the engine: with an in-memory SQLite
-        # database a second connection is a different database, so the table has to be made here.
         # A schema change is committed on its own, whatever commit_all_steps says, and is kept
         # alone in its transaction - the commit before matters as much as the one after.
         # checkfirst=False on purpose: it would put an existence query in front of the CREATE, and
@@ -1414,12 +1425,36 @@ class dbmerge:
             return s
         return encoded[:max_bytes].decode('utf-8', errors='ignore')
 
+    def _temp_table_timestamp(self) -> str:
+        """
+        Creation time for the staging table name, taken from the database clock - the same clock
+        that stamps merged_on. Whoever reads these names later compares them against rows in the
+        database and against other processes' tables, and the hosts running them need not agree on
+        the time; the database is the one clock all of them share.
+        """
+        value = self.conn.scalar(select(self._now()))
+        if isinstance(value, str):
+            # sqlite has no datetime type and returns CURRENT_TIMESTAMP as text.
+            value = datetime.fromisoformat(value)
+        if not isinstance(value, datetime):
+            # Nothing usable came back: the name still has to be built, and a local timestamp is
+            # a better fallback than no timestamp at all.
+            logger.warning(f'Database returned no usable timestamp ({value!r}), '
+                           'naming the staging table by the local clock')
+            value = datetime.now()
+        return value.strftime(TEMP_TABLE_TIMESTAMP_FORMAT)
+
+
     def _create_temp_table(self):
 
-        # '_' and unique_id are ASCII (1 byte each), so we can subtract their char length as bytes
-        max_bytes = MAX_TEMP_TABLE_NAME_LEN - len(self.unique_id) - 1
+        # tmp_<yymmddHHMMSS>_<table>_<hex8>, see TEMP_TABLE_PREFIX. Prefix, timestamp, separators
+        # and unique_id are ASCII (1 byte each), so their char length can be subtracted as bytes;
+        # only the table name part is truncated, so the surrounding parts stay intact and parsable.
+        prefix = TEMP_TABLE_PREFIX + self._temp_table_timestamp() + '_'
+        suffix = '_' + self.unique_id
+        max_bytes = MAX_TEMP_TABLE_NAME_LEN - len(prefix) - len(suffix)
 
-        temp_table_name = self._truncate_to_bytes(self.table_name, max_bytes) + '_' + self.unique_id
+        temp_table_name = prefix + self._truncate_to_bytes(self.table_name, max_bytes) + suffix
 
         # autoincrement=False for the same reason as in _create_table: the staging table is loaded
         # with the key values of the source, never with generated ones.

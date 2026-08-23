@@ -57,7 +57,7 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 
   On MySQL/MariaDB a **string column of the merge key** must be given an explicit length here: InnoDB indexes at most 3072 bytes per key, shared by all of its columns, so no default length is safe.
 - **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name).
-- **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created.
+- **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created. Defaults to `schema`. The table is named `tmp_<yymmddHHMMSS>_<table>_<hex8>` and dropped when the context manager exits — see [The Staging Table](#the-staging-table) for the naming rules and for the leftovers a crash can leave behind on PostgreSQL.
 - **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`.
 - **`source_schema`** *(str | None, optional)*: The database schema of the source table or view.
 - **`can_create_table`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target table if it does not exist.
@@ -183,6 +183,46 @@ The executed SQL statements are exposed only on the `dbmerge` instance (not in `
 - **`insert_sql`**: The exact SQL `INSERT` statement executed against the database.
 - **`update_sql`**: The exact SQL `UPDATE` statement executed against the database.
 - **`delete_sql`**: The exact SQL `DELETE` (or mark) statement executed against the database.
+
+---
+
+## The Staging Table
+
+Every merge loads its data into a staging table first, and drops it when the context manager exits. The name follows a fixed shape:
+
+```
+tmp_260823224826_Facts_0472030e
+│   │            │     └─ random hex, keeps parallel merges of one table apart
+│   │            └─ the target table name
+│   └─ creation time, yymmddHHMMSS
+└─ fixed prefix marking the table as disposable
+```
+
+Each part earns its place. The prefix says the table may be deleted; the timestamp says how old it is; the hex suffix means two processes merging into the same table never collide. The timestamp comes **before** the table name deliberately, so that an ordinary listing of the schema sorts by age — which is what anyone cleaning up by hand goes by.
+
+**Why the name carries a timestamp at all:** PostgreSQL records no creation time for a table, so the name is the only place it can live. That is what makes a leftover recognizable — see below.
+
+The timestamp is read from the **database** clock, the same one that fills `merged_on_field`, because the processes reading these names need not share a clock with each other. It therefore follows the same timezone rules as the audit timestamps in the next section: UTC on SQLite, server-local elsewhere.
+
+**Length.** The whole name is kept within 58 bytes, leaving room under PostgreSQL's 63-byte identifier limit for the `_pkey` suffix it adds to the primary key. Only the middle part — the target table name — is shortened, so the prefix, timestamp and suffix always stay intact and the name stays parsable. Truncation counts bytes, not characters, and never splits a multibyte character:
+
+```
+tmp_260823224826_Fact1Fact2Fact3Fact4Fact5Fact6Fa_7c7f55e5     58 bytes
+tmp_260823194756_Продажи_по_магази_d15633ca                    58 bytes
+```
+
+**Leftovers.** On PostgreSQL the staging table is `UNLOGGED` rather than `TEMPORARY`, which is faster but persistent: a process killed mid-merge leaves it behind in `temp_schema`, and nothing cleans it up automatically. On SQLite, MySQL and MariaDB it is a real `TEMPORARY` table and disappears with the connection. Where leftovers are possible, the name is what lets you find them:
+
+```sql
+-- staging tables older than a day, in creation order
+SELECT tablename FROM pg_tables
+WHERE schemaname = 'tmp'
+  AND tablename LIKE 'tmp\_%'
+  AND substring(tablename from 5 for 12) < to_char(now() - interval '1 day', 'YYMMDDHH24MISS')
+ORDER BY tablename;
+```
+
+Do not drop a staging table just because it looks old: a long-running merge is still using it. Compare against the age of the merges you actually run.
 
 ---
 

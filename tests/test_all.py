@@ -3,6 +3,7 @@ import polars as pl
 import numpy as np
 from datetime import date, datetime
 import time
+import re
 import uuid
 import pytest
 import logging
@@ -15,7 +16,8 @@ from sample_data_in_sqlite import get_data, get_modified_data
 import urllib
 from dbmerge import dbmerge, drop_table_if_exists, format_ms
 # The exceptions are not re-exported from the package root.
-from dbmerge.dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError
+from dbmerge.dbmerge import (IncorrectParameter, IncorrectDataError, NoKeyError,
+                            MAX_TEMP_TABLE_NAME_LEN, TEMP_TABLE_TIMESTAMP_FORMAT)
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
 
@@ -124,6 +126,49 @@ def test_table_create_from_data_with_various_types(engine_name,type_of_data):
                   key=key, data_types=data_types) as merge:
         merge.exec()
         assert merge.inserted_row_count==3, f'Incorrect row count from insert {merge.inserted_row_count}, should be 3'
+
+@pytest.mark.parametrize("engine_name", engines)
+def test_temp_table_name_format(engine_name):
+    # The staging table name is a contract, not cosmetics: on PostgreSQL it is UNLOGGED (persistent),
+    # so a process that dies mid-merge leaves it behind, and a cleanup job has nothing but the name
+    # to go by - PostgreSQL records no creation time for a table. Hence the fixed prefix, the
+    # creation timestamp (leading, so a listing sorts by age) and the random tail, with only the
+    # table name part ever truncated.
+    logger.debug(f'TEST TEMP TABLE NAME FORMAT {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+
+    data=[{'Shop':'123','Product':'123','Date':date(2025,1,1),'Qty':1}]
+    long_name = "Fact1Fact2Fact3Fact4Fact5Fact6Fact7Fact8Fact9Fact10Fact11Fact12"
+    pattern = re.compile(r'^tmp_(\d{12})_(.+)_([0-9a-f]{8})$')
+
+    # exec() drops the staging table and forgets it, so the name is captured as it is created.
+    created_names = []
+    original_create = dbmerge._create_temp_table
+
+    def spy(self):
+        original_create(self)
+        created_names.append(self.temp_table.name)
+
+    dbmerge._create_temp_table = spy
+    try:
+        for table_name in ("Facts", long_name):
+            with dbmerge(engine=engine, data=data, table_name=table_name, schema='target',
+                         temp_schema='tmp', key=key,
+                         data_types={'Shop':String(100),'Product':String(100),'Qty':Integer()}) as merge:
+                merge.exec()
+                temp_name = created_names[-1]
+                match = pattern.match(temp_name)
+                assert match, f'Unexpected temp table name {temp_name}'
+                assert len(temp_name) <= MAX_TEMP_TABLE_NAME_LEN
+                # Only the table name part is truncated, and it keeps its beginning: that is what
+                # tells a human which table the leftover belongs to.
+                assert table_name.startswith(match.group(2))
+                datetime.strptime(match.group(1), TEMP_TABLE_TIMESTAMP_FORMAT)
+    finally:
+        dbmerge._create_temp_table = original_create
+        drop_table_if_exists(engine, long_name, schema='target')
+
 
 @pytest.mark.parametrize("engine_name,type_of_data", [(engine_name,type_of_data) 
                                                      for engine_name in engines 
