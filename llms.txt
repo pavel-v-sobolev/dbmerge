@@ -155,11 +155,11 @@ So SQLite records UTC while every other engine records server-local time, and th
 
 Each merge stages its data in a table named `tmp_<yymmddHHMMSS>_<table>_<hex8>`, e.g. `tmp_260823224826_Facts_0472030e`: a prefix marking it disposable, the creation time from the **database** clock (so its timezone follows the same rules as the audit timestamps above), the target table name, and random hex that keeps parallel merges apart. The timestamp precedes the table name so a plain listing sorts by age. The whole name stays within 58 bytes — under PostgreSQL's 63-byte identifier limit with room for the `_pkey` suffix — and only the table-name part is truncated, on byte boundaries that never split a multibyte character.
 
-It is dropped when the context manager exits. On SQLite/MySQL/MariaDB it is a real `TEMPORARY` table and dies with the connection; on PostgreSQL it is `UNLOGGED`, i.e. persistent, so a process killed mid-merge leaves it behind and the name is the only way to find it (PostgreSQL stores no creation time for a table).
+It is dropped when the context manager exits. On PostgreSQL, SQLite, MySQL and MariaDB it is a real `TEMPORARY` table: session-scoped, invisible to other connections, and removed by the database when the session ends, so a crashed process leaves nothing behind. On PostgreSQL that also keeps the staging data in the session's `temp_buffers` rather than `shared_buffers`, so it never evicts the working set and dropping it does not scan the whole buffer pool. `temp_schema` is quietly ignored there (postgres keeps temporary tables in its own session schema). Only MS SQL Server and CockroachDB get a regular table, and only there can a leftover survive a crash.
 
 ## Database-specific notes
 
-- **PostgreSQL:** staging tables are created `UNLOGGED` (persistent, so a hard crash can leave one behind in `temp_schema`; find leftovers by name — see Staging table below).
+- **PostgreSQL:** staging tables are `TEMPORARY`, so they stay out of `shared_buffers` and vanish with the session; `temp_schema` does not apply and is quietly ignored.
 - **MySQL/MariaDB:** `schema` is required. A **string column of the merge key** needs an explicit length (`data_types={'col': String(100)}`) because InnoDB shares one 3072-byte index budget between all key columns; other string columns become `LONGTEXT` automatically. Timezone-aware datetimes lose their UTC offset — no MySQL type stores one. Default collation ignores case and trailing spaces, so `'test'` and `' Test'` may not register as a change.
 - **SQLite:** no schema support; `schema`/`temp_schema` are reset to `None` with a warning.
 - **MS SQL Server:** bulk inserts are slower because of `pyodbc` limitations.

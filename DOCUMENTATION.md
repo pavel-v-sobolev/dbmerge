@@ -57,7 +57,7 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 
   On MySQL/MariaDB a **string column of the merge key** must be given an explicit length here: InnoDB indexes at most 3072 bytes per key, shared by all of its columns, so no default length is safe.
 - **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name).
-- **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created. Defaults to `schema`. The table is named `tmp_<yymmddHHMMSS>_<table>_<hex8>` and dropped when the context manager exits — see [The Staging Table](#the-staging-table) for the naming rules and for the leftovers a crash can leave behind on PostgreSQL.
+- **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created. Defaults to `schema`. The table is named `tmp_<yymmddHHMMSS>_<table>_<hex8>` and dropped when the context manager exits — see [The Staging Table](#the-staging-table) for the naming rules and for how it is created on each engine. Quietly ignored on PostgreSQL, which keeps temporary tables in its own session schema.
 - **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`.
 - **`source_schema`** *(str | None, optional)*: The database schema of the source table or view.
 - **`can_create_table`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target table if it does not exist.
@@ -211,15 +211,21 @@ tmp_260823224826_Fact1Fact2Fact3Fact4Fact5Fact6Fa_7c7f55e5     58 bytes
 tmp_260823194756_Продажи_по_магази_d15633ca                    58 bytes
 ```
 
-**Leftovers.** On PostgreSQL the staging table is `UNLOGGED` rather than `TEMPORARY`, which is faster but persistent: a process killed mid-merge leaves it behind in `temp_schema`, and nothing cleans it up automatically. On SQLite, MySQL and MariaDB it is a real `TEMPORARY` table and disappears with the connection. Where leftovers are possible, the name is what lets you find them:
+**Lifetime.** On PostgreSQL, SQLite, MySQL and MariaDB the staging table is a real `TEMPORARY` table: it belongs to the session that created it, is invisible to every other connection, and the database removes it when that session ends — so even a process killed mid-merge leaves nothing behind.
+
+On PostgreSQL this also keeps the staging data out of `shared_buffers` entirely; it is cached in the session's own `temp_buffers` instead. Two things follow on a busy server: the staging data never evicts the real working set, and dropping the table does not make PostgreSQL scan the whole buffer pool (a cost that grows with `shared_buffers` and is paid again on every standby replaying the drop). Measured on a 14 MB staging table: an `UNLOGGED` table occupied 1277 pages of `shared_buffers`, a `TEMPORARY` one occupied none, with no difference in merge time.
+
+Because PostgreSQL keeps temporary tables in its own per-session schema, `temp_schema` does not apply there and is quietly ignored.
+
+**Leftovers** are therefore only possible on engines that get a regular table instead — MS SQL Server and CockroachDB. There the name is what lets you find them:
 
 ```sql
 -- staging tables older than a day, in creation order
-SELECT tablename FROM pg_tables
-WHERE schemaname = 'tmp'
-  AND tablename LIKE 'tmp\_%'
-  AND substring(tablename from 5 for 12) < to_char(now() - interval '1 day', 'YYMMDDHH24MISS')
-ORDER BY tablename;
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'tmp'
+  AND table_name LIKE 'tmp\_%'
+  AND substring(table_name, 5, 12) < to_char(now() - interval '1 day', 'YYMMDDHH24MISS')
+ORDER BY table_name;
 ```
 
 Do not drop a staging table just because it looks old: a long-running merge is still using it. Compare against the age of the merges you actually run.

@@ -105,7 +105,7 @@ Here is a rough performance comparison for synchronizing data of different sizes
 ## Database-Specific Notes & Limitations
 
 - **PostgreSQL:** 
-  - Temporary tables are created as `UNLOGGED`. 
+  - Staging tables are real `TEMPORARY` tables, they are invisible to other connections and vanish with the session. `temp_schema` does not apply here and is quietly ignored — PostgreSQL keeps temporary tables in its own session schema.
   - `JSONB` type is supported, but not `JSON` (as it cannot be compared to detect changes).
 - **MariaDB / MySQL:** 
   - Does not detect changes in uppercase vs. lowercase or space padding by default (e.g., `'test' == ' Test'`). If this is important, you need to change the collation settings in your database.

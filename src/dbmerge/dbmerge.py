@@ -241,8 +241,10 @@ class dbmerge:
             temp_schema (str | None, optional): The database schema where the temporary staging table will be created.
                 Defaults to schema. The staging table is named tmp_<yymmddHHMMSS>_<table>_<hex8>: a fixed prefix marking it
                 as disposable, the moment of creation by the database clock (first, so that a listing sorts by age), the target
-                table name (truncated to fit the identifier limit) and a random suffix. On PostgreSQL it is UNLOGGED, i.e. persistent, so a process that dies mid-merge leaves it
-                behind - and the name is then the only thing a cleanup job can go by (PostgreSQL stores no creation time).
+                table name (truncated to fit the identifier limit) and a random suffix. On PostgreSQL, SQLite, MySQL and MariaDB it is a
+                TEMPORARY table: session-scoped, kept out of shared_buffers, and removed by the database when the session ends, so a
+                crashed process leaves nothing behind. PostgreSQL keeps temporary tables in its own session schema, so temp_schema
+                does not apply there and is quietly dropped. Only MS SQL Server and CockroachDB get a regular table that can be left over.
             source_table_name (str | None, optional): If provided, data will be sourced directly from another existing database table or view. Mutually exclusive with the "data" argument (passing both raises IncorrectParameter).
             source_schema (str | None, optional): The database schema of the source table or view.
             can_create_table (bool, optional): Allows the module to automatically create the target table if it does not exist (default is True).
@@ -302,6 +304,13 @@ class dbmerge:
                 if self.source_schema is None and self.source_table_name is not None:
                     raise IncorrectParameter(f"""MariaDB/MySQL require "source_schema" argument to be set 
                                              to your database name, corresponding to your "source_table".""")
+
+            if dialect_name == 'postgresql':
+                # A TEMPORARY table always lives in the session's own temp schema: postgres rejects
+                # "CREATE TEMPORARY TABLE <schema>.<name>" with "cannot create temporary relation
+                # in non-temporary schema". Dropped quietly - the caller has nothing to fix, the
+                # staging table is put where the engine keeps such tables anyway.
+                self.temp_schema = None
 
             if dialect_name in ['sqlite']:
                 if schema is not None:
@@ -1464,16 +1473,12 @@ class dbmerge:
         # As everywhere else, the schema change is kept alone in its own transaction.
         self.conn.commit()
 
-        if self.engine.dialect.name =='postgresql':
-            self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
-                                    prefixes=['UNLOGGED'])
-            # postgresql_on_commit='PRESERVE ROWS' should be used for TEMP table,
-            # but looks like UNLOGGED is performing better then TEMP.
-            # Note: UNLOGGED is a persistent table (unlike TEMP), so if the process crashes before
-            # _drop_temp_table() runs, the table is left behind in temp_schema and is not auto-cleaned.
-            self.temp_table.create(bind=self.conn, checkfirst=False)
-
-        elif self.engine.dialect.name in ('mariadb','mysql','sqlite'):
+        # A TEMPORARY table lives in the session's own local buffers, so the staging data never
+        # enters shared_buffers: it neither evicts the real working set nor makes every DROP scan
+        # the whole buffer pool, which is what an UNLOGGED table costs on a server with large
+        # shared_buffers. It also disappears with the session, so a crashed process leaves nothing
+        # behind. Rows survive the commits between merge phases: ON COMMIT PRESERVE ROWS is the default.
+        if self.engine.dialect.name in ('postgresql','mariadb','mysql','sqlite'):
             self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
                                     prefixes=['TEMPORARY'])
             self.temp_table.create(bind=self.conn, checkfirst=False)
