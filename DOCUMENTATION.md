@@ -340,7 +340,18 @@ A `NULL` arriving for a column that is not `Nullable` fails the load. It is not 
 4. **Mark** writes a new version of each row missing from the source, with `delete_mark_field` set.
 5. **Delete** is a lightweight `DELETE` of every version of the keys missing from the source.
 
-The conditions of `exec()` are built on `merge.table` and `merge.temp_table` as everywhere else. In `update_condition` and `delete_condition`, `merge.table` stands for the current version of the row. A correlated subquery in a condition needs a newer server: it fails on 23.8 and 24.8, and works on 26.9.
+The conditions of `exec()` are built on `merge.table` and `merge.temp_table` as everywhere else. In `update_condition` and `delete_condition`, `merge.table` stands for the current version of the row.
+
+DBMerge itself needs nothing beyond ClickHouse 23.8: its own statements use only joins and `IN` / `NOT IN` over subqueries that do not refer to the outer row. A condition you write yourself may need a newer server, though — when it holds a **correlated subquery**, one that refers to the row being checked, like the `EXISTS` guard in [Conditional Insert Example](#execution-exec): `g.c['category'] == merge.temp_table.c['category']` inside it refers to the staging row. ClickHouse runs such a condition out of the box from 25.8 on; on 25.4–25.7 only with the setting `allow_experimental_correlated_subqueries = 1`, which can go into the engine URL (`clickhousedb://…/default?allow_experimental_correlated_subqueries=1`); 25.3 and older can not run it at all. On an older server, write the same condition with `NOT IN` over a subquery that stands on its own:
+
+```python
+from sqlalchemy import select
+
+with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
+    # The guard above, without a correlated subquery: ClickHouse 23.8 runs it.
+    locked = select(merge.table.c['category']).where(merge.table.c['locked'] == True)
+    result = merge.exec(insert_condition=merge.temp_table.c['category'].not_in(locked))
+```
 
 The statistics differ slightly from the other engines:
 

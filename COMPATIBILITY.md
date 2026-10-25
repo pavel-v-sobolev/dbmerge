@@ -110,8 +110,7 @@ CockroachDB runs `SERIALIZABLE` transactions by default. A merge step over many 
 
 ### ClickHouse
 
-ClickHouse merges work differently from every other database; see [ClickHouse](DOCUMENTATION.md#clickhouse) in the documentation. What depends on the server version:
+ClickHouse merges work differently from every other database; see [ClickHouse](DOCUMENTATION.md#clickhouse) in the documentation.
 
-- **23.8** is the oldest version DBMerge accepts.
-- **A correlated subquery** in `update_condition`, `insert_condition` or `delete_condition` — such as the `EXISTS` guard in the documentation — fails on 23.8 and 24.8 and works on 26.9.
+- **23.8** is the oldest version DBMerge accepts; every merge works from there on.
 - `source_table_name` is not supported on ClickHouse.

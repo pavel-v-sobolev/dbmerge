@@ -1,4 +1,4 @@
-name: Test ClickHouse
+name: ClickHouse
 
 on:
   push:

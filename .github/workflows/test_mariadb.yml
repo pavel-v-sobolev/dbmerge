@@ -1,4 +1,4 @@
-name: Test MariaDB
+name: MariaDB
 
 on:
   push:

@@ -1,4 +1,4 @@
-name: Test MSSQL
+name: MSSQL
 
 on:
   push:

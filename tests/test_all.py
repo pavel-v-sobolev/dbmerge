@@ -832,7 +832,8 @@ def test_insert_condition(engine_name):
     logger.debug(f'TEST INSERT_CONDITION {engine_name}')
     engine = make_engine(engine_name)
     if engine_name == 'clickhouse':
-        # ClickHouse has correlated subqueries only since 25.x, and the condition below is one.
+        # ClickHouse has correlated subqueries by default since 25.8 (behind a setting in 25.4-25.7), and the
+        # condition below is one.
         with engine.connect() as conn:
             try:
                 conn.exec_driver_sql('SELECT 1 FROM (SELECT 1 AS a) AS x '
