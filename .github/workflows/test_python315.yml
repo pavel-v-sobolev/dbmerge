@@ -1,0 +1,45 @@
+name: Test Python 3.15
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test_python315:
+    name: ${{ matrix.engine }}, Python 3.15
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [sqlite, duckdb]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Not "uv sync": uv.lock pins packages that have no Python 3.15 wheels yet (pyarrow 25, pyodbc), so the
+      # latest releases are installed instead, as a user on Python 3.15 gets them.
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.15
+          uv pip install -e . pytest pandas polars pyarrow duckdb_engine
+
+      - name: Create data directory
+        run: mkdir -p data
+
+      - name: Initialize sample data
+        run: |
+          uv run --no-sync python tests/sample_data_in_sqlite.py
+
+      - name: Run pytest
+        env:
+          DBMERGE_TEST_ENGINES: ${{ matrix.engine }}
+        run: |
+          uv run --no-sync pytest tests/test_all.py -v --tb=short
