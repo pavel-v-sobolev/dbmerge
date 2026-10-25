@@ -1,0 +1,53 @@
+name: Test DuckDB
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test_duckdb:
+    name: duckdb, SQLAlchemy ${{ matrix.sqlalchemy }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sqlalchemy: ['2.0', '2.1']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install DB system libraries
+        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev libpq-dev
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+
+      # uv.lock pins SQLAlchemy 2.0; "uv run --no-sync" below keeps the upgrade.
+      - name: Install SQLAlchemy 2.1
+        if: matrix.sqlalchemy == '2.1'
+        run: uv pip install "sqlalchemy~=2.1.0"
+
+      - name: Create data directory
+        run: mkdir -p data
+
+      - name: Initialize sample data
+        run: |
+          uv run --no-sync python tests/sample_data_in_sqlite.py
+
+      - name: Run pytest
+        env:
+          DBMERGE_TEST_ENGINES: duckdb
+        run: |
+          uv run --no-sync pytest tests/test_all.py -v --tb=short

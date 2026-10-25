@@ -1,20 +1,24 @@
 import pandas as pd
 import polars as pl
 import numpy as np
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 import time
+import os
 import re
 import uuid
+import decimal
 import pytest
 import logging
 
-from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_
-from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, JSON, Uuid, StaticPool
+from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_, cast, type_coerce
+from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, Double, JSON, Uuid, StaticPool
 from sqlalchemy import types
+from sqlalchemy.exc import NoSuchModuleError
 
 from sample_data_in_sqlite import get_data, get_modified_data
 import urllib
 from dbmerge import dbmerge, drop_table_if_exists, format_ms
+from dbmerge.duckdb import read_table as read_duckdb_table
 # The exceptions are not re-exported from the package root.
 from dbmerge.dbmerge import (IncorrectParameter, IncorrectDataError, NoKeyError,
                             MAX_TEMP_TABLE_NAME_LEN, TEMP_TABLE_TIMESTAMP_FORMAT)
@@ -36,13 +40,40 @@ mssql_settings = urllib.parse.quote_plus(
 
 engines = {'sqlite':"""sqlite:///data/data.sqlite""",
            'postgres':"""postgresql+psycopg2://postgres:postgres@localhost:5432/dbmerge""",
+           'postgres-psycopg':"postgresql+psycopg://postgres:postgres@localhost:5432/dbmerge",
+           'postgres-pg8000':"postgresql+pg8000://postgres:postgres@localhost:5432/dbmerge",
            'mariadb':"""mariadb+mariadbconnector://root:root@127.0.0.1:3306""",
+           'mysql-pymysql':"mysql+pymysql://root:root@127.0.0.1:3307",
+           'mysql-connector':"mysql+mysqlconnector://root:root@127.0.0.1:3307",
+           'mysql-mysqlclient':"mysql+mysqldb://root:root@127.0.0.1:3307",
            'mssql':f"mssql+pyodbc:///?odbc_connect={mssql_settings}",
+           'mssql-pymssql':"mssql+pymssql://sa:MSSQL.test_pass@localhost:1433/master",
+           # SQLAlchemy 2.1 and newer only
+           'mssql-python':"mssql+mssqlpython://sa:MSSQL.test_pass@localhost:1433/master?TrustServerCertificate=yes",
            'cockroachdb':f"cockroachdb://root@localhost:26257/defaultdb?sslmode=disable",
-           #'duckdb':'duckdb:///:memory:',
-           #'duckdb':'duckdb:///data/data.ddb'
+           'cockroachdb-psycopg':"cockroachdb+psycopg://root@localhost:26257/defaultdb?sslmode=disable",
+           'clickhouse':"clickhousedb://default:@localhost:8123/default",
+           # a file, not :memory: - every connection to :memory: is a database of its own, so the
+           # checks below would not see what the merge wrote
+           'duckdb':'duckdb:///data/data.ddb',
            #'oracle':"oracle+oracledb://system:oracle@localhost/?service_name=XEPDB1"
          }
+
+# Any URL above can be replaced from the environment, e.g. DBMERGE_TEST_URL_CLICKHOUSE for another server
+# version, or DBMERGE_TEST_URL_MYSQL_PYMYSQL for another port.
+for _name in engines:
+    _override = os.environ.get('DBMERGE_TEST_URL_' + _name.upper().replace('-', '_'))
+    if _override:
+        engines[_name] = _override
+
+# DBMERGE_TEST_ENGINES=postgres,postgres-pg8000 runs the tests of these engines only. A substring for -k
+# would not do: "mssql" is also part of "mssql-pymssql" and "mssql-python".
+if os.environ.get('DBMERGE_TEST_ENGINES'):
+    _selected = os.environ['DBMERGE_TEST_ENGINES'].split(',')
+    _unknown = [name for name in _selected if name not in engines]
+    if _unknown:
+        raise ValueError(f'DBMERGE_TEST_ENGINES: unknown engines {_unknown}, known are {list(engines)}')
+    engines = {name: url for name, url in engines.items() if name in _selected}
 
 
 def make_engine(engine_name):
@@ -52,9 +83,14 @@ def make_engine(engine_name):
     # the transaction's read-timestamp refresh and fail COMMIT with a transient RETRY_SERIALIZABLE.
     # CockroachDB expects the client to retry such transactions; dbmerge does not, so the tests ask
     # for READ COMMITTED, where CockroachDB retries statements internally.
-    if engine_name == 'cockroachdb':
-        return create_engine(engines[engine_name], isolation_level='READ COMMITTED')
-    return create_engine(engines[engine_name])
+    # An engine whose dialect or driver is not installed here (mssql-python needs SQLAlchemy 2.1, for one)
+    # is skipped rather than failed.
+    try:
+        if engine_name.startswith('cockroachdb'):
+            return create_engine(engines[engine_name], isolation_level='READ COMMITTED')
+        return create_engine(engines[engine_name])
+    except (NoSuchModuleError, ImportError) as e:
+        pytest.skip(f'{engine_name} is not available here: {e}')
 
 
 
@@ -62,10 +98,28 @@ key = ['Shop','Product','Date']
 data_types = {'Shop':String(100),'Product':String(100)}
 
 
-def _reflect_facts(engine):
+def _reflect_facts(engine, table_name='Facts'):
     # sqlite does not support schemas - dbmerge stores the table without one there.
     schema = None if engine.dialect.name=='sqlite' else 'target'
-    return Table('Facts', MetaData(), autoload_with=engine, schema=schema)
+    if engine.dialect.name == 'duckdb':
+        # SQLAlchemy can not reflect a DuckDB table correctly, so it is read the way dbmerge reads it.
+        with engine.connect() as conn:
+            return read_duckdb_table(conn, MetaData(), table_name, schema)
+    return Table(table_name, MetaData(), autoload_with=engine, schema=schema)
+
+
+def _final_on_clickhouse(engine, stmt, tbl):
+    # ReplacingMergeTree keeps the replaced versions of a row until its parts are merged, so on
+    # ClickHouse the rows are read as they are now: FINAL.
+    if engine.dialect.name == 'clickhousedb':
+        from clickhouse_connect.cc_sqlalchemy.sql import final
+        return final(stmt, tbl)
+    return stmt
+
+
+def skip_on_clickhouse_source_table(engine_name):
+    if engine_name == 'clickhouse':
+        pytest.skip('source_table_name is not supported on ClickHouse')
 
 
 def count_all_rows(engine, date_from=None, date_to=None):
@@ -75,7 +129,7 @@ def count_all_rows(engine, date_from=None, date_to=None):
     if date_from is not None and date_to is not None:
         stmt = stmt.where(tbl.c['Date'].between(date_from, date_to))
     with engine.connect() as conn:
-        return conn.execute(stmt).scalar()
+        return conn.execute(_final_on_clickhouse(engine, stmt, tbl)).scalar()
 
 
 def count_deleted_rows(engine, date_from=None, date_to=None):
@@ -85,7 +139,7 @@ def count_deleted_rows(engine, date_from=None, date_to=None):
     if date_from is not None and date_to is not None:
         stmt = stmt.where(tbl.c['Date'].between(date_from, date_to))
     with engine.connect() as conn:
-        return conn.execute(stmt).scalar()
+        return conn.execute(_final_on_clickhouse(engine, stmt, tbl)).scalar()
 
 
 def get_qty(engine, shop, product):
@@ -93,11 +147,12 @@ def get_qty(engine, shop, product):
     tbl = _reflect_facts(engine)
     stmt = select(tbl.c['Qty']).where((tbl.c['Shop'] == shop) & (tbl.c['Product'] == product))
     with engine.connect() as conn:
-        return conn.execute(stmt).scalar()
+        return conn.execute(_final_on_clickhouse(engine, stmt, tbl)).scalar()
 
 
 def prepare_and_clean_data(engine):
     drop_table_if_exists(engine,'Facts',schema='target')
+    drop_table_if_exists(engine,'Facts_bulk',schema='target')
     drop_table_if_exists(engine,'Facts_source',schema='source')
     drop_table_if_exists(engine,'Fact1Fact2Fact3Fact4Fact5Fact6Fact7Fact8Fact9Fact10Fact11Fact12',schema='target')
 
@@ -235,6 +290,8 @@ def test_empty_data_updates(engine_name,type_of_data):
         merge.exec()
         assert merge.deleted_row_count==3, f'Incorrect row count from delete {merge.deleted_row_count}, should be 3'
 
+    if engine_name == 'clickhouse':
+        return  # source_table_name is not supported on ClickHouse
 
     with dbmerge(engine=engine, table_name="Facts_empty", schema='target', temp_schema='tmp',delete_mode='delete',
                  source_table_name = 'Facts', source_schema = 'target', key=key) as merge:
@@ -678,6 +735,7 @@ def test_a_set_from_temp_with_deletion(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_update_from_source_table_with_delete_in_a_period(engine_name,type_of_data):
     logger.debug(f'TEST UPDATE FROM SOURCE TABLE WITH DELETE/UPDATE OF IN A SET {engine_name} {type_of_data}')
+    skip_on_clickhouse_source_table(engine_name)
     engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
@@ -773,6 +831,14 @@ def test_insert_condition(engine_name):
     # greater version is left fully untouched, while the rest is refreshed from the source.
     logger.debug(f'TEST INSERT_CONDITION {engine_name}')
     engine = make_engine(engine_name)
+    if engine_name == 'clickhouse':
+        # ClickHouse has correlated subqueries only since 25.x, and the condition below is one.
+        with engine.connect() as conn:
+            try:
+                conn.exec_driver_sql('SELECT 1 FROM (SELECT 1 AS a) AS x '
+                                     'WHERE EXISTS (SELECT 1 FROM (SELECT 1 AS b) AS y WHERE y.b = x.a)')
+            except Exception:
+                pytest.skip('this ClickHouse server has no correlated subqueries, which the condition here uses')
     prepare_and_clean_data(engine)
     k = ['Shop', 'Product']
     dt = {'Shop': String(100), 'Product': String(100)}
@@ -803,8 +869,8 @@ def test_insert_condition(engine_name):
 
     tbl = _reflect_facts(engine)
     with engine.connect() as conn:
-        rows = {(r.Shop, r.Product): (r.Qty, r.version) for r in conn.execute(
-            select(tbl.c['Shop'], tbl.c['Product'], tbl.c['Qty'], tbl.c['version'])).all()}
+        rows = {(r.Shop, r.Product): (r.Qty, r.version) for r in conn.execute(_final_on_clickhouse(engine,
+            select(tbl.c['Shop'], tbl.c['Product'], tbl.c['Qty'], tbl.c['version']), tbl)).all()}
 
     # group A has a greater version -> left untouched: new row (A,3) not inserted, existing rows kept
     assert ('A', '3') not in rows, 'insert_condition must block inserting into a group with a greater version'
@@ -836,8 +902,8 @@ def test_skip_compare_fields(engine_name):
     def get_row():
         tbl = _reflect_facts(engine)
         with engine.connect() as conn:
-            return conn.execute(select(tbl.c['Qty'], tbl.c['version'], tbl.c['Merged On'])
-                                .where(tbl.c['Shop'] == 'S')).one()._mapping
+            return conn.execute(_final_on_clickhouse(engine, select(tbl.c['Qty'], tbl.c['version'], tbl.c['Merged On'])
+                                .where(tbl.c['Shop'] == 'S'), tbl)).one()._mapping
 
     merge_row(qty=1, version=5)
     seeded = get_row()
@@ -877,8 +943,8 @@ def test_delete_mark_values(engine_name):
 
     tbl = _reflect_facts(engine)
     with engine.connect() as conn:
-        seeded_merged_on = conn.execute(select(tbl.c['Merged On'])
-                                        .where(tbl.c['Product'] == 'B')).scalar()
+        seeded_merged_on = conn.execute(_final_on_clickhouse(engine, select(tbl.c['Merged On'])
+                                        .where(tbl.c['Product'] == 'B'), tbl)).scalar()
 
     # product B is gone from the source -> marked, and stamped with the new version
     time.sleep(1)   # some engines keep merged_on at second resolution
@@ -891,8 +957,8 @@ def test_delete_mark_values(engine_name):
 
     tbl = _reflect_facts(engine)
     with engine.connect() as conn:
-        rows = {r.Product: r._mapping for r in conn.execute(
-            select(tbl.c['Product'], tbl.c['Deleted'], tbl.c['version'], tbl.c['Merged On'])).all()}
+        rows = {r.Product: r._mapping for r in conn.execute(_final_on_clickhouse(engine,
+            select(tbl.c['Product'], tbl.c['Deleted'], tbl.c['version'], tbl.c['Merged On']), tbl)).all()}
 
     assert rows['B']['Deleted'], 'row missing from the source must be marked'
     assert rows['B']['version'] == 9, 'delete_mark_values must be stamped on the marked row'
@@ -972,7 +1038,7 @@ def test_data_types_for_managed_field(engine_name):
         assert col in tbl.c, f'managed column "{col}" was not created from data_types'
 
     with engine.connect() as conn:
-        row = conn.execute(select(tbl.c['Merged On'], tbl.c['Inserted On'], tbl.c['Deleted'])).one()
+        row = conn.execute(_final_on_clickhouse(engine, select(tbl.c['Merged On'], tbl.c['Inserted On'], tbl.c['Deleted']), tbl)).one()
     assert row[0] is not None and row[1] is not None, 'the merge must fill the audit timestamps'
     assert not row[2], 'a freshly inserted row must not be marked as deleted'
 
@@ -1016,26 +1082,39 @@ def test_parameter_conflicts_raise_domain_errors(engine_name):
 
 
 @pytest.mark.parametrize("engine_name", list(engines))
-def test_auto_types_keep_fraction_and_microseconds(engine_name):
+def test_auto_types_keep_fraction_and_microseconds(engine_name, request):
     # A column created automatically must keep the value it was created from. The generic types are
     # resolved differently per engine, and some of them round unless the precision is stated.
     logger.debug(f'TEST AUTO TYPES KEEP PRECISION {engine_name}')
+    if engine_name == 'mssql-pymssql':
+        # The driver itself sends a datetime parameter with milliseconds only (COMPATIBILITY.md).
+        request.applymarker(pytest.mark.xfail(reason='pymssql truncates microseconds to milliseconds', strict=True))
     engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
     stamp = datetime(2026, 8, 2, 12, 34, 56, 987654)
-    data = [{'Shop': 'S', 'Product': 'A', 'Price': 1.75, 'Stamp': stamp}]
+    # More digits than a decimal of a default scale or a 4-byte float keep.
+    price = 0.1234567890123
+    data = [{'Shop': 'S', 'Product': 'A', 'Price': price, 'Stamp': stamp}]
 
-    with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
-                 data_types={'Shop': String(100), 'Product': String(100)},
-                 key=['Shop', 'Product']) as merge:
-        merge.exec()
+    # The second merge goes into the table the first one created: its staging table is typed after the
+    # target as read back from the database, so the value has to survive that reading too.
+    for round_no in (1, 2):
+        with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                     data_types={'Shop': String(100), 'Product': String(100)},
+                     key=['Shop', 'Product']) as merge:
+            result = merge.exec()
+        if round_no == 2:
+            assert result.updated_row_count == 0, 'the same data merged again must change nothing'
 
-    tbl = _reflect_facts(engine)
-    with engine.connect() as conn:
-        row = conn.execute(select(tbl.c['Price'], tbl.c['Stamp'])).one()
+        tbl = _reflect_facts(engine)
+        # Read as a float: SQLAlchemy turns a NUMERIC of SQLite into a Decimal of 10 digits on the way
+        # back, whatever is stored.
+        stmt = select(type_coerce(tbl.c['Price'], Double), tbl.c['Stamp'])
+        with engine.connect() as conn:
+            row = conn.execute(_final_on_clickhouse(engine, stmt, tbl)).one()
 
-    assert float(row[0]) == 1.75, f'the fraction must survive the round trip, got {row[0]!r}'
-    assert row[1].microsecond == 987654, f'microseconds must survive the round trip, got {row[1]!r}'
+        assert row[0] == price, f'the fraction must survive merge {round_no}, got {row[0]!r}'
+        assert row[1].microsecond == 987654, f'microseconds must survive merge {round_no}, got {row[1]!r}'
 
 
 @pytest.mark.parametrize("engine_name", list(engines))
@@ -1061,7 +1140,7 @@ def test_auto_string_length_policy(engine_name):
 
     tbl = _reflect_facts(engine)
     with engine.connect() as conn:
-        stored = conn.execute(select(tbl.c['Note'])).scalar()
+        stored = conn.execute(_final_on_clickhouse(engine, select(tbl.c['Note']), tbl)).scalar()
     assert len(stored) == len(long_note), f'the string was truncated to {len(stored)} characters'
 
 
@@ -1086,7 +1165,7 @@ def test_skip_compare_fields_covering_every_column(engine_name):
 
     tbl = _reflect_facts(engine)
     with engine.connect() as conn:
-        assert conn.execute(select(tbl.c['version'])).scalar() == 5, 'the skipped column stays as inserted'
+        assert conn.execute(_final_on_clickhouse(engine, select(tbl.c['version']), tbl)).scalar() == 5, 'the skipped column stays as inserted'
 
 
 @pytest.mark.parametrize("engine_name", list(engines))
@@ -1110,7 +1189,7 @@ def test_skip_compare_fields_still_resurrects_marked_row(engine_name):
         tbl = _reflect_facts(engine)
         with engine.connect() as conn:
             return {r.Product: r.Deleted for r in
-                    conn.execute(select(tbl.c['Product'], tbl.c['Deleted'])).all()}
+                    conn.execute(_final_on_clickhouse(engine, select(tbl.c['Product'], tbl.c['Deleted']), tbl)).all()}
 
     merge_rows(['A', 'B'], 5)
     merge_rows(['A'], 6)
@@ -1142,7 +1221,7 @@ def test_skip_update_wins_over_skip_compare(engine_name):
 
     tbl = _reflect_facts(engine)
     with engine.connect() as conn:
-        row = conn.execute(select(tbl.c['Qty'], tbl.c['Note'])).one()
+        row = conn.execute(_final_on_clickhouse(engine, select(tbl.c['Qty'], tbl.c['Note']), tbl)).one()
     assert row[0] == 42, 'the compared column is updated'
     assert row[1] == 'first', 'skip_update_fields wins: the column keeps its inserted value'
 
@@ -1184,7 +1263,10 @@ def test_reported_schema_changes(engine_name):
     added_type = result.added_fields['Note']
     assert isinstance(added_type, types.TypeEngine), f'expected a SQLAlchemy type, got {added_type!r}'
     tbl = _reflect_facts(engine)
-    assert isinstance(tbl.c['Note'].type, String), f'"Note" is {tbl.c["Note"].type} in the database'
+    note_type = tbl.c['Note'].type
+    # ClickHouse types reflect as clickhouse-connect's own classes, not as subclasses of String
+    is_string = isinstance(note_type, String) or (engine_name == 'clickhouse' and 'String' in note_type.name)
+    assert is_string, f'"Note" is {note_type} in the database'
 
     # can_create_columns=False: the column is dropped from the merge instead of being created,
     # so there is no schema change to report.
@@ -1195,6 +1277,103 @@ def test_reported_schema_changes(engine_name):
     tbl = _reflect_facts(engine)
     assert 'Extra' not in tbl.c, 'the column was really not created'
 
+
+def _parity_data(type_of_data, postgres_family=False):
+    # Values that a loader can get wrong: an empty string next to NULL, quotes, separators and line breaks,
+    # a large integer, microseconds, time zones, dates far from today, JSON, UUID, and NULL everywhere.
+    # The UUIDs are proper version 4 ones: the native UUID type of MariaDB, which SQLAlchemy 2.1 creates for
+    # Uuid, refuses others.
+    utc = timezone.utc
+    msk = timezone(timedelta(hours=3))
+    data = [{'Shop': 'S1', 'Product': 'p1', 'Date': date(2025, 1, 1), 'Qty': 1, 'Price': 1.25, 'Flag': True,
+             'Note': 'plain', 'Stamp': datetime(2025, 1, 1, 12, 0, 0, 123456),
+             'StampTz': datetime(2025, 1, 1, 12, 0, tzinfo=utc), 'Old': date(1950, 5, 5),
+             'Data': {'a': [1, 2], 'b': 'x"y'}, 'uuid': uuid.UUID('12345678-1234-4678-9234-567812345678')},
+            {'Shop': 'S1', 'Product': 'p2', 'Date': date(2025, 1, 2), 'Qty': None, 'Price': None, 'Flag': None,
+             'Note': '', 'Stamp': None, 'StampTz': None, 'Old': None, 'Data': None, 'uuid': None},
+            {'Shop': 'S2', 'Product': 'p1', 'Date': date(2025, 1, 3), 'Qty': -2**40, 'Price': -0.5, 'Flag': False,
+             'Note': 'quote " comma , newline \n tab \t backslash \\ unicode ёж', 'Stamp': datetime(1999, 12, 31, 23, 59, 59),
+             'StampTz': datetime(2025, 6, 1, 12, 0, tzinfo=msk), 'Old': date(2100, 1, 1),
+             'Data': {'a': [], 'b': ''}, 'uuid': uuid.UUID('87654321-4321-4765-8321-876543218765')}]
+    data_types = {'Shop': String(100), 'Product': String(100), 'uuid': Uuid()}
+    if postgres_family:
+        # An aware datetime headed for a column without a time zone: each driver converts it its own way,
+        # and COPY must repeat what the driver does. (MySQL drivers refuse or mangle such values outright.)
+        for row, value in zip(data, (datetime(2025, 1, 1, 12, 0, tzinfo=utc), None,
+                                     datetime(2025, 6, 1, 12, 0, tzinfo=msk))):
+            row['StampTzToNaive'] = value
+        data_types['StampTzToNaive'] = DateTime(timezone=False)
+    if type_of_data == 'dict of list':
+        data = {k: [d[k] for d in data] for k in data[0].keys()}
+    elif type_of_data == 'pandas':
+        data = pd.DataFrame(data)
+    elif type_of_data == 'polars':
+        data = pl.DataFrame(data)
+    return data, data_types
+
+
+def _stored_as_text(engine, engine_name, table_name):
+    # Compared as the text the database itself renders the values to, so that no driver conversion on the
+    # way back can hide a difference.
+    tbl = _reflect_facts(engine, table_name)
+    # ClickHouse casts to a non-nullable String and fails on NULL, toString keeps it nullable
+    as_text = (lambda c: func.toString(c)) if engine_name == 'clickhouse' else (lambda c: cast(c, String(4000)))
+    stmt = select(*[as_text(c).label(c.name) for c in tbl.c]).order_by(*[tbl.c[k] for k in key])
+    with engine.connect() as conn:
+        return [dict(r._mapping) for r in conn.execute(_final_on_clickhouse(engine, stmt, tbl)).all()]
+
+
+def _assert_same_rows(engine, engine_name, first_label, second_label):
+    first, second = _stored_as_text(engine, engine_name, 'Facts'), _stored_as_text(engine, engine_name, 'Facts_bulk')
+    # A NUMERIC without precision keeps the scale a value came with, and drivers differ in it (1.0 or 1),
+    # so numbers are compared as numbers.
+    tbl = _reflect_facts(engine)
+    numeric = {c.name for c in tbl.c if isinstance(c.type, Numeric)}
+
+    def same(column, a, b):
+        if a == b:
+            return True
+        return column in numeric and a is not None and b is not None and decimal.Decimal(a) == decimal.Decimal(b)
+
+    assert len(first) == 3
+    for a, b in zip(first, second):
+        differences = {c: (a[c], b.get(c)) for c in a if not same(c, a[c], b.get(c))}
+        assert not differences, f'{a["Shop"]}/{a["Product"]}: {first_label} vs {second_label} {differences}'
+
+
+@pytest.mark.parametrize("engine_name,type_of_data", [(engine_name,type_of_data)
+                                                     for engine_name in engines
+                                                     for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
+def test_bulk_load_stores_what_row_by_row_stores(engine_name, type_of_data):
+    # Where an engine and its driver have a bulk loader, it must store exactly what the row by row
+    # INSERT stores: the same data goes through both into two tables, which must hold the same values.
+    logger.debug(f'TEST BULK LOAD STORES WHAT ROW BY ROW STORES {engine_name} {type_of_data}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    data, data_types = _parity_data(type_of_data, engine.dialect.name in ('postgresql', 'cockroachdb'))
+    for table_name, bulk_load in (('Facts', False), ('Facts_bulk', True)):
+        with dbmerge(engine=engine, data=data, table_name=table_name, schema='target', temp_schema='tmp',
+                     key=key, data_types=data_types) as merge:
+            merge.exec(bulk_load=bulk_load)
+    _assert_same_rows(engine, engine_name, 'row by row', 'bulk')
+
+
+@pytest.mark.parametrize("type_of_data", ('list of dict', 'dict of list', 'pandas', 'polars'))
+def test_clickhouse_without_pyarrow_stores_what_arrow_stores(type_of_data, monkeypatch):
+    # Without pyarrow ClickHouse loads the staging table through the native protocol of the client. It must
+    # store exactly what the Arrow load stores.
+    if 'clickhouse' not in engines:
+        pytest.skip('ClickHouse is not among the tested engines')
+    engine = make_engine('clickhouse')
+    prepare_and_clean_data(engine)
+    data, data_types = _parity_data(type_of_data)
+    with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', key=key, data_types=data_types) as merge:
+        merge.exec()
+    import sys
+    monkeypatch.setattr(sys.modules['dbmerge.clickhouse'], 'pa', None)
+    with dbmerge(engine=engine, data=data, table_name='Facts_bulk', schema='target', key=key, data_types=data_types) as merge:
+        merge.exec()
+    _assert_same_rows(engine, 'clickhouse', 'Arrow', 'native protocol')
 
 if __name__ == '__main__':
 

@@ -8,7 +8,14 @@ on:
 
 jobs:
   test_cockroach:
+    name: ${{ matrix.engine }}, SQLAlchemy ${{ matrix.sqlalchemy }}
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [cockroachdb, cockroachdb-psycopg]
+        sqlalchemy: ['2.0', '2.1']
 
     steps:
       - uses: actions/checkout@v4
@@ -37,12 +44,18 @@ jobs:
         run: |
           uv sync --extra dev
 
+      # uv.lock pins SQLAlchemy 2.0; "uv run --no-sync" below keeps the upgrade.
+      # sqlalchemy-cockroachdb 2.0.4 declares SQLAlchemy < 2.1, 2.0.3 is the last release without that limit.
+      - name: Install SQLAlchemy 2.1
+        if: matrix.sqlalchemy == '2.1'
+        run: uv pip install "sqlalchemy~=2.1.0" "sqlalchemy-cockroachdb<2.0.4"
+
       - name: Create data directory
         run: mkdir -p data
 
       - name: Initialize sample data
         run: |
-          uv run python tests/sample_data_in_sqlite.py
+          uv run --no-sync python tests/sample_data_in_sqlite.py
 
       - name: Wait for CockroachDB
         run: |
@@ -54,6 +67,8 @@ jobs:
           done
           echo "CockroachDB did not become ready"; docker logs cockroach; exit 1
 
-      - name: Run pytest (CockroachDB only)
+      - name: Run pytest
+        env:
+          DBMERGE_TEST_ENGINES: ${{ matrix.engine }}
         run: |
-          uv run pytest tests/test_all.py -v --tb=short -k "cockroachdb"
+          uv run --no-sync pytest tests/test_all.py -v --tb=short

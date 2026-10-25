@@ -5,13 +5,13 @@ build-backend = "hatchling.build"
 [project]
 name = "dbmerge"
 version = "1.0.24"
-description = "Database-agnostic UPSERT (insert/update/delete) for Python: merge pandas/polars DataFrames or dicts into PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server and CockroachDB via SQLAlchemy."
+description = "Database-agnostic UPSERT (insert/update/delete) for Python: merge pandas/polars DataFrames or dicts into PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB and ClickHouse via SQLAlchemy."
 
 keywords = [
     "sql","database","etl","upsert","merge","dwh","python",
     "sqlalchemy","pandas","polars",
     "data-engineering","synchronization","database-sync","bulk-insert",
-    "postgres","mysql","mariadb","sqlite","mssql","sql-server","cockroachdb"
+    "postgres","mysql","mariadb","sqlite","mssql","sql-server","cockroachdb","duckdb","clickhouse"
 ]
 
 authors = [
@@ -63,6 +63,7 @@ include = [
     "src/dbmerge",
     "README.md",
     "DOCUMENTATION.md",
+    "COMPATIBILITY.md",
     "llms.txt",
     "user_guide.py",
     "quick_start.py",
@@ -74,6 +75,10 @@ pandas = [
 ]
 polars = [
     "polars",
+]
+clickhouse = [
+    "clickhouse-connect>=1.9",
+    "pyarrow",
 ]
 dev = [
     "pandas>=2.0.1",
@@ -87,5 +92,10 @@ dev = [
     "twine",
     "build",
     "ydb-sqlalchemy",
-    "sqlalchemy-cockroachdb"
+    "sqlalchemy-cockroachdb",
+    "clickhouse-connect>=1.9",
+    "pymysql",
+    "mysql-connector-python",
+    "psycopg[binary]",
+    "pg8000",
 ]

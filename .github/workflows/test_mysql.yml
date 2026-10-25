@@ -1,0 +1,70 @@
+name: Test MySQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test_mysql:
+    name: ${{ matrix.engine }}, SQLAlchemy ${{ matrix.sqlalchemy }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [mysql-pymysql, mysql-connector, mysql-mysqlclient]
+        sqlalchemy: ['2.0', '2.1']
+
+    # Port 3307, as in db/mysql/docker-compose.yml: locally 3306 is usually taken by MariaDB.
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 3307:3306
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      # mysqlclient is built from source against the client library found by pkg-config.
+      - name: Install DB system libraries
+        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev libpq-dev pkg-config
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+          uv pip install mysqlclient
+
+      # uv.lock pins SQLAlchemy 2.0; "uv run --no-sync" below keeps the upgrade.
+      - name: Install SQLAlchemy 2.1
+        if: matrix.sqlalchemy == '2.1'
+        run: uv pip install "sqlalchemy~=2.1.0"
+
+      - name: Create data directory
+        run: mkdir -p data
+
+      - name: Initialize sample data
+        run: |
+          uv run --no-sync python tests/sample_data_in_sqlite.py
+
+      - name: Run pytest
+        env:
+          DBMERGE_TEST_ENGINES: ${{ matrix.engine }}
+        run: |
+          uv run --no-sync pytest tests/test_all.py -v --tb=short

@@ -12,7 +12,7 @@ Built on top of SQLAlchemy, it abstracts away engine-specific SQL `MERGE` or `ON
 [![PyPI version](https://img.shields.io/pypi/v/dbmerge.svg)](https://pypi.org/project/dbmerge/)
 [![Python versions](https://img.shields.io/pypi/pyversions/dbmerge.svg)](https://pypi.org/project/dbmerge/)
 
-[![PostgreSQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml) [![MariaDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml) [![SQLite](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml) [![MS SQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml) [![CockroachDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_cockroach.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_cockroach.yml)
+[![PostgreSQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_postgresql.yml) [![MariaDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mariadb.yml) [![SQLite](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_sqlite.yml) [![MS SQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mssql.yml) [![CockroachDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_cockroach.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_cockroach.yml) [![MySQL](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mysql.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_mysql.yml) [![DuckDB](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_duckdb.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_duckdb.yml) [![ClickHouse](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_clickhouse.yml/badge.svg)](https://github.com/pavel-v-sobolev/dbmerge/actions/workflows/test_clickhouse.yml)
 
 
 ## Overview
@@ -42,6 +42,10 @@ Tested and verified with:
 - SQLite
 - MS SQL Server
 - CockroachDB
+- DuckDB
+- ClickHouse
+
+[COMPATIBILITY.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md) lists the tested drivers and versions.
 
 ## Installation
 
@@ -88,18 +92,20 @@ with dbmerge(engine=engine, data=data, table_name="Facts",
 
 DBMerge handles the entire reconciliation process (staging, comparing, updating, inserting) with solid performance, scaling well even for larger datasets.
 
-Here is a rough performance comparison for synchronizing data of different sizes using DBMerge (measured on a standard developer laptop):
+Here is a rough performance comparison for synchronizing data of different sizes using DBMerge (measured on a developer laptop with an Intel Core i5-1235U, the driver in parentheses):
 
 | Database | DBMerge (100k rows) | DBMerge (1mil rows) |
 |----------|---------------------|---------------------|
-| **PostgreSQL** | ~2.0s | ~19.8s |
-| **MySQL / MariaDB** | ~1.0s | ~11.1s |
-| **SQLite** | ~0.7s | ~7.6s |
-| **CockroachDB** | ~8.6s | ~2m 49s |
-| **MS SQL Server*** | ~22.4s | ~4m 23s |
+| **DuckDB** (duckdb_engine) | ~0.3s | ~1.7s |
+| **ClickHouse** (clickhouse-connect) | ~0.4s | ~4.1s |
+| **SQLite** (sqlite3) | ~0.7s | ~7.7s |
+| **PostgreSQL** (psycopg2) | ~1.2s | ~7.5s |
+| **MS SQL Server** (mssql-python) | ~1.5s | ~9.5s |
+| **MariaDB** (mariadb) | ~1.0s | ~12.1s |
+| **MySQL** (PyMySQL) | ~2.2s | ~25.4s |
+| **CockroachDB** (psycopg2) | ~2.7s | ~47s |
 
-
-*\* Note: MS SQL Server bulk operations take longer due to inherent limitations in the `pyodbc` driver*
+The staging table is loaded in bulk where the driver allows it: `COPY FROM STDIN` on PostgreSQL and CockroachDB, bulk copy on MS SQL Server, Arrow on DuckDB and ClickHouse. The other drivers of PostgreSQL (`psycopg`, `pg8000`) and CockroachDB (`psycopg`) are within a few percent of `psycopg2`; on MS SQL Server `pyodbc` takes ~1.9s / ~14.5s and `pymssql`, which loads row by row, ~11s for 100k rows. See [COMPATIBILITY.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md#bulk-staging-load) for every driver.
 
 
 ## Database-Specific Notes & Limitations
@@ -113,12 +119,14 @@ Here is a rough performance comparison for synchronizing data of different sizes
   - A **string column of the merge key** needs an explicit length, because InnoDB shares one 3072-byte index budget between all columns of the key (e.g., `data_types={'Your Key Field': String(100)}`). Other string columns are created as `LONGTEXT` automatically.
   - Timezone-aware datetimes lose their UTC offset: no MySQL/MariaDB type stores one. Normalize to UTC before merging if the offset matters.
   - A `BOOLEAN` column is stored as `TINYINT(1)`, so a `delete_mark_field` there holds `0`/`1` rather than `False`/`True`.
+  - The staging table is `TEMPORARY` on MariaDB and a regular table on MySQL, which can not refer to one temporary table twice in a statement.
 - **SQLite:** Does not support schemas. If a schema setting is provided, it is automatically reset to `None` with a warning.
-- **MS SQL Server:** Bulk insert operations may have lower performance due to specific `pyodbc` driver limitations.
-- **CockroachDB:** Uses the official `sqlalchemy-cockroachdb` dialect (over `psycopg2`); speaks the PostgreSQL wire protocol.
+- **MS SQL Server:** Use `pyodbc` or `mssql-python` for a fast staging load. `pymssql` loads row by row and keeps milliseconds only.
+- **CockroachDB:** Uses the official `sqlalchemy-cockroachdb` dialect (over `psycopg2` or `psycopg`); speaks the PostgreSQL wire protocol.
   - `exec(commit_all_steps=False)` is noticeably faster here. On a single-node instance, merging 200 000 rows took ~6s against ~16s with the default, because one commit costs a consensus round regardless of how much it carries. The update phase showed no difference. It also makes the merge all-or-nothing; the trade-off is one larger transaction, which raises the chance of a serialization retry.
 - **Oracle:** Currently **not supported** (missing support for `JOIN` operations in `UPDATE` statements within the `oracledb` module).
-- **DuckDB:** Currently **not supported** (due to a bug in `duckdb_engine` regarding table definition loading).
+- **DuckDB:** Use a database file: with `duckdb:///:memory:` every connection gets a database of its own.
+- **ClickHouse:** Through `clickhouse-connect` (`pip install dbmerge[clickhouse]`). The target must be a `ReplacingMergeTree` ordered by the merge key; a changed row is written as a new version, so read the table with `FINAL`. See [ClickHouse](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#clickhouse).
 
 ## Data Loss Risks
 

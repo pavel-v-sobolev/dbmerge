@@ -12,6 +12,7 @@ from typing import Literal, Any, TYPE_CHECKING
 import sys
 import uuid
 import time
+import importlib
 
 if TYPE_CHECKING:
     from pandas import DataFrame as PandasDataFrame
@@ -24,7 +25,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists, literal, literal_column
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
 from sqlalchemy import String, Text, Integer, BigInteger, Numeric, Double, Boolean, DateTime, Date, Time, JSON, Uuid, LargeBinary
-from sqlalchemy import types, dialects, func, text, schema
+from sqlalchemy import types, dialects, func, text, schema, cast
 
 POLARS_TO_SQLALCHEMY_TYPE_MAP = {
     'Int8': BigInteger(),
@@ -72,6 +73,34 @@ def _is_polars_dataframe(data) -> bool:
     pl = sys.modules.get('polars')
     return pl is not None and isinstance(data, pl.DataFrame)
 
+def _affected_rows(result) -> int:
+    # The DB-API rowcount, unless the driver does not know it (-1) and reports the count as a row of the
+    # result instead - which is how DuckDB answers every INSERT, UPDATE and DELETE.
+    if result.rowcount == -1 and result.returns_rows:
+        return result.scalar()
+    return result.rowcount
+
+def _register_alembic_impl(dialect_name):
+    # alembic refuses a dialect it ships no implementation for, and some SQLAlchemy dialects (duckdb_engine)
+    # register none either. Its default implementation emits a plain ALTER TABLE ... ADD COLUMN, which
+    # the dialects listed in ALEMBIC_DEFAULT_IMPL_DIALECTS take as is. Defining the class is what registers it.
+    from alembic.ddl.impl import DefaultImpl, _impls
+    if dialect_name in ALEMBIC_DEFAULT_IMPL_DIALECTS and dialect_name not in _impls:
+        class Impl(DefaultImpl):
+            __dialect__ = dialect_name
+
+def _is_clickhouse_client(engine) -> bool:
+    cc = sys.modules.get('clickhouse_connect.driver.client')
+    return cc is not None and isinstance(engine, cc.Client)
+
+def _load_dialect_module(dialect_name):
+    # Imported only here, when an engine of this dialect is actually used, so that its driver stays an
+    # optional dependency of the package.
+    module_name = DIALECT_MODULES.get(dialect_name)
+    if module_name is None:
+        return None
+    return importlib.import_module(f'.{module_name}', __package__)
+
 def _is_string_without_length(field_type) -> bool:
     # Text and its dialect variants (TEXT, LONGTEXT, ...) are lengthless by nature rather than by
     # omission, so they are not treated as a string whose length is still unknown.
@@ -113,7 +142,11 @@ class TempTableAlreadyExists(RuntimeError):
     pass
 
 # Maximum rows to check when detecting column type until non null value is found
-MAX_TYPE_DETECTION_ROWS = 10000 
+MAX_TYPE_DETECTION_ROWS = 10000
+
+# Rows per insert into the staging table, unless exec() is given a chunk_size. A dialect module may have
+# its own default (DEFAULT_CHUNK_SIZE of the module).
+DEFAULT_CHUNK_SIZE = 10000
 
 # Maximum length of postgres table name is 63, postgres might need some symbols for "_pkey" suffix.
 MAX_TEMP_TABLE_NAME_LEN = 58
@@ -134,13 +167,31 @@ JSONB_DIALECTS = ('postgresql', 'cockroachdb')
 # Dialects that need generic types adapted before a column can be created from them.
 MYSQL_DIALECTS = ('mysql', 'mariadb')
 
-# Dialects that resolve a NUMERIC with no precision to a whole-number decimal:
-# DECIMAL(10,0) on MySQL/MariaDB and NUMERIC(18,0) on MS SQL. Both round every value.
-ROUNDING_NUMERIC_DIALECTS = ('mysql', 'mariadb', 'mssql')
+# Dialects whose staging table is a TEMPORARY one (see _create_temp_table). MySQL is not among them, but MariaDB
+# reached through a MySQL driver (dialect "mysql") still is.
+TEMPORARY_STAGING_DIALECTS = ('postgresql', 'mariadb', 'sqlite', 'duckdb')
+
+# Dialects that resolve a NUMERIC with no precision to a decimal of fixed scale: DECIMAL(10,0) on
+# MySQL/MariaDB, NUMERIC(18,0) on MS SQL and DECIMAL(18,3) on DuckDB. All of them round every value.
+ROUNDING_NUMERIC_DIALECTS = ('mysql', 'mariadb', 'mssql', 'duckdb')
 
 # InnoDB indexes a key of at most this many bytes, shared by all columns of the key.
 # With utf8mb4 a character takes up to 4 bytes, so a single-column key fits VARCHAR(768).
 MYSQL_MAX_KEY_BYTES = 3072
+
+# Drivers that report no row count for an INSERT ... SELECT built by SQLAlchemy (see _execute_dml).
+INSERT_COUNT_AS_TEXT_DRIVERS = ('psycopg', 'mysqlconnector')
+
+# Dialects alembic has no implementation for, which add columns with its default one (see _register_alembic_impl).
+ALEMBIC_DEFAULT_IMPL_DIALECTS = ('duckdb',)
+
+# Dialects the generic SQLAlchemy flow can not handle on its own, each mapped to the module of this package
+# that does the steps done differently there. A function of the module stands in for a step of the generic
+# flow (see _dialect_hook), the steps it has no function for go the generic way: clickhouse.py replaces
+# almost all of them, duckdb.py only reads the table. A clickhouse-connect client passed instead of an
+# engine counts as the clickhousedb dialect.
+CLICKHOUSE_DIALECT = 'clickhousedb'
+DIALECT_MODULES = {CLICKHOUSE_DIALECT: 'clickhouse', 'duckdb': 'duckdb'}
 
 @dataclass
 class mergeResult:
@@ -197,7 +248,10 @@ class dbmerge:
         ```
 
         Args:
-            engine (Engine): The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, MS SQL and CockroachDB.
+            engine (Engine): The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, MS SQL,
+                CockroachDB, DuckDB and ClickHouse; COMPATIBILITY.md lists the drivers and versions.
+                For ClickHouse, a "clickhousedb://" engine (clickhouse-connect) or a clickhouse_connect client; the target
+                table must be a ReplacingMergeTree.
             table_name (str): The name of the target table where data will be merged.
             data (list[dict] | dict[str,list] | pd.DataFrame | pl.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries (e.g. [{'col1': 'val1'}, ...]), a dict of lists (e.g. {'col1': ['val1', ...], ...}) or a Pandas/Polars DataFrame.
                 For a list of dictionaries, the set of columns is taken from the first row: all rows must have the same keys, keys that appear only in later rows are ignored.
@@ -234,17 +288,18 @@ class dbmerge:
                 A type given here is authoritative: it is used as written and never substituted, even if the engine then
                 refuses to create a column from it. Auto-detected types are adapted to the target engine instead, where
                 the generic type would not work (on MySQL/MariaDB a string of unknown length becomes LONGTEXT; on
-                MySQL/MariaDB/MS SQL a number of unknown precision becomes a double and a datetime keeps microseconds).
+                MySQL/MariaDB/MS SQL/DuckDB a number of unknown precision becomes a double; on MySQL/MariaDB/MS SQL a datetime keeps microseconds).
                 On MySQL/MariaDB a string column of the merge key must be given an explicit length here, because InnoDB
                 indexes at most 3072 bytes per key, shared by all of its columns.
             schema (str | None, optional): The database schema of the target table.
             temp_schema (str | None, optional): The database schema where the temporary staging table will be created.
                 Defaults to schema. The staging table is named tmp_<yymmddHHMMSS>_<table>_<hex8>: a fixed prefix marking it
                 as disposable, the moment of creation by the database clock (first, so that a listing sorts by age), the target
-                table name (truncated to fit the identifier limit) and a random suffix. On PostgreSQL, SQLite, MySQL and MariaDB it is a
+                table name (truncated to fit the identifier limit) and a random suffix. On PostgreSQL, SQLite, MariaDB and DuckDB it is a
                 TEMPORARY table: session-scoped, kept out of shared_buffers, and removed by the database when the session ends, so a
-                crashed process leaves nothing behind. PostgreSQL keeps temporary tables in its own session schema, so temp_schema
-                does not apply there and is quietly dropped. Only MS SQL Server and CockroachDB get a regular table that can be left over.
+                crashed process leaves nothing behind. PostgreSQL and DuckDB keep temporary tables in a schema of their own, so temp_schema
+                does not apply there and is quietly dropped. MySQL, MS SQL Server and CockroachDB get a regular table that can be left
+                over (MySQL can not open a temporary table twice in one statement, which a condition of exec() may need).
             source_table_name (str | None, optional): If provided, data will be sourced directly from another existing database table or view. Mutually exclusive with the "data" argument (passing both raises IncorrectParameter).
             source_schema (str | None, optional): The database schema of the source table or view.
             can_create_table (bool, optional): Allows the module to automatically create the target table if it does not exist (default is True).
@@ -266,22 +321,32 @@ class dbmerge:
         try:
             _ensure_logger_handler()
 
-            self._validate_init_params(engine=engine, table_name=table_name, data=data,
-                                       delete_mode=delete_mode, delete_mark_field=delete_mark_field,
-                                       delete_mark_values=delete_mark_values,
-                                       merged_on_field=merged_on_field, inserted_on_field=inserted_on_field,
-                                       skip_update_fields=skip_update_fields,
-                                       skip_compare_fields=skip_compare_fields, key=key, data_types=data_types,
-                                       schema=schema, temp_schema=temp_schema,
-                                       source_table_name=source_table_name, source_schema=source_schema,
-                                       can_create_table=can_create_table, can_create_columns=can_create_columns,
-                                       can_create_schemas=can_create_schemas)
+            init_params = dict(engine=engine, table_name=table_name, data=data,
+                               delete_mode=delete_mode, delete_mark_field=delete_mark_field,
+                               delete_mark_values=delete_mark_values,
+                               merged_on_field=merged_on_field, inserted_on_field=inserted_on_field,
+                               skip_update_fields=skip_update_fields,
+                               skip_compare_fields=skip_compare_fields, key=key, data_types=data_types,
+                               schema=schema, temp_schema=temp_schema,
+                               source_table_name=source_table_name, source_schema=source_schema,
+                               can_create_table=can_create_table, can_create_columns=can_create_columns,
+                               can_create_schemas=can_create_schemas)
+            self._validate_init_params(**init_params)
+
+            # The dialect is known only once the engine is known to be an engine at all.
+            self.dialect_name = CLICKHOUSE_DIALECT if _is_clickhouse_client(engine) else engine.dialect.name
+            dialect_name = self.dialect_name
+            # The module that does what this dialect needs done differently, None for the generic flow.
+            self._dialect_module = _load_dialect_module(dialect_name)
+            if hook := self._dialect_hook('validate_init_params'):
+                hook(**init_params)
 
             self.data = data
             self.engine = engine
             self.table_name = table_name
             self.merge_finished = False
-            dialect_name = self.engine.dialect.name
+            # Set early: a dialect module may pick the kind of staging table by it when it connects.
+            self.delete_mode = delete_mode
 
             self.schema = schema
             self.temp_schema = temp_schema
@@ -293,7 +358,9 @@ class dbmerge:
             self.can_create_table = can_create_table
             self.can_create_schemas = can_create_schemas
 
-            self.inspector = inspect(self.engine)
+            # A dialect module that opens the session itself reads the catalog its own way too: a
+            # clickhouse-connect client can not be inspected at all.
+            self.inspector = None if self._dialect_hook('open_session') else inspect(self.engine)
             self.metadata = MetaData()
 
             if dialect_name in ('mysql','mariadb'):
@@ -312,6 +379,11 @@ class dbmerge:
                 # staging table is put where the engine keeps such tables anyway.
                 self.temp_schema = None
 
+            if dialect_name == 'duckdb':
+                # The same with DuckDB: a TEMPORARY table belongs to its "temp" catalog, and a schema
+                # given for it is refused.
+                self.temp_schema = None
+
             if dialect_name in ['sqlite']:
                 if schema is not None:
                     logger.warning(f'"{dialect_name}" engine does not support schemas. '
@@ -327,7 +399,7 @@ class dbmerge:
                     logger.warning(f'"{dialect_name}" engine does not support schemas. '
                                    f'Omitting parameter source_schema = "{source_schema}"')
                     self.source_schema = None
-            
+
             self.total_row_count = 0
             self.inserted_row_count =0 
             self.updated_row_count = 0
@@ -344,7 +416,10 @@ class dbmerge:
             self.skip_update_fields = skip_update_fields if skip_update_fields is not None else []
             self.skip_compare_fields = skip_compare_fields if skip_compare_fields is not None else []
 
-            self.conn = engine.connect()
+            if hook := self._dialect_hook('open_session'):
+                hook(self)
+            else:
+                self.conn = engine.connect()
 
             if self.schema is not None:
                 self.table_full_name = self.schema+'.'+table_name
@@ -376,8 +451,6 @@ class dbmerge:
             # columns are dropped from the merge instead of being created, and nothing is reported.
             self.table_created = False
             self.added_fields = {}
-
-            self.delete_mode = delete_mode
 
             self.delete_mark_field = delete_mark_field
             self.delete_mark_values = delete_mark_values if delete_mark_values is not None else {}
@@ -505,6 +578,9 @@ class dbmerge:
 
             self._check_key()
 
+            if hook := self._dialect_hook('check_table'):
+                hook(self)
+
             if self.table is None:
                 if can_create_table:
                     logger.info(f'Table "{self.table_full_name}" does not exist. Creating.')
@@ -545,7 +621,7 @@ class dbmerge:
 
     def exec(self, delete_condition: ColumnElement=None, source_condition: ColumnElement=None,
              update_condition: ColumnElement=None, insert_condition: ColumnElement=None,
-             commit_all_steps=True, chunk_size: int = 10000) -> mergeResult:
+             commit_all_steps=True, chunk_size: int | None = None, bulk_load: bool = True) -> mergeResult:
         """
         Executes the merge operation. It returns a mergeResult class with statistical information.
 
@@ -590,7 +666,12 @@ class dbmerge:
                 It applies to the data only - schema changes (creating the target table, adding columns, creating and
                 dropping the staging table) are always committed on their own and never roll back with the data.
             chunk_size (int, optional): Defines the batch size when inserting raw data (from lists of dicts, dicts of lists
-                or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Defaults to 10000.
+                or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Defaults to 10000,
+                on ClickHouse to 1,000,000: every insert creates a part of the table there, and small ones are costly.
+            bulk_load (bool, optional): Load the staging table in bulk where the engine and its driver allow it
+                (COPY FROM STDIN on PostgreSQL and CockroachDB, bulk copy with mssql-python, fast_executemany with
+                pyodbc, Arrow on DuckDB), instead of the row by row INSERT of SQLAlchemy. The data stored is the same
+                either way; False falls back to the row by row INSERT. ClickHouse always loads in bulk.
 
         Returns:
             mergeResult: A dataclass object containing execution statistics (e.g., inserted_row_count, total_time)
@@ -601,6 +682,9 @@ class dbmerge:
         if self.merge_finished:
             raise IncorrectParameter(f'Merge exec already finished on table {self.table_full_name}')
 
+        if chunk_size is None:
+            chunk_size = getattr(self._dialect_module, 'DEFAULT_CHUNK_SIZE', DEFAULT_CHUNK_SIZE)
+
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
             raise IncorrectParameter(f'chunk_size must be a positive integer, got {chunk_size!r}')
 
@@ -608,6 +692,9 @@ class dbmerge:
         # step commits on - the opposite of what such a call means.
         if not isinstance(commit_all_steps, bool):
             raise IncorrectParameter(f'commit_all_steps must be True or False, got {commit_all_steps!r}.')
+        if not isinstance(bulk_load, bool):
+            raise IncorrectParameter(f'bulk_load must be True or False, got {bulk_load!r}.')
+        self.bulk_load = bulk_load
 
         if delete_condition is not None:
             if not isinstance(delete_condition,ColumnElement):
@@ -647,8 +734,8 @@ class dbmerge:
             data_msg = f'Temp data: {self.total_row_count} rows ({format_ms(self.temp_insert_time)})'
             if commit_all_steps:
                 self.conn.commit()
-            
-            
+
+
             self._update_not_matching_data()
             updated_msg = f'Updated: {self.updated_row_count} rows ({format_ms(self.update_time)})'
             if commit_all_steps:
@@ -731,7 +818,13 @@ class dbmerge:
         except Exception:
             pass
 
+    def _dialect_hook(self, name):
+        """The function of the dialect module that stands in for a step of the generic flow, or None to go the generic way."""
+        return getattr(self._dialect_module, name, None)
+
     def _create_schema_if_not_exists(self,schema_name):
+        if hook := self._dialect_hook('create_schema_if_not_exists'):
+            return hook(self, schema_name)
         if self.conn.dialect.name not in ['sqlite']:
             schema_exists = self.conn.dialect.has_schema(self.conn, schema_name)
             # The check just opened a transaction on the connection. It is closed here whether or
@@ -780,9 +873,9 @@ class dbmerge:
 
 
     def _check_type_is_supported(self,field_type):
-        if isinstance(field_type,JSON) and self.engine.dialect.name in JSONB_DIALECTS:
+        if isinstance(field_type,JSON) and self.dialect_name in JSONB_DIALECTS:
             if not isinstance(field_type,dialects.postgresql.JSONB):
-                raise IncorrectDataError(f'JSON type is not supported for "{self.engine.dialect.name}". '+\
+                raise IncorrectDataError(f'JSON type is not supported for "{self.dialect_name}". '+\
                                         'Use JSONB instead (sqlalchemy.dialects.postgresql.JSONB)')
 
     def _check_existing_and_new_fields(self):
@@ -912,7 +1005,7 @@ class dbmerge:
                             self.new_fields[f] = Date()
                         elif isinstance(test_row[f],list) or isinstance(test_row[f],dict) or \
                             isinstance(test_row[f],tuple):
-                            if self.engine.dialect.name in JSONB_DIALECTS:
+                            if self.dialect_name in JSONB_DIALECTS:
                                 self.new_fields[f] = dialects.postgresql.JSONB()
                             else:
                                 self.new_fields[f] = JSON()
@@ -945,7 +1038,10 @@ class dbmerge:
         # fields we are about to create are adjusted to what the target engine actually supports.
         # Only new fields are touched - a column that already exists in the table keeps the type
         # the table gives it.
-        dialect_name = self.engine.dialect.name
+        if hook := self._dialect_hook('adapt_types'):
+            return hook(self)
+
+        dialect_name = self.dialect_name
 
         for f in self.new_fields:
             # A type listed in data_types is the caller's own decision about how the column must be
@@ -976,8 +1072,8 @@ class dbmerge:
                             f'creating it as LONGTEXT on "{dialect_name}"')
                 self._set_new_field_type(f, dialects.mysql.LONGTEXT())
 
-            # A NUMERIC with no precision is rounded to a whole number by these engines, so 1.75
-            # would be stored as 2. A float carries no precision or scale to declare, and a double
+            # A NUMERIC with no precision is rounded to a fixed scale by these engines: 1.75 would be
+            # stored as 2 on MySQL, 0.1234 as 0.123 on DuckDB. A float carries no precision or scale to declare, and a double
             # is the type the value already has in Python, so it is used instead of inventing one.
             elif dialect_name in ROUNDING_NUMERIC_DIALECTS and _is_numeric_without_precision(field_type):
                 logger.info(f'Field "{f}" - number of unknown precision, '
@@ -1005,7 +1101,9 @@ class dbmerge:
         # the engine's, not ours. The only thing asked for here is the fractional precision that an
         # engine hides behind a default: MySQL/MariaDB NOW() drops the fraction unless NOW(fsp) is
         # used. The argument has to be a literal - a bind parameter is not accepted there.
-        if self.engine.dialect.name in MYSQL_DIALECTS:
+        if hook := self._dialect_hook('now'):
+            return hook()
+        if self.dialect_name in MYSQL_DIALECTS:
             return func.now(literal_column('6'))
         return func.now()
 
@@ -1046,7 +1144,11 @@ class dbmerge:
             # added so far. They are exactly the columns the incoming data asked for, and a repeated
             # merge adds the remaining ones, so the target converges.
             self.conn.commit()
-            op=Operations(MigrationContext.configure(self.conn))
+            # A dialect module that adds the column its own way needs no alembic, which may not know the dialect.
+            add_column = self._dialect_hook('add_column')
+            if add_column is None:
+                _register_alembic_impl(self.dialect_name)
+                op = Operations(MigrationContext.configure(self.conn))
             # The automatically managed columns are left out of the reported added_fields: they
             # carry no source data, so a consumer watching for a schema change has nothing to
             # recompute over them. A delete flag supplied in the data is a data column, and stays.
@@ -1055,12 +1157,15 @@ class dbmerge:
                 managed.add(self.delete_mark_field)
             for field_name in self.new_fields:
                 logger.info(f'Creating new field "{field_name}" - {self.new_fields[field_name]}')
-                primary_key = field_name in self.key
-                op.add_column(
-                        self.table_name,
-                        Column(field_name, self.new_fields[field_name], primary_key=primary_key),
-                        schema=self.schema
-                    )
+                if add_column is not None:
+                    add_column(self, field_name, self.new_fields[field_name])
+                else:
+                    primary_key = field_name in self.key
+                    op.add_column(
+                            self.table_name,
+                            Column(field_name, self.new_fields[field_name], primary_key=primary_key),
+                            schema=self.schema
+                        )
                 # Committed one ALTER at a time, so each stays alone in its transaction. A failure
                 # part way through therefore leaves the columns added so far - they are exactly the
                 # ones the incoming data asked for, and a repeated merge adds the rest.
@@ -1082,9 +1187,15 @@ class dbmerge:
         """Validate user-supplied arguments up front so that a wrong type raises a
         clear IncorrectParameter instead of an obscure crash deeper in the merge."""
 
-        if not isinstance(engine, Engine):
-            raise IncorrectParameter(f'"engine" must be a SQLAlchemy Engine (from create_engine()), '
-                                     f'got {type(engine).__name__}.')
+        if not isinstance(engine, Engine) and not _is_clickhouse_client(engine):
+            raise IncorrectParameter(f'"engine" must be a SQLAlchemy Engine (from create_engine()) '
+                                     f'or a clickhouse-connect client, got {type(engine).__name__}.')
+
+        # clickhouse-sqlalchemy: its driver opens a new session for every statement, and the ClickHouse
+        # support is built on the clickhouse-connect client.
+        if isinstance(engine, Engine) and engine.dialect.name == 'clickhouse':
+            raise IncorrectParameter('ClickHouse is supported through clickhouse-connect: create the engine with '
+                                     'a "clickhousedb://" URL or pass a clickhouse_connect client.')
 
         if not isinstance(table_name, str) or table_name.strip() == '':
             raise IncorrectParameter(f'"table_name" must be a non-empty string, got {table_name!r}.')
@@ -1190,7 +1301,9 @@ class dbmerge:
 
 
     def _insert_missing_data(self):
-        
+        if hook := self._dialect_hook('insert_new_rows'):
+            return hook(self)
+
         start_time = time.perf_counter()
         first_pk_col = self.table.c[self.key[0]]
         
@@ -1229,14 +1342,15 @@ class dbmerge:
 
         self.insert_sql = str(insert_stmt)
 
-        result = self.conn.execute(insert_stmt)
-        self.inserted_row_count = result.rowcount #if use returning, then rowcount will not work.
+        self.inserted_row_count = self._execute_dml(insert_stmt)
 
         end_time = time.perf_counter()
         self.insert_time = end_time - start_time  
 
 
     def _delete_rows_missing_in_source(self):
+        if hook := self._dialect_hook('delete_rows_missing_in_source'):
+            return hook(self)
 
         start_time = time.perf_counter()
         delete_join_conditions = []
@@ -1252,14 +1366,15 @@ class dbmerge:
                 
         self.delete_sql = str(delete_stmt)
 
-        result = self.conn.execute(delete_stmt)
-        self.deleted_row_count = result.rowcount
+        self.deleted_row_count = self._execute_dml(delete_stmt)
 
         end_time = time.perf_counter()
         self.delete_time = end_time - start_time  
 
 
     def _mark_rows_missing_in_source(self):
+        if hook := self._dialect_hook('insert_marked_rows'):
+            return hook(self)
 
         start_time = time.perf_counter()
         update_join_conditions = []
@@ -1291,15 +1406,16 @@ class dbmerge:
         
         self.delete_sql = str(update_stmt)
         
-        result = self.conn.execute(update_stmt)
-        self.deleted_row_count = result.rowcount
+        self.deleted_row_count = self._execute_dml(update_stmt)
 
         end_time = time.perf_counter()
         self.delete_time = end_time - start_time  
 
 
     def _update_not_matching_data(self):
-        
+        if hook := self._dialect_hook('insert_changed_rows'):
+            return hook(self)
+
         start_time = time.perf_counter()
         non_key_cols = [c for c in self.data_fields if c not in self.key and
                                                        c not in self.skip_update_fields]
@@ -1375,15 +1491,33 @@ class dbmerge:
 
         self.update_sql = str(update_stmt)
 
-        result = self.conn.execute(update_stmt)
-
-        self.updated_row_count = result.rowcount
+        self.updated_row_count = self._execute_dml(update_stmt)
         
         end_time = time.perf_counter()
         self.update_time = end_time - start_time  
 
 
+    def _execute_dml(self, statement) -> int:
+        """Runs an INSERT, UPDATE or DELETE and returns the number of rows it changed."""
+        if statement.is_insert and (self.dialect_name == 'duckdb' or self.conn.dialect.driver in INSERT_COUNT_AS_TEXT_DRIVERS):
+            # These drivers lose the count of an INSERT built by SQLAlchemy, but report it for the same
+            # INSERT sent as plain SQL, so that is how it goes to them:
+            # - DuckDB knows no rowcount, it answers every DML statement with a row that holds the count, and
+            #   SQLAlchemy closes the result of an INSERT without RETURNING unread.
+            # - psycopg (3) reports -1 for INSERT ... SELECT.
+            # - mysql-connector in its pure Python mode reports -1 for INSERT ... SELECT. It falls back to that
+            #   mode by itself once pyarrow is loaded into the process, which pandas 3 does.
+            compiled = statement.compile(dialect=self.conn.dialect)
+            params = compiled.construct_params()
+            if compiled.positional:
+                params = tuple(params[name] for name in compiled.positiontup)
+            return _affected_rows(self.conn.exec_driver_sql(str(compiled), params))
+        return _affected_rows(self.conn.execute(statement))
+
+
     def _load_table_metadata_from_db(self,table_name,schema):
+        if hook := self._dialect_hook('reflect_table'):
+            return hook(self, table_name, schema)
         table_exists = self.inspector.has_table(table_name, schema)
         if table_exists:
             table = Table(table_name, self.metadata, autoload_with=self.engine, schema=schema,
@@ -1393,6 +1527,8 @@ class dbmerge:
             
     
     def _create_table(self):
+        if hook := self._dialect_hook('create_table'):
+            return hook(self)
         # autoincrement=False: the key value always comes from the source data, so the database must
         # not generate it. Left at its default, a single-column integer key is created as
         # AUTO_INCREMENT / SERIAL / IDENTITY - which turns a key of 0 into 1 on MySQL, leaves the
@@ -1441,7 +1577,14 @@ class dbmerge:
         database and against other processes' tables, and the hosts running them need not agree on
         the time; the database is the one clock all of them share.
         """
-        value = self.conn.scalar(select(self._now()))
+        if hook := self._dialect_hook('scalar'):
+            value = hook(self, select(self._now()))
+        elif self.dialect_name == 'duckdb':
+            # DuckDB's now() is a TIMESTAMP WITH TIME ZONE, and turning that into Python needs pytz,
+            # which DuckDB does not install. The name needs the local time only.
+            value = self.conn.scalar(select(cast(self._now(), DateTime)))
+        else:
+            value = self.conn.scalar(select(self._now()))
         if isinstance(value, str):
             # sqlite has no datetime type and returns CURRENT_TIMESTAMP as text.
             value = datetime.fromisoformat(value)
@@ -1465,6 +1608,9 @@ class dbmerge:
 
         temp_table_name = prefix + self._truncate_to_bytes(self.table_name, max_bytes) + suffix
 
+        if hook := self._dialect_hook('create_temp_table'):
+            return hook(self, temp_table_name)
+
         # autoincrement=False for the same reason as in _create_table: the staging table is loaded
         # with the key values of the source, never with generated ones.
         cols = [Column(c.name, c.type, primary_key = c.name in self.key, autoincrement=False)
@@ -1478,7 +1624,10 @@ class dbmerge:
         # the whole buffer pool, which is what an UNLOGGED table costs on a server with large
         # shared_buffers. It also disappears with the session, so a crashed process leaves nothing
         # behind. Rows survive the commits between merge phases: ON COMMIT PRESERVE ROWS is the default.
-        if self.engine.dialect.name in ('postgresql','mariadb','mysql','sqlite'):
+        # MySQL refuses to open a TEMPORARY table twice in one statement ("Can't reopen table"), which a
+        # condition of exec() that reads merge.temp_table again makes it do. MariaDB has no such limit.
+        is_mariadb = getattr(self.conn.dialect, 'is_mariadb', False)
+        if self.dialect_name in TEMPORARY_STAGING_DIALECTS or is_mariadb:
             self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
                                     prefixes=['TEMPORARY'])
             self.temp_table.create(bind=self.conn, checkfirst=False)
@@ -1494,43 +1643,48 @@ class dbmerge:
 
 
     def _insert_data_to_temp(self):
+        if hook := self._dialect_hook('insert_data_to_temp'):
+            return hook(self)
+
+        if self.bulk_load:
+            from . import _bulk_load
+            loader = _bulk_load.loader_for(self)
+            if loader is not None:
+                return loader(self)
 
         start_time = time.perf_counter()
-        
-        chunks_num = (self.total_row_count // self.chunk_size)
-        if self.total_row_count % self.chunk_size > 0:
-            chunks_num = chunks_num + 1
-        
-        if self.total_row_count>0:
-            for i in range(chunks_num):
-                begin = i * self.chunk_size
-                end = min((i + 1) * self.chunk_size, self.total_row_count)
-                
-                if self.type_of_data == 'list of dict':
-                    data_slice = self.data[begin:end]
-                
-                elif self.type_of_data == 'dict of list':
-                    data_slice = [dict(zip(self.data.keys(), vals)) 
-                                  for vals in zip(*[v[begin:end] for v in self.data.values()])]
-                
-                elif self.type_of_data == 'pandas':
-                    import numpy as np  # numpy is a hard dependency of pandas, so it is already loaded
-                    data_slice = self.data.iloc[begin:end]
-                    data_slice = data_slice.replace({np.nan: None})
-                    data_slice = data_slice.to_dict(orient='records')
-                
-                elif self.type_of_data == 'polars':
-                    data_slice = self.data.slice(begin,self.chunk_size)   
-                    data_slice = data_slice.to_dicts()
-                
-                else:
-                    return
-                    
-                self.conn.execute(insert(self.temp_table), data_slice)
 
-        
+        for begin in range(0, self.total_row_count, self.chunk_size):
+            end = min(begin + self.chunk_size, self.total_row_count)
+            self._insert_rows_to_temp(begin, end)
+
         end_time = time.perf_counter()
         self.temp_insert_time = end_time - start_time       
+
+
+    def _insert_rows_to_temp(self, begin, end):
+        """Inserts rows begin..end of the incoming data into the staging table, row by row."""
+        if self.type_of_data == 'list of dict':
+            data_slice = self.data[begin:end]
+
+        elif self.type_of_data == 'dict of list':
+            data_slice = [dict(zip(self.data.keys(), vals))
+                          for vals in zip(*[v[begin:end] for v in self.data.values()])]
+
+        elif self.type_of_data == 'pandas':
+            import numpy as np  # numpy is a hard dependency of pandas, so it is already loaded
+            data_slice = self.data.iloc[begin:end]
+            data_slice = data_slice.replace({np.nan: None})
+            data_slice = data_slice.to_dict(orient='records')
+
+        elif self.type_of_data == 'polars':
+            data_slice = self.data.slice(begin, end - begin)
+            data_slice = data_slice.to_dicts()
+
+        else:
+            return
+
+        self.conn.execute(insert(self.temp_table), data_slice)
         
     def _insert_source_table_to_temp(self):
 
@@ -1545,8 +1699,7 @@ class dbmerge:
             select_stmt = select(*source_fields).where(self.source_condition)
 
         insert_stmt = insert(self.temp_table).from_select(target_fields,select_stmt)
-        result = self.conn.execute(insert_stmt)
-        self.total_row_count = result.rowcount 
+        self.total_row_count = self._execute_dml(insert_stmt)
 
         end_time = time.perf_counter()
         self.temp_insert_time = end_time - start_time  
@@ -1554,10 +1707,12 @@ class dbmerge:
 
     def _drop_temp_table(self):
         if hasattr(self, 'temp_table') and self.temp_table is not None:
+            if hook := self._dialect_hook('drop_table'):
+                hook(self, self.temp_table)
             # TEMPORARY tables (sqlite/mysql/mariadb) are visible only on the connection
             # that created them: dropping via the engine runs on another pooled connection
             # where the table does not exist, leaving it alive until the pool recycles.
-            if hasattr(self, 'conn') and not self.conn.closed:
+            elif hasattr(self, 'conn') and not self.conn.closed:
                 # checkfirst=False for the same reason as on creation, and there is nothing to
                 # check anyway: the name carries a unique id, so this table is ours and exists.
                 self.conn.commit()
@@ -1592,7 +1747,11 @@ def drop_table_if_exists(engine,table_name,schema=None):
     metadata = MetaData()
     table_exists = inspector.has_table(table_name, schema)
     if table_exists:
-        table = Table(table_name, metadata, autoload_with=engine, schema=schema)
+        # DROP needs the name only, and SQLAlchemy 2.1 can not reflect a DuckDB table at all (see duckdb.py).
+        if engine.dialect.name == 'duckdb':
+            table = Table(table_name, metadata, schema=schema)
+        else:
+            table = Table(table_name, metadata, autoload_with=engine, schema=schema)
         logger.debug(f'Deleting table "{table_full_name}"')
         # checkfirst=False: has_table above has already answered that question, and asking again
         # would put a second statement in the transaction that carries the DROP - which CockroachDB

@@ -25,7 +25,7 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 
 #### Arguments
 
-- **`engine`** *(sqlalchemy.engine.Engine)*: The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, MS SQL and CockroachDB.
+- **`engine`** *(sqlalchemy.engine.Engine | clickhouse_connect client)*: The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, MS SQL, CockroachDB, DuckDB and ClickHouse — [COMPATIBILITY.md](COMPATIBILITY.md) lists the drivers and versions. For ClickHouse it may also be a clickhouse-connect client — see [ClickHouse](#clickhouse).
 - **`table_name`** *(str)*: The name of the target table where data will be merged.
 - **`data`** *(list[dict] | dict[str, list] | pd.DataFrame | pl.DataFrame | None, optional)*: The source data to merge. Accepts a list of dictionaries (e.g., `[{'col1': 'val1'}, ...]`), a dict of lists (e.g., `{'col1': ['val1', ...], ...}`) or a Pandas/Polars DataFrame. For a list of dictionaries, the set of columns is taken from the first row: all rows must have the same keys, and keys that appear only in later rows are ignored.
 - **`delete_mode`** *(Literal['no', 'delete', 'mark'], optional)*: Defines how to handle records that exist in the target table but are missing from the source data. 
@@ -53,12 +53,12 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
   The key is always supplied by your data, so a key column DBMerge creates is never a generated one: no `AUTO_INCREMENT`, `SERIAL` or `IDENTITY`. If you want the database to generate surrogate ids, add that column to your schema yourself — it is not part of the merge key.
 - **`data_types`** *(dict[str, types.TypeEngine] | None, optional)*: A dictionary mapping column names to SQLAlchemy data types (e.g., `{'Name': String(100)}`). Used when creating missing tables or columns. If omitted, data types are auto-detected from the source data.
 
-  A type given here is authoritative: it is used exactly as written and is never substituted, even when the engine then refuses to create a column from it. Types that were auto-detected instead are adapted to the target engine where the generic type would not work — on MySQL/MariaDB a string of unknown length becomes `LONGTEXT`, and on MySQL/MariaDB/MS SQL a number of unknown precision becomes a double and a datetime keeps its microseconds.
+  A type given here is authoritative: it is used exactly as written and is never substituted, even when the engine then refuses to create a column from it. Types that were auto-detected instead are adapted to the target engine where the generic type would not work — on MySQL/MariaDB a string of unknown length becomes `LONGTEXT`, on MySQL/MariaDB/MS SQL/DuckDB a number of unknown precision becomes a double (DuckDB would round it to three decimal places), and on MySQL/MariaDB/MS SQL a datetime keeps its microseconds.
 
   On MySQL/MariaDB a **string column of the merge key** must be given an explicit length here: InnoDB indexes at most 3072 bytes per key, shared by all of its columns, so no default length is safe.
-- **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name).
-- **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created. Defaults to `schema`. The table is named `tmp_<yymmddHHMMSS>_<table>_<hex8>` and dropped when the context manager exits — see [The Staging Table](#the-staging-table) for the naming rules and for how it is created on each engine. Quietly ignored on PostgreSQL, which keeps temporary tables in its own session schema.
-- **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`.
+- **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name). On ClickHouse it is a database, and defaults to the current database of the connection.
+- **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created. Defaults to `schema`. The table is named `tmp_<yymmddHHMMSS>_<table>_<hex8>` and dropped when the context manager exits — see [The Staging Table](#the-staging-table) for the naming rules and for how it is created on each engine. Quietly ignored on PostgreSQL and DuckDB, which keep temporary tables in a schema of their own, and on ClickHouse whenever the staging table is a temporary one there.
+- **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`. Not supported on ClickHouse.
 - **`source_schema`** *(str | None, optional)*: The database schema of the source table or view.
 - **`can_create_table`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target table if it does not exist.
 - **`can_create_columns`** *(bool, optional)*: Defaults to `True`. Allows the module to append missing columns to the target table.
@@ -147,7 +147,10 @@ with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
 - **`commit_all_steps`** *(bool, optional)*: Defaults to `True`. If `True`, every step (temp insert, target insert, update, delete) is committed immediately. If `False`, a single commit is issued after all steps complete successfully. Must be a real boolean — a string such as `'false'` is rejected rather than silently treated as truthy.
 
   It applies to the **data only**. Schema changes — creating the target table, adding columns, creating and dropping the staging table — are always committed on their own and are never part of the merge transaction, so `commit_all_steps=False` does not make them roll back with the data.
-- **`chunk_size`** *(int, optional)*: Defaults to `10000`. Defines the batch size when inserting raw data (from lists of dicts, dicts of lists or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Must be a positive integer.
+
+  It has no effect on ClickHouse, which has no transactions: every statement there is final as soon as it runs.
+- **`chunk_size`** *(int, optional)*: Defaults to `10000`, and to `1000000` on ClickHouse, where every insert creates a new part of the table and small ones are costly. Defines the batch size when inserting raw data (from lists of dicts, dicts of lists or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Must be a positive integer.
+- **`bulk_load`** *(bool, optional)*: Defaults to `True`. Loads the staging table in bulk where the database and its driver allow it — `COPY FROM STDIN` on PostgreSQL and CockroachDB, bulk copy with mssql-python, `fast_executemany` with pyodbc, Arrow on DuckDB — instead of SQLAlchemy's row by row `INSERT`. The values stored are the same either way; `False` turns it off. ClickHouse always loads in bulk. See [Bulk Staging Load](COMPATIBILITY.md#bulk-staging-load) for each driver, the speed-ups, and the data that still goes row by row.
 
 #### Execution Results & Statistics
 `exec()` returns a `mergeResult` dataclass. The same statistics are also available as attributes on the `dbmerge` instance after `exec()` completes.
@@ -211,13 +214,13 @@ tmp_260823224826_Fact1Fact2Fact3Fact4Fact5Fact6Fa_7c7f55e5     58 bytes
 tmp_260823194756_Продажи_по_магази_d15633ca                    58 bytes
 ```
 
-**Lifetime.** On PostgreSQL, SQLite, MySQL and MariaDB the staging table is a real `TEMPORARY` table: it belongs to the session that created it, is invisible to every other connection, and the database removes it when that session ends — so even a process killed mid-merge leaves nothing behind.
+**Lifetime.** On PostgreSQL, SQLite, MariaDB and DuckDB the staging table is a real `TEMPORARY` table: it belongs to the session that created it, is invisible to every other connection, and the database removes it when that session ends — so even a process killed mid-merge leaves nothing behind. On ClickHouse it is a `TEMPORARY` table too, except in the cases listed under [ClickHouse](#the-staging-table-on-clickhouse).
 
 On PostgreSQL this also keeps the staging data out of `shared_buffers` entirely; it is cached in the session's own `temp_buffers` instead. Two things follow on a busy server: the staging data never evicts the real working set, and dropping the table does not make PostgreSQL scan the whole buffer pool (a cost that grows with `shared_buffers` and is paid again on every standby replaying the drop). Measured on a 14 MB staging table: an `UNLOGGED` table occupied 1277 pages of `shared_buffers`, a `TEMPORARY` one occupied none, with no difference in merge time.
 
-Because PostgreSQL keeps temporary tables in its own per-session schema, `temp_schema` does not apply there and is quietly ignored.
+Because PostgreSQL keeps temporary tables in its own per-session schema, `temp_schema` does not apply there and is quietly ignored. The same holds for DuckDB, which keeps them in its `temp` catalog.
 
-**Leftovers** are therefore only possible on engines that get a regular table instead — MS SQL Server and CockroachDB. There the name is what lets you find them:
+**Leftovers** are therefore only possible where the staging table is a regular one — MS SQL Server, CockroachDB, MySQL, and ClickHouse in the cases listed under its section. MySQL gets a regular table because it can not refer to one temporary table twice in a statement (`Can't reopen table`), which an `update_condition` or `insert_condition` built on `merge.temp_table` needs. There the name is what lets you find them:
 
 ```sql
 -- staging tables older than a day, in creation order
@@ -261,6 +264,8 @@ This does not help everywhere: MySQL/MariaDB have no type that stores an offset,
 | MySQL / MariaDB | `NOW(6)` | server/session `time_zone` | microseconds |
 | SQLite | `CURRENT_TIMESTAMP` | **always UTC** | whole seconds |
 | MS SQL Server | `CURRENT_TIMESTAMP` | server timezone | ~3.3 ms (it returns a `datetime`) |
+| DuckDB | `now()` | session `TimeZone`, which defaults to the local timezone of the machine | microseconds |
+| ClickHouse | `now64(6)` | stores the instant; shown in the column's timezone, or else the server's | microseconds |
 
 Two consequences worth planning around:
 
@@ -270,6 +275,107 @@ Two consequences worth planning around:
 On PostgreSQL and CockroachDB, `now()` returns the *transaction* start time. With the default `commit_all_steps=True` each phase is its own transaction, so rows touched by the update phase and rows added by the insert phase get slightly different timestamps; with `commit_all_steps=False` the whole merge shares one.
 
 If you need a single timestamp with guaranteed semantics across every engine, do not use these parameters — pass your own column in `data` with a value you computed (e.g. `datetime.now(timezone.utc)`), and it will be stored as an ordinary field.
+
+---
+
+## ClickHouse
+
+ClickHouse has no `UPDATE` suited to merging and no transactions, so DBMerge merges into it differently: a changed row is written as a new version of itself, and a `ReplacingMergeTree` table keeps only the last version of every key. The interface stays the same.
+
+```python
+import clickhouse_connect
+from sqlalchemy import create_engine
+from dbmerge import dbmerge
+
+engine = create_engine("clickhousedb://default:@localhost:8123/default")   # a SQLAlchemy engine,
+engine = clickhouse_connect.get_client(host="localhost")                     # or a clickhouse-connect client
+
+with dbmerge(engine=engine, data=data, table_name="Facts", key=['Shop', 'Product', 'Date']) as merge:
+    result = merge.exec()
+```
+
+Install it with `pip install dbmerge[clickhouse]`, which adds clickhouse-connect and pyarrow. A client passed in stays yours: DBMerge does not close it. `schema` is a ClickHouse database and defaults to the current database of the connection. The server must be 23.8 or newer.
+
+### The target table
+
+It has to be a `ReplacingMergeTree` — plain, `Replicated` or `Shared`. Before anything is written, DBMerge checks that:
+
+- `ORDER BY` lists exactly the merge key columns, in any order. `ReplacingMergeTree` keeps one row per value of `ORDER BY`: an extra column there splits one key into several rows, a missing one merges different keys. Without the `key` argument, the key is taken from `ORDER BY`.
+- `PARTITION BY` uses only key columns. Rows are replaced only within a partition, so the versions of a key spread over two partitions would never be merged.
+- With a version column, `ReplacingMergeTree(ver)`, the data carries `ver`, or `ver` is the `merged_on_field`. Otherwise every new version would get the default `0` and lose to the row it replaces.
+- The data does not try to write `MATERIALIZED`, `ALIAS` or `EPHEMERAL` columns.
+
+A table that fails a check raises `NoKeyError` or `IncorrectParameter`.
+
+A table DBMerge creates is `ENGINE = ReplacingMergeTree ORDER BY (<key>)`, with no version column and no partitioning. The key columns are not nullable, since `ORDER BY` refuses nullable columns; every other column is `Nullable`. Types are chosen so that no value changes on the way in:
+
+| SQLAlchemy type | Detected from the data | Given in `data_types` |
+|---|---|---|
+| `Boolean` | `Bool` | `Bool` |
+| `SmallInteger` / `Integer` / `BigInteger` | `Int16` / `Int32` / `Int64` | the same |
+| `Float`, `Numeric` without precision | `Float64` | `Float64` |
+| `Numeric(p, s)` | `Decimal(p, s)` | `Decimal(p, s)` |
+| `String`, `Text` (any length) | `String` | `String` |
+| `DateTime` | `DateTime64(6)` | `DateTime` (whole seconds) |
+| `DateTime(timezone=True)` | `DateTime64(6, 'UTC')` | `DateTime('UTC')` |
+| `Date` | `Date32` (1900–2299) | `Date` (1970–2149) |
+| `Uuid` | `UUID` | `UUID` |
+| `JSON`, `LargeBinary` | `String`; dicts and lists are written as JSON text | `String` |
+
+Any ClickHouse type can be given in `data_types` as it is, and is then used exactly as written, nullability included:
+
+```python
+from clickhouse_connect.cc_sqlalchemy.datatypes.base import sqla_type_from_name
+
+data_types={'Shop': sqla_type_from_name('LowCardinality(String)')}
+```
+
+A `NULL` arriving for a column that is not `Nullable` fails the load. It is not stored as `0`, `''` or `1970-01-01`, as ClickHouse would otherwise do.
+
+### How the merge runs
+
+1. The data goes into the staging table in Arrow format, in chunks of 1,000,000 rows by default. Without pyarrow it goes through the native protocol of clickhouse-connect, a few times slower, and DBMerge logs a warning once.
+2. **Changed rows** are compared with the current version of the target rows and written anew as `INSERT … SELECT`. Columns the merge does not write keep their current value in the new version: `skip_update_fields`, `inserted_on_field`, and columns the data does not have.
+3. **New rows** are inserted when the target has no version of their key at all.
+4. **Mark** writes a new version of each row missing from the source, with `delete_mark_field` set.
+5. **Delete** is a lightweight `DELETE` of every version of the keys missing from the source.
+
+The conditions of `exec()` are built on `merge.table` and `merge.temp_table` as everywhere else. In `update_condition` and `delete_condition`, `merge.table` stands for the current version of the row. A correlated subquery in a condition needs a newer server: it fails on 23.8 and 24.8, and works on 26.9.
+
+The statistics differ slightly from the other engines:
+
+- `updated_row_count`, `inserted_row_count` and, with `delete_mode='mark'`, `deleted_row_count` are the rows each step actually wrote.
+- With `delete_mode='delete'`, `deleted_row_count` is counted right before the `DELETE`, which reports no count of its own. If other processes write to the table at the same time, it is an estimate.
+- Changed rows are written by an `INSERT`, so their time is part of `insert_time`, and `update_time` is `0`. `update_sql` holds that `INSERT … SELECT`.
+
+### Reading the table: FINAL
+
+`ReplacingMergeTree` removes older versions in background merges, at a time of its choosing. Until then, the table holds a changed row twice, the old version next to the new one. Read it with `FINAL` to see one row per key:
+
+```sql
+SELECT * FROM Facts FINAL WHERE Date = '2025-01-01'
+```
+
+`SETTINGS final = 1` does the same for every table in a query. Rows removed by `delete_mode='delete'` disappear from every read at once.
+
+### The staging table on ClickHouse
+
+It is a `TEMPORARY` table in the session of the clickhouse-connect client: no other connection sees it, and the server drops it with the session. `temp_schema` is then ignored. It is a regular table in `temp_schema` (which defaults to `schema`) in two cases:
+
+- **`delete_mode='delete'`**: a `DELETE` runs as a mutation, which can not read a temporary table.
+- **a client without a session**, created with `autogenerate_session_id=False` (for example to share it between threads): a temporary table would be gone right after it was created.
+
+A regular staging table can be left over by a process killed mid-merge; its name tells how old it is — see [The Staging Table](#the-staging-table).
+
+### Duplicate keys on ClickHouse
+
+The staging table on ClickHouse has no primary key, so duplicate keys in the source are not refused. All of them are written and counted, and `ReplacingMergeTree` keeps one — in practice the last, but this is not guaranteed. Remove duplicates from the source if it matters which one stays. A `NULL` in a key column still fails the load, as on the other engines, since `ORDER BY` columns are not nullable.
+
+### Not supported
+
+- `source_table_name`.
+- `commit_all_steps`: there are no transactions, every statement is final as soon as it runs.
+- clickhouse-sqlalchemy (`clickhouse://` engines): its driver opens a new session for every statement, so the temporary staging table would not survive. Use clickhouse-connect.
 
 ---
 
@@ -296,7 +402,7 @@ DBMerge logs a warning for empty input but still performs the delete — if an e
 
 #### The merge key must be unique in the target table
 
-Duplicates **in the source** are caught for you: the staging table is built with a primary key over `key`, so duplicate or `NULL` key values fail on load before the target is touched.
+Duplicates **in the source** are caught for you: the staging table is built with a primary key over `key`, so duplicate or `NULL` key values fail on load before the target is touched. ClickHouse is the exception — see [Duplicate keys](#duplicate-keys-on-clickhouse).
 
 The **target** is the database's responsibility. If it has no primary key or unique index on the key columns and already contains duplicate key values, every phase treats them as one logical row and rewrites all of them:
 
@@ -353,7 +459,7 @@ with dbmerge(engine=engine, data=data, table_name="Facts", delete_mode='delete')
     result = merge.exec(commit_all_steps=False)
 ```
 
-Any failure then rolls the whole merge back. The cost is one large transaction holding locks longer and producing a bigger WAL/undo segment. Choose per dataset size rather than by default — and note that even with per-step commits, a single bulk `UPDATE` or `DELETE` over millions of rows is still one large statement.
+Any failure then rolls the whole merge back. The cost is one large transaction holding locks longer and producing a bigger WAL/undo segment. ClickHouse has no transactions, so a merge there is never all-or-nothing: plan to re-run it. Choose per dataset size rather than by default — and note that even with per-step commits, a single bulk `UPDATE` or `DELETE` over millions of rows is still one large statement.
 
 ### Checklist before a production merge
 

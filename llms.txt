@@ -4,7 +4,7 @@
 
 Install: `pip install dbmerge`. Requires SQLAlchemy 2.x. Accepts `list[dict]`, `dict[str, list]`, `pandas.DataFrame`, `polars.DataFrame`, or an existing database table/view.
 
-Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB. **Not supported:** Oracle, DuckDB.
+Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB, ClickHouse ([COMPATIBILITY.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md) lists the drivers and versions). **Not supported:** Oracle.
 
 ## Rules for AI coding assistants
 
@@ -22,7 +22,7 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB. **Not 
 
 | Parameter | Meaning |
 |---|---|
-| `engine` | SQLAlchemy `Engine` from `create_engine()`. |
+| `engine` | SQLAlchemy `Engine` from `create_engine()`. For ClickHouse also a clickhouse-connect client. |
 | `table_name` | Target table. |
 | `data` | Source rows. Mutually exclusive with `source_table_name` (passing both raises). |
 | `source_table_name` / `source_schema` | Read the source straight from a table or view instead of Python memory. |
@@ -37,9 +37,11 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB. **Not 
 | `schema` / `temp_schema` | Target and staging schema. `schema` is **required** for MySQL/MariaDB (set it to the database name). |
 | `can_create_table` / `can_create_columns` / `can_create_schemas` | All default to `True`. Set to `False` in production against a migration-managed schema. |
 
-`exec(delete_condition=None, source_condition=None, update_condition=None, insert_condition=None, commit_all_steps=True, chunk_size=10000)` returns a `mergeResult` with `total_row_count`, `inserted_row_count`, `updated_row_count`, `deleted_row_count`, `total_time`, `temp_insert_time`, `insert_time`, `update_time`, `delete_time`, `table_created`, `added_fields`.
+`exec(delete_condition=None, source_condition=None, update_condition=None, insert_condition=None, commit_all_steps=True, chunk_size=None, bulk_load=True)` returns a `mergeResult` with `total_row_count`, `inserted_row_count`, `updated_row_count`, `deleted_row_count`, `total_time`, `temp_insert_time`, `insert_time`, `update_time`, `delete_time`, `table_created`, `added_fields`.
 
 `table_created` / `added_fields` report the schema changes the merge made to the target table. `added_fields` is a `{column name: SQLAlchemy type}` mapping — the type each column was really created with, after any adjustment for the target engine. It covers only columns added to an already existing table, never the auto-managed timestamp/delete-flag columns, and stays empty with `can_create_columns=False`. Use them downstream: a dataset built incrementally from a `merged_on_field` watermark can not detect a new column by itself — adding a column moves no watermark — so `added_fields` is the signal to rebuild it in full.
+
+`chunk_size` defaults to 10000 rows (1000000 on ClickHouse). `bulk_load=True` loads the staging table in bulk where the driver allows it (`COPY` on PostgreSQL/CockroachDB, bulk copy with mssql-python, `fast_executemany` with pyodbc, Arrow on DuckDB and ClickHouse); it stores the same values as the row by row `INSERT`, and `False` turns it off.
 
 Phases run in this order: staging load → `UPDATE` → `INSERT` → `DELETE`/mark.
 
@@ -130,7 +132,7 @@ with dbmerge(engine=engine, data=data, table_name="Facts", key=['id'],
 - **`delete_mode='delete'`/`'mark'` treats the source as a complete snapshot.** Every target row missing from the source is affected, and an empty source wipes the table. Scope a partial source with `delete_condition`.
 - **`commit_all_steps=True` (the default) is not atomic.** Each phase commits separately, so a failure in a later phase leaves the earlier ones applied and cannot be rolled back. Use `commit_all_steps=False` for an all-or-nothing merge, at the cost of one large transaction. Design merges to be safe to re-run.
 - **`commit_all_steps` covers the data, never the schema.** Creating the target table, adding a column and creating or dropping the staging table are always committed on their own, whichever value you pass.
-- **The merge key must be unique in the target table.** Duplicates in the *source* are caught automatically by the staging table's primary key, but if the target has no primary key or unique index on the key columns, duplicate rows there are all overwritten with the same source row, silently. That is the database schema's responsibility.
+- **The merge key must be unique in the target table.** Duplicates in the *source* are caught automatically by the staging table's primary key (not on ClickHouse), but if the target has no primary key or unique index on the key columns, duplicate rows there are all overwritten with the same source row, silently. That is the database schema's responsibility.
 - **Automatic schema creation is a convenience, not a schema tool.** It infers types from sample values and cannot recover precision, scale, length or timezone policy, and each backend resolves the resulting generic type differently. In production, manage the schema with migrations and pass `can_create_table=False, can_create_columns=False`.
 - **`delete_mark_field` must be a dedicated flag column.** The mark phase writes `1`/`True` into it and the update phase writes `0`/`False` back, so any other meaning the column carries is destroyed. It cannot be part of `key`, nor the same column as `merged_on_field`/`inserted_on_field` — those combinations are rejected.
 - **PostgreSQL/CockroachDB need `JSONB`, not `JSON`** (`from sqlalchemy.dialects.postgresql import JSONB`) — plain `JSON` cannot be compared to detect changes and is rejected.
@@ -155,18 +157,21 @@ So SQLite records UTC while every other engine records server-local time, and th
 
 Each merge stages its data in a table named `tmp_<yymmddHHMMSS>_<table>_<hex8>`, e.g. `tmp_260823224826_Facts_0472030e`: a prefix marking it disposable, the creation time from the **database** clock (so its timezone follows the same rules as the audit timestamps above), the target table name, and random hex that keeps parallel merges apart. The timestamp precedes the table name so a plain listing sorts by age. The whole name stays within 58 bytes — under PostgreSQL's 63-byte identifier limit with room for the `_pkey` suffix — and only the table-name part is truncated, on byte boundaries that never split a multibyte character.
 
-It is dropped when the context manager exits. On PostgreSQL, SQLite, MySQL and MariaDB it is a real `TEMPORARY` table: session-scoped, invisible to other connections, and removed by the database when the session ends, so a crashed process leaves nothing behind. On PostgreSQL that also keeps the staging data in the session's `temp_buffers` rather than `shared_buffers`, so it never evicts the working set and dropping it does not scan the whole buffer pool. `temp_schema` is quietly ignored there (postgres keeps temporary tables in its own session schema). Only MS SQL Server and CockroachDB get a regular table, and only there can a leftover survive a crash.
+It is dropped when the context manager exits. On PostgreSQL, SQLite, MariaDB and DuckDB it is a real `TEMPORARY` table: session-scoped, invisible to other connections, and removed by the database when the session ends, so a crashed process leaves nothing behind. On PostgreSQL that also keeps the staging data in the session's `temp_buffers` rather than `shared_buffers`, so it never evicts the working set and dropping it does not scan the whole buffer pool. `temp_schema` is quietly ignored on PostgreSQL and DuckDB, which keep temporary tables in a schema of their own. MS SQL Server, CockroachDB and MySQL get a regular table (MySQL can not refer to one temporary table twice in a statement), and only there can a leftover survive a crash. ClickHouse uses a `TEMPORARY` table, except with `delete_mode='delete'`.
 
 ## Database-specific notes
 
 - **PostgreSQL:** staging tables are `TEMPORARY`, so they stay out of `shared_buffers` and vanish with the session; `temp_schema` does not apply and is quietly ignored.
 - **MySQL/MariaDB:** `schema` is required. A **string column of the merge key** needs an explicit length (`data_types={'col': String(100)}`) because InnoDB shares one 3072-byte index budget between all key columns; other string columns become `LONGTEXT` automatically. Timezone-aware datetimes lose their UTC offset — no MySQL type stores one. Default collation ignores case and trailing spaces, so `'test'` and `' Test'` may not register as a change.
 - **SQLite:** no schema support; `schema`/`temp_schema` are reset to `None` with a warning.
-- **MS SQL Server:** bulk inserts are slower because of `pyodbc` limitations.
+- **MS SQL Server:** use pyodbc or mssql-python (SQLAlchemy 2.1+) for a fast staging load; pymssql loads row by row and truncates microseconds to milliseconds.
+- **DuckDB:** use a database file: with `:memory:` every connection sees its own database.
+- **ClickHouse:** through clickhouse-connect (`clickhousedb://` or its client), server 23.8+. The target must be a `ReplacingMergeTree` whose `ORDER BY` is exactly the merge key; a changed row is written as a new version, so read the table with `FINAL`. No transactions, no `source_table_name`, duplicate source keys are not refused. See the ClickHouse section of DOCUMENTATION.md.
 - **CockroachDB:** uses the `sqlalchemy-cockroachdb` dialect over the PostgreSQL wire protocol. `exec(commit_all_steps=False)` is markedly faster: one commit costs a consensus round whatever it carries (200 000 rows inserted in ~6s against ~16s on a single node; no difference on the update phase).
 
 ## Docs
 
 - [DOCUMENTATION.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md): full API reference, plus a **Data Loss Risks** section covering deletion semantics, type conversion and non-atomic commits.
 - [README.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/README.md): overview, benchmarks, database-specific limitations.
+- [COMPATIBILITY.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md): tested databases, drivers and versions, the bulk staging load of each driver, and where drivers store data differently.
 - [user_guide.py](https://github.com/pavel-v-sobolev/dbmerge/blob/main/user_guide.py): runnable advanced examples.
