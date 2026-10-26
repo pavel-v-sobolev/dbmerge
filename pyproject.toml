@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbmerge"
-version = "2.0.0"
+version = "2.0.1"
 description = "Database-agnostic UPSERT (insert/update/delete) for Python: merge pandas/polars DataFrames or dicts into PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB and ClickHouse via SQLAlchemy."
 
 keywords = [
@@ -53,21 +53,24 @@ Issues = "https://github.com/pavel-v-sobolev/dbmerge/issues"
 Documentation = "https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md"
 Examples = "https://github.com/pavel-v-sobolev/dbmerge/blob/main/user_guide.py"
 Repository = "https://github.com/pavel-v-sobolev/dbmerge"
-Changelog = "https://github.com/pavel-v-sobolev/dbmerge/releases"
+Changelog = "https://github.com/pavel-v-sobolev/dbmerge/blob/main/CHANGELOG.md"
 
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dbmerge"]
 
 [tool.hatch.build.targets.sdist]
+# A leading slash ties a file to the project root: the patterns work as in .gitignore, and "README.md"
+# alone would take the README of every folder.
 include = [
-    "src/dbmerge",
-    "README.md",
-    "DOCUMENTATION.md",
-    "COMPATIBILITY.md",
-    "llms.txt",
-    "user_guide.py",
-    "quick_start.py",
+    "/src/dbmerge",
+    "/README.md",
+    "/DOCUMENTATION.md",
+    "/COMPATIBILITY.md",
+    "/CHANGELOG.md",
+    "/llms.txt",
+    "/user_guide.py",
+    "/quick_start.py",
 ]
 
 [project.optional-dependencies]

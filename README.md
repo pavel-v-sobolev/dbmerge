@@ -100,12 +100,12 @@ Here is a rough performance comparison for synchronizing data of different sizes
 | **ClickHouse** (clickhouse-connect) | ~0.4s | ~4.1s |
 | **SQLite** (sqlite3) | ~0.7s | ~7.7s |
 | **PostgreSQL** (psycopg2) | ~1.2s | ~7.5s |
-| **MS SQL Server** (mssql-python) | ~1.5s | ~9.5s |
+| **MS SQL Server** (mssql-python) | ~1.1s | ~6.2s |
 | **MariaDB** (mariadb) | ~1.0s | ~12.1s |
 | **MySQL** (PyMySQL) | ~2.2s | ~25.4s |
 | **CockroachDB** (psycopg2) | ~2.7s | ~47s |
 
-The staging table is loaded in bulk where the driver allows it: `COPY FROM STDIN` on PostgreSQL and CockroachDB, bulk copy on MS SQL Server, Arrow on DuckDB and ClickHouse. The other drivers of PostgreSQL (`psycopg`, `pg8000`) and CockroachDB (`psycopg`) are within a few percent of `psycopg2`; on MS SQL Server `pyodbc` takes ~1.9s / ~14.5s and `pymssql`, which loads row by row, ~11s for 100k rows. See [COMPATIBILITY.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md#bulk-staging-load) for every driver.
+The staging table is loaded in bulk where the driver allows it: `COPY FROM STDIN` on PostgreSQL and CockroachDB, bulk copy on MS SQL Server, Arrow on DuckDB and ClickHouse. The other drivers of PostgreSQL (`psycopg`, `pg8000`) and CockroachDB (`psycopg`) are within a few percent of `psycopg2`; on MS SQL Server `pyodbc` takes ~1.7s / ~14.6s and `pymssql`, which loads row by row, ~11s for 100k rows. See [COMPATIBILITY.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md#bulk-staging-load) for every driver.
 
 
 ## Database-Specific Notes & Limitations

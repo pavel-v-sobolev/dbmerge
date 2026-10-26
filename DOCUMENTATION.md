@@ -27,14 +27,14 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 
 - **`engine`** *(sqlalchemy.engine.Engine | clickhouse_connect client)*: The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, MS SQL, CockroachDB, DuckDB and ClickHouse — [COMPATIBILITY.md](COMPATIBILITY.md) lists the drivers and versions. For ClickHouse it may also be a clickhouse-connect client — see [ClickHouse](#clickhouse).
 - **`table_name`** *(str)*: The name of the target table where data will be merged.
-- **`data`** *(list[dict] | dict[str, list] | pd.DataFrame | pl.DataFrame | None, optional)*: The source data to merge. Accepts a list of dictionaries (e.g., `[{'col1': 'val1'}, ...]`), a dict of lists (e.g., `{'col1': ['val1', ...], ...}`) or a Pandas/Polars DataFrame. For a list of dictionaries, the set of columns is taken from the first row: all rows must have the same keys, and keys that appear only in later rows are ignored.
+- **`data`** *(list[dict] | dict[str, list] | pd.DataFrame | pl.DataFrame | None, optional)*: The source data to merge. Accepts a list of dictionaries (e.g., `[{'col1': 'val1'}, ...]`), a dict of lists (e.g., `{'col1': ['val1', ...], ...}`) or a Pandas/Polars DataFrame. For a list of dictionaries, every row must have the same keys as the first one, and a DataFrame must not have two columns of one name: otherwise the values of a column would be lost, so either raises `IncorrectDataError`. A column the target computes itself (`GENERATED ALWAYS AS …`) can not be written, and raises `IncorrectParameter` when it comes in `data` (on DuckDB the database refuses it itself).
 - **`delete_mode`** *(Literal['no', 'delete', 'mark'], optional)*: Defines how to handle records that exist in the target table but are missing from the source data. 
   - `'no'` (default): Retain existing target rows (do nothing).
   - `'delete'`: Hard delete rows from the target table.
   - `'mark'`: Soft delete rows by setting a flag in `delete_mark_field`.
   
   > ⚠️ With `'delete'` or `'mark'`, **every** target row missing from the source is affected. If the source covers only part of the table (or is empty), restrict the scope with the `delete_condition` argument of `exec()` — otherwise an empty source with `delete_mode='delete'` wipes the entire table.
-- **`delete_mark_field`** *(str, optional)*: The column used to flag a record as deleted. Must be a **Boolean** or **Integer** column. A row missing from the source is set to `True`/`1`; inserted or resurrected (reappeared) rows are set to `False`/`0` (an active row is `False`/`0`, never `NULL`). If this column is present in the incoming `data`, the supplied value is used as-is. It must be a column of its own: it cannot be part of `key`, nor the same column as `merged_on_field` or `inserted_on_field`. On MySQL/MariaDB a `BOOLEAN` column is really `TINYINT(1)` and is read back as an integer, so the flag there is `0`/`1` rather than `False`/`True`.
+- **`delete_mark_field`** *(str, optional)*: The column used to flag a record as deleted. Must be a **Boolean** or **Integer** column. A row missing from the source is set to `True`/`1`; inserted or resurrected (reappeared) rows are set to `False`/`0`, so a flag DBMerge manages is never `NULL`. If this column is present in the incoming `data`, the supplied value is used as-is, `NULL` included. It must be a column of its own: it cannot be part of `key`, nor the same column as `merged_on_field` or `inserted_on_field`. On MySQL/MariaDB a `BOOLEAN` column is really `TINYINT(1)` and is read back as an integer, so the flag there is `0`/`1` rather than `False`/`True`.
 - **`delete_mark_values`** *(dict[str, Any] | None, optional)*: Extra columns to write when a row is marked as deleted, as `{column name: value}`. Requires `delete_mode='mark'`. Without it, a marked row keeps the values of the last load that still contained it; with it, you can also record something about the marking itself — for example `delete_mark_values={'load_id': 42}` writes `42` into the `load_id` column of every row that disappeared from the source. The columns must exist in the target table. They cannot be part of `key` (that would rewrite the identity of the row being marked), and `delete_mark_field`, `merged_on_field` and `inserted_on_field` are managed automatically and cannot be listed here either.
 - **`merged_on_field`** *(str | None, optional)*: The name of a timestamp column. Automatically updated to the current datetime whenever a row is inserted, updated, or marked as deleted. This column is always managed automatically: if present in the incoming `data`, the supplied values are ignored.
 - **`inserted_on_field`** *(str | None, optional)*: The name of a timestamp column. Automatically set to the current datetime when a new row is initially inserted. It is ignored during updates or deletions. This column is always managed automatically: if present in the incoming `data`, the supplied values are ignored.
@@ -58,7 +58,7 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
   On MySQL/MariaDB a **string column of the merge key** must be given an explicit length here: InnoDB indexes at most 3072 bytes per key, shared by all of its columns, so no default length is safe.
 - **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name). On ClickHouse it is a database, and defaults to the current database of the connection.
 - **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created. Defaults to `schema`. The table is named `tmp_<yymmddHHMMSS>_<table>_<hex8>` and dropped when the context manager exits — see [The Staging Table](#the-staging-table) for the naming rules and for how it is created on each engine. Quietly ignored on PostgreSQL and DuckDB, which keep temporary tables in a schema of their own, and on ClickHouse whenever the staging table is a temporary one there.
-- **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`. Not supported on ClickHouse.
+- **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`. A column the target computes itself (`GENERATED ALWAYS AS …`) is left out: the target computes it anyway. Not supported on ClickHouse.
 - **`source_schema`** *(str | None, optional)*: The database schema of the source table or view.
 - **`can_create_table`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target table if it does not exist.
 - **`can_create_columns`** *(bool, optional)*: Defaults to `True`. Allows the module to append missing columns to the target table.
@@ -66,15 +66,15 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
 
 #### Exceptions
 
-All exceptions subclass `RuntimeError`. They are **not** re-exported from the package root — import them from `dbmerge.dbmerge`:
+All exceptions subclass `RuntimeError`, and can be imported from the package root (`from dbmerge.dbmerge import …` works as well):
 
 ```python
-from dbmerge.dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError, TableNotFoundError, TempTableAlreadyExists
+from dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError, TableNotFoundError, TempTableAlreadyExists
 ```
 
-- **`IncorrectParameter`**: arguments are wrong, missing, or conflict with each other (two roles on one column, `delete_mark_values` pointing at a key or managed column, a non-boolean `commit_all_steps`, `source_schema` without `source_table_name`).
+- **`IncorrectParameter`**: arguments are wrong, missing, or conflict with each other (two roles on one column, `delete_mark_values` pointing at a key or managed column, a non-boolean `commit_all_steps`, `source_schema` without `source_table_name`, a column the target computes itself brought in `data`).
 - **`NoKeyError`**: no usable merge key could be determined, or a key column is also used for another role.
-- **`IncorrectDataError`**: the input data has an unsupported shape, or a column type could not be resolved.
+- **`IncorrectDataError`**: the input data has an unsupported shape (rows of a list of dicts with different keys, two DataFrame columns of one name), a column type could not be resolved, or on ClickHouse a value does not fit its column (the error names the column and the row).
 - **`TableNotFoundError`**: the target table does not exist and `can_create_table=False`.
 - **`TempTableAlreadyExists`**: a staging table with the generated name already exists.
 
@@ -94,6 +94,8 @@ This method triggers the actual merge operation based on the configurations pass
 2. **Update:** Updates existing rows in the target table where field values differ from the temporary table.
 3. **Insert:** Copies rows from the temporary table to the target table that do not currently exist.
 4. **Delete / Mark:** Deletes or marks rows in the target table that are entirely missing from the temporary staging data.
+
+Because updates run before deletes, a `UNIQUE` constraint on columns other than the key can stop a valid snapshot. When a value moves to another row while the row that holds it now leaves the source — code `'B'` goes from row 2, which is deleted, to row 1 — the update meets the old row 2 still in place and fails with an `IntegrityError`. Such a change takes two merges, or the constraint has to be checked differently.
 
 **Scoped Deletion Example:**
 If you load data in chunks (e.g., monthly snapshots), you can restrict the deletion scope using the `delete_condition` argument so that it only affects the relevant timeframe.
@@ -149,8 +151,8 @@ with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
   It applies to the **data only**. Schema changes — creating the target table, adding columns, creating and dropping the staging table — are always committed on their own and are never part of the merge transaction, so `commit_all_steps=False` does not make them roll back with the data.
 
   It has no effect on ClickHouse, which has no transactions: every statement there is final as soon as it runs.
-- **`chunk_size`** *(int, optional)*: Defaults to `10000`, and to `1000000` on ClickHouse, where every insert creates a new part of the table and small ones are costly. Defines the batch size when inserting raw data (from lists of dicts, dicts of lists or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Must be a positive integer.
-- **`bulk_load`** *(bool, optional)*: Defaults to `True`. Loads the staging table in bulk where the database and its driver allow it — `COPY FROM STDIN` on PostgreSQL and CockroachDB, bulk copy with mssql-python, `fast_executemany` with pyodbc, Arrow on DuckDB — instead of SQLAlchemy's row by row `INSERT`. The values stored are the same either way; `False` turns it off. ClickHouse always loads in bulk. See [Bulk Staging Load](COMPATIBILITY.md#bulk-staging-load) for each driver, the speed-ups, and the data that still goes row by row.
+- **`chunk_size`** *(int, optional)*: Defaults to `10000`; to `100000` for the bulk copy of mssql-python, where every chunk opens a connection of its own; and to `1000000` on ClickHouse, where every insert creates a new part of the table and small ones are costly. Defines the batch size when inserting raw data (from lists of dicts, dicts of lists or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Must be a positive integer.
+- **`bulk_load`** *(bool, optional)*: Defaults to `True`. Loads the staging table in bulk where the database and its driver allow it — `COPY FROM STDIN` on PostgreSQL and CockroachDB, bulk copy with mssql-python, `fast_executemany` with pyodbc, Arrow on DuckDB — instead of SQLAlchemy's row by row `INSERT`. The values stored are the same either way — except on CockroachDB, whose COPY does not apply the limits of column types (see [CockroachDB](COMPATIBILITY.md#cockroachdb)); `False` turns it off. ClickHouse always loads in bulk. See [Bulk Staging Load](COMPATIBILITY.md#bulk-staging-load) for each driver, the speed-ups, and the data that still goes row by row.
 
 #### Execution Results & Statistics
 `exec()` returns a `mergeResult` dataclass. The same statistics are also available as attributes on the `dbmerge` instance after `exec()` completes.
@@ -161,7 +163,7 @@ Fields of the returned `mergeResult` (and matching instance attributes):
 - **`inserted_row_count`**: Number of new rows inserted into the target table.
 - **`updated_row_count`**: Number of existing rows successfully updated.
 - **`deleted_row_count`**: Number of rows deleted (or flagged as deleted).
-- **`total_time`**: Total execution time (in seconds) for the entire database operation.
+- **`total_time`**: The sum of `temp_insert_time`, `insert_time`, `update_time` and `delete_time`, in seconds. Schema changes, commits and the cleanup of the staging table are not part of it.
 - **`temp_insert_time`**: Time taken (in seconds) to load data into the temporary table.
 - **`insert_time`**: Time taken (in seconds) to perform the target `INSERT` step.
 - **`update_time`**: Time taken (in seconds) to perform the target `UPDATE` step.
@@ -183,9 +185,9 @@ if result.added_fields:
 
 The executed SQL statements are exposed only on the `dbmerge` instance (not in `mergeResult`):
 
-- **`insert_sql`**: The exact SQL `INSERT` statement executed against the database.
-- **`update_sql`**: The exact SQL `UPDATE` statement executed against the database.
-- **`delete_sql`**: The exact SQL `DELETE` (or mark) statement executed against the database.
+- **`insert_sql`**: The `INSERT` statement of the insert phase, as SQLAlchemy renders it, with placeholders in place of the values.
+- **`update_sql`**: The `UPDATE` statement of the update phase, rendered the same way.
+- **`delete_sql`**: The `DELETE` (or mark) statement of the delete phase, rendered the same way.
 
 ---
 
@@ -232,6 +234,8 @@ ORDER BY table_name;
 ```
 
 Do not drop a staging table just because it looks old: a long-running merge is still using it. Compare against the age of the merges you actually run.
+
+Should the staging table fail to drop when the merge ends, DBMerge logs a warning with its name rather than raising: the data of a merge that succeeded is committed already, and the error of a merge that failed must not be replaced.
 
 ---
 

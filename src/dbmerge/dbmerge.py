@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists, literal, literal_column
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
 from sqlalchemy import String, Text, Integer, BigInteger, Numeric, Double, Boolean, DateTime, Date, Time, JSON, Uuid, LargeBinary
-from sqlalchemy import types, dialects, func, text, schema, cast
+from sqlalchemy import types, dialects, func, schema, cast
 
 POLARS_TO_SQLALCHEMY_TYPE_MAP = {
     'Int8': BigInteger(),
@@ -254,7 +254,8 @@ class dbmerge:
                 table must be a ReplacingMergeTree.
             table_name (str): The name of the target table where data will be merged.
             data (list[dict] | dict[str,list] | pd.DataFrame | pl.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries (e.g. [{'col1': 'val1'}, ...]), a dict of lists (e.g. {'col1': ['val1', ...], ...}) or a Pandas/Polars DataFrame.
-                For a list of dictionaries, the set of columns is taken from the first row: all rows must have the same keys, keys that appear only in later rows are ignored.
+                For a list of dictionaries, every row must have the same keys as the first one, and a DataFrame must not have two
+                columns of one name: otherwise the values of a column would be lost, so either raises IncorrectDataError.
             delete_mode (Literal['no', 'delete', 'mark'], optional): Defines how to handle records that exist in the target table but are missing from the source data.
                 - 'no' (default): Retain existing target rows.
                 - 'delete': Hard delete rows from the target table.
@@ -309,12 +310,13 @@ class dbmerge:
         Raises:
             IncorrectParameter: Raised when arguments are not correct, missing, or conflict with each other.
             NoKeyError: Raised when no usable merge key can be determined, or when a key column is also used for another role.
-            IncorrectDataError: Raised when the input data has an unsupported shape or a type that can not be resolved.
+            IncorrectDataError: Raised when the input data has an unsupported shape (rows of a list of dicts with different
+                keys, two DataFrame columns of one name) or a type that can not be resolved.
             TableNotFoundError: Raised when the target table does not exist and can_create_table=False.
             TempTableAlreadyExists: Raised if a temporary table with the generated name already exists (a very unlikely case, since the name includes a random unique id).
 
-        All of these subclass RuntimeError. They live in dbmerge.dbmerge and are not re-exported from
-        the package root, so import them as: from dbmerge.dbmerge import IncorrectParameter
+        All of these subclass RuntimeError, and can be imported from the package root:
+        from dbmerge import IncorrectParameter (from dbmerge.dbmerge works as well).
         """
         
 
@@ -667,11 +669,13 @@ class dbmerge:
                 dropping the staging table) are always committed on their own and never roll back with the data.
             chunk_size (int, optional): Defines the batch size when inserting raw data (from lists of dicts, dicts of lists
                 or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Defaults to 10000,
-                on ClickHouse to 1,000,000: every insert creates a part of the table there, and small ones are costly.
+                to 100,000 for the bulk copy of mssql-python (every chunk opens a connection of its own), and on ClickHouse
+                to 1,000,000: every insert creates a part of the table there, and small ones are costly.
             bulk_load (bool, optional): Load the staging table in bulk where the engine and its driver allow it
                 (COPY FROM STDIN on PostgreSQL and CockroachDB, bulk copy with mssql-python, fast_executemany with
                 pyodbc, Arrow on DuckDB), instead of the row by row INSERT of SQLAlchemy. The data stored is the same
-                either way; False falls back to the row by row INSERT. ClickHouse always loads in bulk.
+                either way, except on CockroachDB, whose COPY does not apply the limits of column types (VARCHAR(n),
+                DECIMAL(p,s)); False falls back to the row by row INSERT. ClickHouse always loads in bulk.
 
         Returns:
             mergeResult: A dataclass object containing execution statistics (e.g., inserted_row_count, total_time)
@@ -682,6 +686,8 @@ class dbmerge:
         if self.merge_finished:
             raise IncorrectParameter(f'Merge exec already finished on table {self.table_full_name}')
 
+        # A bulk loader may take chunks of its own size when the caller has not chosen one (see _bulk_load).
+        self.chunk_size_given = chunk_size is not None
         if chunk_size is None:
             chunk_size = getattr(self._dialect_module, 'DEFAULT_CHUNK_SIZE', DEFAULT_CHUNK_SIZE)
 
@@ -784,14 +790,16 @@ class dbmerge:
     
         
         except Exception:
-            if hasattr(self, 'conn'):
-                self.conn.rollback()
+            # A rollback that fails too (the connection broke, say) must not hide the error of the merge.
+            try:
+                if hasattr(self, 'conn'):
+                    self.conn.rollback()
+            except Exception as e:
+                logger.warning(f'Rollback after a failed merge failed as well: {e}')
             raise
 
         finally:
-            self._drop_temp_table()
-            if hasattr(self, 'conn'):
-                self.conn.close()
+            self._close()
             self.merge_finished = True
 
 
@@ -800,21 +808,46 @@ class dbmerge:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self._drop_temp_table()
-        if hasattr(self, 'conn') and not self.conn.closed:
-            self.conn.close()
+        self._close()
+
+    def _close(self):
+        """
+        Drops the staging table and closes the connection. Never raises: a failure here must not hide the
+        error of the merge, and after a merge that succeeded its data is committed already - so a staging
+        table that can not be dropped is reported as a warning.
+        """
+        temp_table = getattr(self, 'temp_table', None)
+        try:
+            if temp_table is not None:
+                try:
+                    self._drop_temp_table()
+                except Exception as e:
+                    # The connection may have broken along with the merge. Once it is closed,
+                    # _drop_temp_table tries a regular staging table again on another connection of the pool.
+                    self._close_connection()
+                    try:
+                        self._drop_temp_table()
+                    except Exception:
+                        logger.warning(f'Could not drop the staging table "{temp_table.fullname}": {e}. A TEMPORARY '
+                                       f'table goes with its session, a regular one is left behind and has to be '
+                                       f'dropped by hand.')
+                        self.temp_table = None
+        finally:
+            self._close_connection()
+
+    def _close_connection(self):
+        try:
+            if hasattr(self, 'conn') and not self.conn.closed:
+                self.conn.close()
+        except Exception as e:
+            logger.warning(f'Could not close the connection: {e}')
 
     def __del__(self):
         # Best-effort safety net for objects used without a context manager and
         # without calling exec(). Must never raise: during interpreter shutdown
-        # the engine/connection may already be finalized.
+        # the engine/connection may already be finalized, and even logging may fail.
         try:
-            self._drop_temp_table()
-        except Exception:
-            pass
-        try:
-            if hasattr(self, 'conn') and not self.conn.closed:
-                self.conn.close()
+            self._close()
         except Exception:
             pass
 
@@ -847,15 +880,29 @@ class dbmerge:
     def _get_fields_from_list_of_dict(self):
         test_row = self.data[0]
         self.type_of_data = 'list of dict'
-        if isinstance(test_row,dict):
-            self.data_fields = {c:None for c in test_row if c not in self.special_fields}
-        else:
+        if not isinstance(test_row,dict):
             raise IncorrectDataError(f'Input "data" is list, but no dict inside')
+        # The columns are those of the first row, so every row must have exactly its keys. Otherwise the
+        # values of an extra key would be lost, and a missing key would fail the row by row INSERT but turn
+        # into NULL in a bulk load. Checking a million rows takes about 0.15s.
+        keys = test_row.keys()
+        for i, row in enumerate(self.data):
+            if not isinstance(row, dict):
+                raise IncorrectDataError(f'Input "data" is a list of dicts, but row {i} is {type(row).__name__}')
+            if row.keys() != keys:
+                extra, missing = sorted(set(row) - set(keys)), sorted(set(keys) - set(row))
+                raise IncorrectDataError(f'Row {i} of "data" does not have the keys of the first row: '
+                                         f'extra {extra}, missing {missing}. All rows must have the same keys.')
+        self.data_fields = {c:None for c in test_row if c not in self.special_fields}
 
     def _get_fields_from_dict_of_list(self):
         self.data_fields = {c:None for c in self.data.keys() if c not in self.special_fields}
 
     def _get_fields_from_pandas(self):
+        # Two columns of one name would end up as one: the value of one of them would be lost silently.
+        duplicated = self.data.columns[self.data.columns.duplicated()].unique().tolist()
+        if duplicated:
+            raise IncorrectDataError(f'Input DataFrame has more than one column named {duplicated}')
         self.data_fields = {c:None for c in self.data.columns if c not in self.special_fields}
 
     def _get_fields_from_polars(self):
@@ -881,6 +928,7 @@ class dbmerge:
     def _check_existing_and_new_fields(self):
         if self.table is not None:
             existing_fields = {c.name:c.type for c in self.table.c}
+            self._leave_out_computed_fields()
         else:
             existing_fields = {}
 
@@ -904,6 +952,23 @@ class dbmerge:
         inserted_on_field = self.inserted_on_field
         if inserted_on_field is not None and inserted_on_field not in existing_fields:
             self.new_fields[inserted_on_field]=DateTime()
+
+
+    def _leave_out_computed_fields(self):
+        # A column the database computes itself (GENERATED ALWAYS AS ...) can not be written by an INSERT or
+        # an UPDATE. A source table built like the target has the same column, and its value is what the
+        # target computes anyway, so it is left out. Data that brings a value for it is refused before any
+        # write: the value could not be stored.
+        computed = [c.name for c in self.table.c if c.computed is not None and c.name in self.data_fields]
+        if not computed:
+            return
+        if self.source_table is None:
+            raise IncorrectParameter(f'Columns {computed} of table "{self.table_full_name}" are computed by the '
+                                     f'database and can not be written. Leave them out of "data".')
+        logger.info(f'Columns {computed} are computed by the database in table "{self.table_full_name}", '
+                    f'they are not merged from the source table.')
+        for f in computed:
+            del self.data_fields[f]
 
 
     def _resolve_delete_mark_values(self):

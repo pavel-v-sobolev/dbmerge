@@ -33,7 +33,11 @@ def arrow_table(merge: dbmerge, begin, end, nested_as_json=(), processors=None, 
     fields = list(merge.data_fields)
 
     if merge.type_of_data in ('list of dict', 'dict of list'):
-        return pa.Table.from_pydict(python_columns(merge, begin, end, nested_as_json, processors, wall_clock))
+        columns = python_columns(merge, begin, end, nested_as_json, processors, wall_clock)
+        try:
+            return pa.Table.from_pydict(columns)
+        except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
+            raise _arrow_value_error(columns, begin, e) from e
 
     if merge.type_of_data == 'pandas':
         import pandas as pd
@@ -51,7 +55,10 @@ def arrow_table(merge: dbmerge, begin, end, nested_as_json=(), processors=None, 
                     converted[f] = values
         if converted:
             frame = frame.assign(**converted)
-        return pa.Table.from_pandas(frame, preserve_index=False)
+        try:
+            return pa.Table.from_pandas(frame, preserve_index=False)
+        except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
+            raise _arrow_value_error({f: frame[f].tolist() for f in fields}, begin, e) from e
 
     # polars, which is already loaded when its DataFrame is passed
     import polars as pl
@@ -69,6 +76,33 @@ def arrow_table(merge: dbmerge, begin, end, nested_as_json=(), processors=None, 
     if converted:
         frame = frame.with_columns(converted)
     return frame.to_arrow()
+
+
+def _arrow_value_error(columns, begin, error):
+    """
+    The error of a chunk Arrow can not take, naming the column and the row of the value it stops at. Arrow
+    tells neither (only pandas adds the column), so the columns are built one by one, and the failing one
+    is cut in halves to the shortest beginning that still fails: some 14 tries for a chunk of 10,000 rows,
+    and only once something has failed. The bulk loaders of other engines catch it and go row by row; on
+    ClickHouse, which loads in bulk only, it is what the caller gets.
+    """
+    import pyarrow as pa
+    from .dbmerge import IncorrectDataError
+    for name, values in columns.items():
+        try:
+            pa.array(values)
+        except (pa.ArrowInvalid, pa.ArrowTypeError):
+            converts, fails = 0, len(values)     # values[:converts] converts, values[:fails] does not
+            while fails - converts > 1:
+                middle = (converts + fails) // 2
+                try:
+                    pa.array(values[:middle])
+                    converts = middle
+                except (pa.ArrowInvalid, pa.ArrowTypeError):
+                    fails = middle
+            return IncorrectDataError(f'Column "{name}", row {begin + fails - 1}: the value {values[fails - 1]!r} '
+                                      f'does not fit the column ({error})')
+    return IncorrectDataError(f'The data could not be put in an Arrow table: {error}')
 
 
 def python_columns(merge: dbmerge, begin, end, nested_as_json=(), processors=None, wall_clock=None):

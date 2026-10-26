@@ -1,0 +1,165 @@
+diff --git a/src/dbmerge/_bulk_load.py b/src/dbmerge/_bulk_load.py
+index a1d700d..d2553c1 100644
+--- a/src/dbmerge/_bulk_load.py
++++ b/src/dbmerge/_bulk_load.py
+@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
+ 
+ import importlib.util
+ import io
++import json
+ import sys
+ import time
+ 
+@@ -103,6 +104,12 @@ def _postgres_copy(merge: dbmerge):
+     from zoneinfo import ZoneInfo
+ 
+     start_time = time.perf_counter()
++    # COPY goes through the driver's own cursor, past SQLAlchemy. Unless SQLAlchemy has a transaction open by
++    # then, it does not know of the one COPY starts: a failed COPY would leave the connection aborted, the
++    # rollback in exec() would not reach the driver, and the DROP of the staging table would then fail with
++    # "current transaction is aborted", in place of the error that COPY raised.
++    if not merge.conn.in_transaction():
++        merge.conn.begin()
+     preparer = merge.conn.dialect.identifier_preparer
+     fields = list(merge.data_fields)
+     sql = (f'COPY {preparer.format_table(merge.temp_table)} ({", ".join(preparer.quote(f) for f in fields)}) '
+@@ -180,7 +187,9 @@ def _csv_by_csv_module(merge: dbmerge, begin, end, processors, wall_clock):
+ 
+ 
+ def _copy(merge: dbmerge, sql, data):
+-    driver = merge.conn.dialect.driver
++    from sqlalchemy.exc import DBAPIError
++    dialect = merge.conn.dialect
++    driver = dialect.driver
+     cursor = merge.conn.connection.dbapi_connection.cursor()
+     try:
+         if driver == 'psycopg2':
+@@ -190,6 +199,10 @@ def _copy(merge: dbmerge, sql, data):
+                 copy.write(data)
+         else:  # pg8000
+             cursor.execute(sql, stream=io.BytesIO(data))
++    except dialect.loaded_dbapi.Error as e:
++        # The driver's own exception, wrapped as SQLAlchemy wraps it for the row by row INSERT, so that
++        # the caller gets the same exception class (DataError, IntegrityError...) with bulk_load on or off.
++        raise DBAPIError.instance(sql, None, e, dialect.loaded_dbapi.Error, dialect=dialect) from e
+     finally:
+         cursor.close()
+ 
+@@ -198,11 +211,29 @@ def _json_processors(merge: dbmerge):
+     # A JSON column gets its values through its own bind processor, as the row by row INSERT does: the
+     # serializer of the engine, and None as the JSON literal null unless the type says none_as_null.
+     from sqlalchemy import JSON
++    from sqlalchemy.sql.elements import Null
++    dialect = merge.conn.dialect
+     processors = {}
+     for f in merge.data_fields:
+         column_type = merge.temp_table.c[f].type
+-        if isinstance(column_type, JSON):
+-            processors[f] = column_type.bind_processor(merge.conn.dialect) or (lambda v: v)
++        if not isinstance(column_type, JSON):
++            continue
++        processor = column_type.bind_processor(dialect)
++        if processor is None:
++            # psycopg 3 has no text form here: SQLAlchemy hands it a Jsonb wrapper, so a dict would reach the
++            # CSV as a dict - Python's repr without pyarrow, a struct column (and a silent fall back to row by
++            # row) with it. Serialized the way the row by row INSERT stores it: JSON null for None, unless the
++            # type says none_as_null.
++            serializer = getattr(dialect, '_json_serializer', None) or json.dumps
++            def processor(v, serializer=serializer, none_as_null=column_type.none_as_null):
++                if v is JSON.NULL:          # the JSON null, always
++                    return serializer(None)
++                if isinstance(v, Null):     # sqlalchemy.null(): SQL NULL, always
++                    return None
++                if v is None:
++                    return None if none_as_null else serializer(None)
++                return serializer(v)
++        processors[f] = processor
+     return processors
+ 
+ 
+diff --git a/tests/test_all.py b/tests/test_all.py
+index c9ec8fd..816a5f5 100644
+--- a/tests/test_all.py
++++ b/tests/test_all.py
+@@ -13,7 +13,7 @@ import logging
+ from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_, cast, type_coerce
+ from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, Double, JSON, Uuid, StaticPool
+ from sqlalchemy import types
+-from sqlalchemy.exc import NoSuchModuleError
++from sqlalchemy.exc import NoSuchModuleError, DBAPIError
+ 
+ from sample_data_in_sqlite import get_data, get_modified_data
+ import urllib
+@@ -1376,6 +1376,72 @@ def test_clickhouse_without_pyarrow_stores_what_arrow_stores(type_of_data, monke
+         merge.exec()
+     _assert_same_rows(engine, 'clickhouse', 'Arrow', 'native protocol')
+ 
++
++# The engines that load the staging table with COPY.
++POSTGRES_FAMILY = [e for e in engines if e.startswith(('postgres', 'cockroachdb'))]
++
++
++@pytest.mark.parametrize("engine_name", POSTGRES_FAMILY)
++def test_bulk_load_reports_the_original_error(engine_name):
++    # COPY writes through the driver's own cursor, past SQLAlchemy. A value it refuses must surface as the
++    # same SQLAlchemy exception the row by row INSERT raises - not as "current transaction is aborted" from
++    # the DROP of the staging table that runs after it.
++    logger.debug(f'TEST BULK LOAD REPORTS THE ORIGINAL ERROR {engine_name}')
++    engine = make_engine(engine_name)
++    errors = {}
++    for bulk_load in (False, True):
++        drop_table_if_exists(engine, 'BadData', schema='target')
++        with pytest.raises(DBAPIError) as info:
++            with dbmerge(engine=engine, data=[{'id': 1, 'value': 'not a number'}], table_name='BadData',
++                         schema='target', temp_schema='tmp', key=['id'],
++                         data_types={'value': types.BigInteger()}) as merge:
++                merge.exec(bulk_load=bulk_load)
++        errors[bulk_load] = info.value
++    drop_table_if_exists(engine, 'BadData', schema='target')
++    assert type(errors[True]) is type(errors[False]), (type(errors[False]), type(errors[True]))
++    assert 'not a number' in str(errors[True]), str(errors[True])
++
++
++@pytest.mark.parametrize("engine_name,type_of_data", [(engine_name, type_of_data)
++                                                     for engine_name in POSTGRES_FAMILY
++                                                     for type_of_data in ('list of dict', 'dict of list', 'pandas', 'polars')])
++def test_bulk_load_without_pyarrow_stores_what_row_by_row_stores(engine_name, type_of_data, monkeypatch):
++    # Without pyarrow the CSV for COPY is written by the csv module (Python 3.12+). CI always has pyarrow,
++    # so this path is covered only here.
++    import sys
++    if sys.version_info < (3, 12):
++        pytest.skip('without pyarrow, COPY needs the csv module of Python 3.12+')
++    # imported lazily by dbmerge, so it may not be loaded yet. Not "import dbmerge._bulk_load": that would
++    # bind the name dbmerge in this function to the package, not to the class.
++    from dbmerge import _bulk_load
++    monkeypatch.setattr(_bulk_load, '_has_pyarrow', lambda: False)
++    logger.debug(f'TEST BULK LOAD WITHOUT PYARROW STORES WHAT ROW BY ROW STORES {engine_name} {type_of_data}')
++    engine = make_engine(engine_name)
++    prepare_and_clean_data(engine)
++    data, data_types = _parity_data(type_of_data, True)
++    for table_name, bulk_load in (('Facts', False), ('Facts_bulk', True)):
++        with dbmerge(engine=engine, data=data, table_name=table_name, schema='target', temp_schema='tmp',
++                     key=key, data_types=data_types) as merge:
++            merge.exec(bulk_load=bulk_load)
++    _assert_same_rows(engine, engine_name, 'row by row', 'bulk without pyarrow')
++
++
++@pytest.mark.parametrize("engine_name", POSTGRES_FAMILY)
++def test_json_goes_through_copy(engine_name, caplog):
++    # A JSON column must not push its chunks back to row by row: with psycopg 3 SQLAlchemy binds JSON as a
++    # Jsonb wrapper, which has no text form for the CSV unless dbmerge serializes it itself.
++    from sqlalchemy.dialects.postgresql import JSONB
++    engine = make_engine(engine_name)
++    drop_table_if_exists(engine, 'JsonData', schema='target')
++    data = [{'id': i, 'doc': [{'a': i, 'list': [1, None], 'text': 'x"y'}, [1, 'two'], None, {}][i % 4]} for i in range(8)]
++    with caplog.at_level(logging.DEBUG, logger='dbmerge'):
++        with dbmerge(engine=engine, data=data, table_name='JsonData', schema='target', temp_schema='tmp',
++                     key=['id'], data_types={'doc': JSONB()}) as merge:
++            merge.exec()
++    drop_table_if_exists(engine, 'JsonData', schema='target')
++    fallbacks = [r.getMessage() for r in caplog.records if 'row by row' in r.getMessage()]
++    assert not fallbacks, fallbacks
++
+ if __name__ == '__main__':
+ 
+     test_date_range_with_delete_mark('cockroachdb','list of dict')

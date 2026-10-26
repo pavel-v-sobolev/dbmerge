@@ -4,6 +4,8 @@ import numpy as np
 from datetime import date, datetime, timezone, timedelta
 import time
 import os
+import sys
+import importlib.util
 import re
 import uuid
 import decimal
@@ -11,15 +13,15 @@ import pytest
 import logging
 
 from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_, cast, type_coerce
-from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, Double, JSON, Uuid, StaticPool
+from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, Double, JSON, Uuid, StaticPool, Computed
 from sqlalchemy import types
-from sqlalchemy.exc import NoSuchModuleError
+from sqlalchemy.exc import NoSuchModuleError, DBAPIError
 
 from sample_data_in_sqlite import get_data, get_modified_data
 import urllib
 from dbmerge import dbmerge, drop_table_if_exists, format_ms
 from dbmerge.duckdb import read_table as read_duckdb_table
-# The exceptions are not re-exported from the package root.
+# Through the module: the constants live only there (the exceptions are in the package root as well).
 from dbmerge.dbmerge import (IncorrectParameter, IncorrectDataError, NoKeyError,
                             MAX_TEMP_TABLE_NAME_LEN, TEMP_TABLE_TIMESTAMP_FORMAT)
 
@@ -76,6 +78,15 @@ if os.environ.get('DBMERGE_TEST_ENGINES'):
     engines = {name: url for name, url in engines.items() if name in _selected}
 
 
+def _to_polars(frame):
+    # pl.from_pandas needs pyarrow for columns of Python objects (strings, dates). Without it the frame is
+    # built from plain lists, NaN - the missing value of pandas - turned into null, as from_pandas does.
+    if importlib.util.find_spec('pyarrow') is not None:
+        return pl.from_pandas(frame)
+    return pl.DataFrame({c: [None if isinstance(v, float) and v != v else v for v in frame[c].tolist()]
+                         for c in frame.columns})
+
+
 def make_engine(engine_name):
     # CockroachDB runs SERIALIZABLE by default. A merge step here reads the staging table and
     # updates tens of thousands of target rows, so a single step can stay open for tens of seconds -
@@ -87,10 +98,25 @@ def make_engine(engine_name):
     # is skipped rather than failed.
     try:
         if engine_name.startswith('cockroachdb'):
-            return create_engine(engines[engine_name], isolation_level='READ COMMITTED')
-        return create_engine(engines[engine_name])
+            engine = create_engine(engines[engine_name], isolation_level='READ COMMITTED')
+        else:
+            engine = create_engine(engines[engine_name])
     except (NoSuchModuleError, ImportError) as e:
         pytest.skip(f'{engine_name} is not available here: {e}')
+    _made_engines.append(engine)
+    return engine
+
+
+# The engines make_engine made, disposed after every test: a pooled connection stays open until its engine
+# is disposed or collected, and a whole run once used up the 151 connections of MariaDB.
+_made_engines = []
+
+
+@pytest.fixture(autouse=True)
+def _dispose_engines():
+    yield
+    while _made_engines:
+        _made_engines.pop().dispose()
 
 
 
@@ -426,7 +452,7 @@ def test_change_data_and_mark_deleted_data(engine_name,type_of_data):
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='tmp',
                   data_types=data_types, key=key) as merge:
@@ -439,7 +465,7 @@ def test_change_data_and_mark_deleted_data(engine_name,type_of_data):
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='tmp',
                   delete_mode='mark',merged_on_field='Merged On',inserted_on_field='Inserted On',
@@ -463,7 +489,7 @@ def test_date_range_with_deletion(engine_name,type_of_data):
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
 
     with dbmerge(engine=engine, data=data,  table_name="Facts", schema='target', temp_schema='tmp',
                   data_types=data_types, key=key) as merge:
@@ -475,7 +501,7 @@ def test_date_range_with_deletion(engine_name,type_of_data):
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
     
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='tmp',
                   delete_mode='delete') as merge:
@@ -499,7 +525,7 @@ def test_date_range_with_delete_mark(engine_name,type_of_data):
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='tmp',
                   data_types=data_types, key=key, delete_mark_field='Deleted') as merge:
@@ -516,7 +542,7 @@ def test_date_range_with_delete_mark(engine_name,type_of_data):
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
 
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
                   delete_mode='mark',delete_mark_field='Deleted') as merge:
@@ -539,7 +565,7 @@ def test_date_range_with_delete_mark(engine_name,type_of_data):
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
     
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
                   delete_mode='mark',delete_mark_field='Deleted') as merge:
@@ -708,7 +734,7 @@ def test_a_set_from_temp_with_deletion(engine_name,type_of_data):
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
 
     with dbmerge(data=data, engine=engine, table_name="Facts", schema='target', temp_schema='tmp',
                   data_types=data_types, key=key) as merge:
@@ -720,7 +746,7 @@ def test_a_set_from_temp_with_deletion(engine_name,type_of_data):
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
     
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp',
                   delete_mode='delete') as merge:
@@ -747,7 +773,7 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,type_of_da
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
 
     with dbmerge(engine=engine, data=data, table_name="Facts_source", schema='source', temp_schema='tmp',
                   inserted_on_field='Inserted On', key=key, data_types=data_types) as merge:
@@ -765,7 +791,7 @@ def test_update_from_source_table_with_delete_in_a_period(engine_name,type_of_da
     elif type_of_data=='list of dict':
         data = data.replace({np.nan: None}).to_dict(orient='records')
     elif type_of_data=='polars':
-        data = pl.from_pandas(data)
+        data = _to_polars(data)
 
     with dbmerge(engine=engine, data=data, table_name="Facts", schema='target', temp_schema='tmp', 
                   key=key, data_types=data_types,
@@ -1336,7 +1362,9 @@ def _assert_same_rows(engine, engine_name, first_label, second_label):
             return True
         return column in numeric and a is not None and b is not None and decimal.Decimal(a) == decimal.Decimal(b)
 
-    assert len(first) == 3
+    # zip() would stop at the shorter side, so the row counts and the columns are compared first.
+    assert len(first) == len(second) == 3, f'{first_label}: {len(first)} rows, {second_label}: {len(second)} rows'
+    assert set(first[0]) == set(second[0]), f'{first_label} columns {sorted(first[0])}, {second_label} {sorted(second[0])}'
     for a, b in zip(first, second):
         differences = {c: (a[c], b.get(c)) for c in a if not same(c, a[c], b.get(c))}
         assert not differences, f'{a["Shop"]}/{a["Product"]}: {first_label} vs {second_label} {differences}'
@@ -1375,6 +1403,252 @@ def test_clickhouse_without_pyarrow_stores_what_arrow_stores(type_of_data, monke
     with dbmerge(engine=engine, data=data, table_name='Facts_bulk', schema='target', key=key, data_types=data_types) as merge:
         merge.exec()
     _assert_same_rows(engine, 'clickhouse', 'Arrow', 'native protocol')
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_list_of_dict_rows_with_other_keys_are_refused(engine_name):
+    # The columns of a list of dicts are those of its first row. A later row with an extra key would lose its
+    # value, and one with a missing key would fail row by row but store NULL in a bulk load (DB-08).
+    logger.debug(f'TEST LIST OF DICT ROWS WITH OTHER KEYS ARE REFUSED {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    first = {'Shop': '1', 'Product': 'a', 'Date': date(2025, 1, 1), 'Qty': 1}
+    for second in ({**first, 'Shop': '2', 'Extra': 'lost'}, {'Shop': '2', 'Product': 'a', 'Date': date(2025, 1, 1)}):
+        with pytest.raises(IncorrectDataError, match='Row 1'):
+            with dbmerge(engine=engine, data=[first, second], table_name='Facts', schema='target', temp_schema='tmp',
+                         key=key, data_types=data_types) as merge:
+                merge.exec()
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_pandas_duplicate_columns_are_refused(engine_name):
+    # Two DataFrame columns of one name would end up as one column, losing the values of the other (DB-09).
+    logger.debug(f'TEST PANDAS DUPLICATE COLUMNS ARE REFUSED {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    data = pd.DataFrame([['1', 'a', date(2025, 1, 1), 1, 2]], columns=['Shop', 'Product', 'Date', 'Qty', 'Qty'])
+    with pytest.raises(IncorrectDataError, match='Qty'):
+        with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                     key=key, data_types=data_types) as merge:
+            merge.exec()
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_computed_target_column_is_not_written(engine_name):
+    # A column the target computes itself (DB-07). Merged from a source table built like the target, it is
+    # left out and computed by the target; brought in "data", it is refused before anything is written.
+    skip_on_clickhouse_source_table(engine_name)
+    if engine_name == 'duckdb':
+        pytest.skip('DuckDB does not tell a generated column from a default in its catalog')
+    logger.debug(f'TEST COMPUTED TARGET COLUMN IS NOT WRITTEN {engine_name}')
+    engine = make_engine(engine_name)
+    schema = None if engine.dialect.name == 'sqlite' else 'target'
+    metadata = MetaData()
+    source, target = [Table(name, metadata, Column('id', Integer, primary_key=True, autoincrement=False),
+                            Column('a', Integer), Column('doubled', Integer, Computed('a * 2', persisted=True)),
+                            schema=schema)
+                      for name in ('Generated_source', 'Generated')]
+    # One table per transaction: CockroachDB refuses two schema changes in one under READ COMMITTED.
+    for table in (source, target):
+        drop_table_if_exists(engine, table.name, schema=schema)
+        table.create(engine)
+    try:
+        with engine.begin() as conn:
+            conn.execute(source.insert(), [{'id': 1, 'a': 3}])
+        with dbmerge(engine=engine, source_table_name='Generated_source', source_schema=schema,
+                     table_name='Generated', schema=schema, temp_schema='tmp') as merge:
+            result = merge.exec()
+        assert result.inserted_row_count == 1
+        with engine.connect() as conn:
+            assert tuple(conn.execute(select(target.c['a'], target.c['doubled'])).one()) == (3, 6)
+        with pytest.raises(IncorrectParameter, match='doubled'):
+            with dbmerge(engine=engine, data=[{'id': 1, 'a': 4, 'doubled': 8}], table_name='Generated',
+                         schema=schema, temp_schema='tmp') as merge:
+                merge.exec()
+    finally:
+        for table in (source, target):
+            drop_table_if_exists(engine, table.name, schema=schema)
+
+
+@pytest.mark.parametrize("engine_name", list(engines))
+def test_failed_cleanup_keeps_the_error_and_closes(engine_name, caplog):
+    # A staging table that can not be dropped must neither hide the error of the merge nor leave the
+    # connection open (DB-12). After a merge that succeeded, it is only a warning: the data is committed.
+    logger.debug(f'TEST FAILED CLEANUP KEEPS THE ERROR AND CLOSES {engine_name}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    data = [{'Shop': '1', 'Product': 'a', 'Date': date(2025, 1, 1), 'Qty': 1}]
+
+    def failing_drop(merge):
+        real_drop = merge._drop_temp_table
+        def drop():
+            real_drop()     # the table really goes, so no test leaves one behind
+            raise RuntimeError('cleanup failed')
+        merge._drop_temp_table = drop
+
+    with pytest.raises(RuntimeError, match='merge failed'):
+        with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                     key=key, data_types=data_types) as merge:
+            failing_drop(merge)
+            def failing_load():
+                raise RuntimeError('merge failed')
+            merge._insert_data_to_temp = failing_load
+            merge.exec()
+    assert merge.conn.closed and merge.merge_finished
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger='dbmerge'):
+        with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
+                     key=key, data_types=data_types) as merge:
+            failing_drop(merge)
+            result = merge.exec()
+    assert result.inserted_row_count == 1
+    assert merge.conn.closed and merge.merge_finished
+    assert any('Could not drop the staging table' in r.getMessage() for r in caplog.records)
+
+
+def test_exceptions_are_exported_from_the_package_root():
+    import dbmerge as package
+    from dbmerge.dbmerge import IncorrectParameter as old_path
+    assert package.IncorrectParameter is old_path
+    exported = {'IncorrectParameter', 'IncorrectDataError', 'NoKeyError', 'TableNotFoundError', 'TempTableAlreadyExists'}
+    assert exported <= set(package.__all__) and all(hasattr(package, name) for name in exported)
+
+
+@pytest.mark.parametrize("type_of_data", ('list of dict', 'dict of list', 'pandas'))
+def test_clickhouse_reports_column_and_row_of_a_bad_value(type_of_data):
+    # ClickHouse loads in bulk only, through Arrow. Arrow names neither the column nor the row of a value it
+    # can not take, so dbmerge finds them for the error.
+    if 'clickhouse' not in engines:
+        pytest.skip('ClickHouse is not among the tested engines')
+    engine = make_engine('clickhouse')
+    prepare_and_clean_data(engine)
+    data = [{'id': i, 'amount_x': i} for i in range(999)] + [{'id': 999, 'amount_x': 'bad text'}]
+    if type_of_data == 'dict of list':
+        data = {k: [d[k] for d in data] for k in data[0]}
+    elif type_of_data == 'pandas':
+        data = pd.DataFrame(data)
+    with pytest.raises(IncorrectDataError, match=r'Column "amount_x", row 999: .*bad text'):
+        with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', key=['id'],
+                     data_types={'amount_x': types.BigInteger()}) as merge:
+            merge.exec(chunk_size=600)      # the bad row lands in the second chunk: the row number is not per chunk
+
+
+# The engines that load the staging table with COPY.
+POSTGRES_FAMILY = [e for e in engines if e.startswith(('postgres', 'cockroachdb'))]
+
+
+def _spy_on_copy(monkeypatch):
+    """The SQL of every COPY the bulk loader runs: no fall back message in the log does not prove COPY ran."""
+    # imported lazily by dbmerge, so it may not be loaded yet. Not "import dbmerge._bulk_load": that would
+    # bind the name dbmerge in the calling function to the package, not to the class.
+    from dbmerge import _bulk_load
+    calls = []
+    real_copy = _bulk_load._copy
+
+    def copy(merge, sql, data):
+        calls.append(sql)
+        return real_copy(merge, sql, data)
+    monkeypatch.setattr(_bulk_load, '_copy', copy)
+    return calls
+
+
+@pytest.mark.parametrize("engine_name", [e for e in engines if e != 'clickhouse'])
+def test_bulk_load_reports_the_original_error(engine_name):
+    # A value the bulk load refuses must surface as the same SQLAlchemy exception the row by row INSERT
+    # raises. COPY writes past SQLAlchemy, so its error could turn into "current transaction is aborted" from
+    # the DROP of the staging table that runs after it. fast_executemany of pyodbc may have stored the rows
+    # before the bad one, so the row by row retry could fail on the primary key of the staging table instead.
+    # The bad value comes last in a chunk of 1000. A naive datetime column makes the COPY loader ask for the
+    # session time zone first (except on pg8000), which opens the transaction another way, so both are tried.
+    # (ClickHouse always loads in bulk, there is nothing to compare with. A value Arrow can not put in an
+    # integer column goes row by row on DuckDB.)
+    logger.debug(f'TEST BULK LOAD REPORTS THE ORIGINAL ERROR {engine_name}')
+    engine = make_engine(engine_name)
+    if engine.dialect.name == 'sqlite':
+        pytest.skip('SQLite stores text in an integer column, so there is no error to compare')
+    for with_naive_datetime in (False, True):
+        for commit_all_steps in (True, False):
+            rows = [{'id': i, 'value': i} for i in range(999)] + [{'id': 999, 'value': 'not a number'}]
+            if with_naive_datetime:
+                rows = [{**row, 'Stamp': datetime(2025, 1, 1, 12, 0)} for row in rows]
+            errors = {}
+            for bulk_load in (False, True):
+                drop_table_if_exists(engine, 'BadData', schema='target')
+                with pytest.raises(DBAPIError) as info:
+                    with dbmerge(engine=engine, data=rows, table_name='BadData',
+                                 schema='target', temp_schema='tmp', key=['id'],
+                                 data_types={'value': types.BigInteger()}) as merge:
+                        merge.exec(bulk_load=bulk_load, commit_all_steps=commit_all_steps)
+                errors[bulk_load] = info.value
+            case = f'naive datetime: {with_naive_datetime}, commit_all_steps: {commit_all_steps}'
+            assert type(errors[True]) is type(errors[False]), (case, type(errors[False]), type(errors[True]))
+            assert 'PRIMARY KEY' not in str(errors[True]).upper(), (case, str(errors[True]))
+            if engine_name in POSTGRES_FAMILY:
+                assert 'not a number' in str(errors[True]), (case, str(errors[True]))
+    drop_table_if_exists(engine, 'BadData', schema='target')
+
+
+@pytest.mark.parametrize("engine_name,type_of_data", [(engine_name, type_of_data)
+                                                     for engine_name in POSTGRES_FAMILY
+                                                     for type_of_data in ('list of dict', 'dict of list', 'pandas', 'polars')])
+def test_bulk_load_without_pyarrow_stores_what_row_by_row_stores(engine_name, type_of_data, monkeypatch):
+    # Without pyarrow the CSV for COPY is written by the csv module (Python 3.12+). CI always has pyarrow,
+    # so this path is covered only here.
+    if sys.version_info < (3, 12):
+        pytest.skip('without pyarrow, COPY needs the csv module of Python 3.12+')
+    from dbmerge import _bulk_load
+    monkeypatch.setattr(_bulk_load, '_has_pyarrow', lambda: False)
+    copies = _spy_on_copy(monkeypatch)
+    logger.debug(f'TEST BULK LOAD WITHOUT PYARROW STORES WHAT ROW BY ROW STORES {engine_name} {type_of_data}')
+    engine = make_engine(engine_name)
+    prepare_and_clean_data(engine)
+    data, data_types = _parity_data(type_of_data, True)
+    for table_name, bulk_load in (('Facts', False), ('Facts_bulk', True)):
+        with dbmerge(engine=engine, data=data, table_name=table_name, schema='target', temp_schema='tmp',
+                     key=key, data_types=data_types) as merge:
+            merge.exec(bulk_load=bulk_load)
+    assert copies, 'the staging table was not loaded with COPY'
+    _assert_same_rows(engine, engine_name, 'row by row', 'bulk without pyarrow')
+
+
+@pytest.mark.parametrize("engine_name,with_pyarrow", [(engine_name, with_pyarrow)
+                                                     for engine_name in POSTGRES_FAMILY
+                                                     for with_pyarrow in (True, False)])
+def test_json_goes_through_copy(engine_name, with_pyarrow, monkeypatch):
+    # JSON must go through COPY rather than fall back to row by row, and be stored as the row by row INSERT
+    # stores it, JSON null and SQL NULL apart. With SQLAlchemy 2.1 and psycopg 3, JSON has no bind processor
+    # at all - the driver adapts it itself - so dbmerge has to serialize it for the CSV on its own.
+    from dbmerge import _bulk_load
+    from sqlalchemy import null
+    from sqlalchemy.dialects.postgresql import JSONB
+    if with_pyarrow and importlib.util.find_spec('pyarrow') is None:
+        pytest.skip('pyarrow is not installed')
+    if not with_pyarrow:
+        if sys.version_info < (3, 12):
+            pytest.skip('without pyarrow, COPY needs the csv module of Python 3.12+')
+        monkeypatch.setattr(_bulk_load, '_has_pyarrow', lambda: False)
+    copies = _spy_on_copy(monkeypatch)
+    engine = make_engine(engine_name)
+    values = [{'a': 1, 'list': [1, None], 'text': 'x"y'}, [1, 'two'], {}, 'text', 0, None, JSON.NULL, null()]
+    data = [{'id': i, 'doc': value, 'doc_none_as_null': value} for i, value in enumerate(values)]
+    data_types = {'doc': JSONB(), 'doc_none_as_null': JSONB(none_as_null=True)}
+    stored = {}
+    for table_name, bulk_load in (('JsonRows', False), ('JsonBulk', True)):
+        drop_table_if_exists(engine, table_name, schema='target')
+        copies.clear()
+        with dbmerge(engine=engine, data=data, table_name=table_name, schema='target', temp_schema='tmp',
+                     key=['id'], data_types=data_types) as merge:
+            merge.exec(bulk_load=bulk_load)
+        assert bool(copies) == bulk_load, f'COPY calls with bulk_load={bulk_load}: {len(copies)}'
+        tbl = Table(table_name, MetaData(), autoload_with=engine, schema='target')
+        with engine.connect() as conn:
+            stored[bulk_load] = conn.execute(select(
+                tbl.c['id'], cast(tbl.c['doc'], String), tbl.c['doc'].is_(None),
+                cast(tbl.c['doc_none_as_null'], String), tbl.c['doc_none_as_null'].is_(None)).order_by(tbl.c['id'])).all()
+        drop_table_if_exists(engine, table_name, schema='target')
+    assert stored[True] == stored[False], (stored[False], stored[True])
+
 
 if __name__ == '__main__':
 

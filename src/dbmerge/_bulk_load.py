@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import importlib.util
 import io
+import json
 import sys
 import time
 
@@ -24,6 +25,10 @@ if TYPE_CHECKING:
 
 # The PostgreSQL drivers that take COPY ... FROM STDIN, each in its own way (see _copy).
 COPY_DRIVERS = ('psycopg2', 'psycopg', 'pg8000')
+
+# Rows per bulk copy of mssql-python, unless exec() is given a chunk_size. Every call opens a connection of
+# its own, some 40ms: a million rows load in 5.4s in chunks of 10,000 and in 1.5s in chunks of 100,000.
+MSSQL_PYTHON_CHUNK_SIZE = 100_000
 
 
 def loader_for(merge: dbmerge):
@@ -87,7 +92,15 @@ def _duckdb_from_arrow(merge: dbmerge):
 
     for begin in range(0, merge.total_row_count, merge.chunk_size):
         end = min(begin + merge.chunk_size, merge.total_row_count)
-        connection.register(view, arrow_table(merge, begin, end, processors=processors))
+        try:
+            chunk = arrow_table(merge, begin, end, processors=processors)
+        except Exception as e:
+            # Values Arrow can not put in one column - a column of mixed types, say - go row by row, as they
+            # would without bulk_load: a value the column refuses is then reported by DuckDB as it is there.
+            logger.debug(f'Rows {begin}..{end} could not be put in an Arrow table ({e}), inserting them row by row')
+            merge._insert_rows_to_temp(begin, end)
+            continue
+        connection.register(view, chunk)
         try:
             merge.conn.exec_driver_sql(f'INSERT INTO {staging} ({columns}) SELECT {columns} FROM {view}')
         finally:
@@ -99,10 +112,16 @@ def _duckdb_from_arrow(merge: dbmerge):
 def _postgres_copy(merge: dbmerge):
     # COPY ... FROM STDIN through the connection the merge already holds, so the staging table - a TEMPORARY
     # one, seen only by its own session - is there, and the load belongs to the same transaction.
-    from sqlalchemy import DateTime, LargeBinary
+    from sqlalchemy import DateTime, Integer, LargeBinary
     from zoneinfo import ZoneInfo
 
     start_time = time.perf_counter()
+    # COPY goes through the driver's own cursor, past SQLAlchemy. Unless SQLAlchemy has a transaction open by
+    # then, it does not know of the one COPY starts: a failed COPY would leave the connection aborted, the
+    # rollback in exec() would not reach the driver, and the DROP of the staging table would then fail with
+    # "current transaction is aborted", in place of the error that COPY raised.
+    if not merge.conn.in_transaction():
+        merge.conn.begin()
     preparer = merge.conn.dialect.identifier_preparer
     fields = list(merge.data_fields)
     sql = (f'COPY {preparer.format_table(merge.temp_table)} ({", ".join(preparer.quote(f) for f in fields)}) '
@@ -135,7 +154,16 @@ def _postgres_copy(merge: dbmerge):
             return
         wall_clock = {f: zone for f in naive_columns}
 
-    to_csv = _csv_by_arrow if _has_pyarrow() else _csv_by_csv_module
+    if _has_pyarrow():
+        to_csv = _csv_by_arrow
+    else:
+        to_csv = _csv_by_csv_module
+        # pandas keeps an integer column with a missing value as floats. The csv module writes 1.0 for them,
+        # which COPY does not take for an integer column, while Arrow writes 1 and the row by row INSERT sends
+        # a number the server casts.
+        for f in fields:
+            if isinstance(merge.temp_table.c[f].type, Integer) and f not in processors:
+                processors[f] = lambda v: int(v) if isinstance(v, float) and v.is_integer() else v
     for begin in range(0, merge.total_row_count, merge.chunk_size):
         end = min(begin + merge.chunk_size, merge.total_row_count)
         try:
@@ -180,7 +208,9 @@ def _csv_by_csv_module(merge: dbmerge, begin, end, processors, wall_clock):
 
 
 def _copy(merge: dbmerge, sql, data):
-    driver = merge.conn.dialect.driver
+    from sqlalchemy.exc import DBAPIError
+    dialect = merge.conn.dialect
+    driver = dialect.driver
     cursor = merge.conn.connection.dbapi_connection.cursor()
     try:
         if driver == 'psycopg2':
@@ -190,6 +220,10 @@ def _copy(merge: dbmerge, sql, data):
                 copy.write(data)
         else:  # pg8000
             cursor.execute(sql, stream=io.BytesIO(data))
+    except dialect.loaded_dbapi.Error as e:
+        # The driver's own exception, wrapped as SQLAlchemy wraps it for the row by row INSERT, so that
+        # the caller gets the same exception class (DataError, IntegrityError...) with bulk_load on or off.
+        raise DBAPIError.instance(sql, None, e, dialect.loaded_dbapi.Error, dialect=dialect) from e
     finally:
         cursor.close()
 
@@ -198,11 +232,29 @@ def _json_processors(merge: dbmerge):
     # A JSON column gets its values through its own bind processor, as the row by row INSERT does: the
     # serializer of the engine, and None as the JSON literal null unless the type says none_as_null.
     from sqlalchemy import JSON
+    from sqlalchemy.sql.elements import Null
+    dialect = merge.conn.dialect
     processors = {}
     for f in merge.data_fields:
         column_type = merge.temp_table.c[f].type
-        if isinstance(column_type, JSON):
-            processors[f] = column_type.bind_processor(merge.conn.dialect) or (lambda v: v)
+        if not isinstance(column_type, JSON):
+            continue
+        processor = column_type.bind_processor(dialect)
+        if processor is None:
+            # psycopg 3 has no text form here: SQLAlchemy hands it a Jsonb wrapper, so a dict would reach the
+            # CSV as a dict - Python's repr without pyarrow, a struct column (and a silent fall back to row by
+            # row) with it. Serialized the way the row by row INSERT stores it: JSON null for None, unless the
+            # type says none_as_null.
+            serializer = getattr(dialect, '_json_serializer', None) or json.dumps
+            def processor(v, serializer=serializer, none_as_null=column_type.none_as_null):
+                if v is JSON.NULL:          # the JSON null, always
+                    return serializer(None)
+                if isinstance(v, Null):     # sqlalchemy.null(): SQL NULL, always
+                    return None
+                if v is None:
+                    return None if none_as_null else serializer(None)
+                return serializer(v)
+        processors[f] = processor
     return processors
 
 
@@ -219,33 +271,37 @@ def _mssql_python_bulkcopy(merge: dbmerge):
     staging = merge.conn.dialect.identifier_preparer.format_table(merge.temp_table)
     processors = _json_processors(merge)
     use_arrow = _has_pyarrow()
-    cursor = merge.conn.connection.dbapi_connection.cursor()
     # timeout=0: the default of 30 seconds would cut a large load short. keep_nulls: a NULL stays NULL
     # rather than taking the default of its column.
     options = dict(column_mappings=fields, keep_nulls=True, timeout=0)
+    chunk_size = merge.chunk_size if merge.chunk_size_given else MSSQL_PYTHON_CHUNK_SIZE
 
     offset_columns = _datetimeoffset_columns(merge)
 
-    for begin in range(0, merge.total_row_count, merge.chunk_size):
-        end = min(begin + merge.chunk_size, merge.total_row_count)
-        if offset_columns and _has_non_utc_offsets(merge, begin, end, offset_columns):
-            # A datetimeoffset keeps the offset a value came with, and the bulk copy of mssql-python can not
-            # repeat that: from Arrow it writes every value in UTC (+00:00), from tuples it keeps the offset
-            # but shifts the moment by it. Such rows go row by row, which stores them exactly.
-            _warn_once('mssql-datetimeoffset',
-                       'datetimeoffset values with an offset other than UTC are inserted row by row: the bulk copy '
-                       'of mssql-python can not keep their offset')
-            merge._insert_rows_to_temp(begin, end)
-            continue
-        try:
-            if use_arrow:
-                cursor.bulkcopy_arrow(staging, arrow_table(merge, begin, end, processors=processors), **options)
-            else:
-                columns = python_columns(merge, begin, end, processors=processors)
-                cursor.bulkcopy(staging, list(zip(*columns.values())), **options)
-        except Exception as e:
-            logger.debug(f'Bulk copy of rows {begin}..{end} failed ({e}), inserting them row by row')
-            merge._insert_rows_to_temp(begin, end)
+    cursor = merge.conn.connection.dbapi_connection.cursor()
+    try:
+        for begin in range(0, merge.total_row_count, chunk_size):
+            end = min(begin + chunk_size, merge.total_row_count)
+            if offset_columns and _has_non_utc_offsets(merge, begin, end, offset_columns):
+                # A datetimeoffset keeps the offset a value came with, and the bulk copy of mssql-python can not
+                # repeat that: from Arrow it writes every value in UTC (+00:00), from tuples it keeps the offset
+                # but shifts the moment by it. Such rows go row by row, which stores them exactly.
+                _warn_once('mssql-datetimeoffset',
+                           'datetimeoffset values with an offset other than UTC are inserted row by row: the bulk '
+                           'copy of mssql-python can not keep their offset')
+                merge._insert_rows_to_temp(begin, end)
+                continue
+            try:
+                if use_arrow:
+                    cursor.bulkcopy_arrow(staging, arrow_table(merge, begin, end, processors=processors), **options)
+                else:
+                    columns = python_columns(merge, begin, end, processors=processors)
+                    cursor.bulkcopy(staging, list(zip(*columns.values())), **options)
+            except Exception as e:
+                logger.debug(f'Bulk copy of rows {begin}..{end} failed ({e}), inserting them row by row')
+                merge._insert_rows_to_temp(begin, end)
+    finally:
+        cursor.close()
 
     merge.temp_insert_time = time.perf_counter() - start_time
 
@@ -271,8 +327,9 @@ def _has_non_utc_offsets(merge: dbmerge, begin, end, fields):
 
 def _pyodbc_fast_executemany(merge: dbmerge):
     # fast_executemany: pyodbc sends a whole chunk as one array of parameters instead of a round trip per
-    # row. A chunk that fails goes row by row; a failure part way through can not double rows silently,
-    # since the staging table on MS SQL has a primary key.
+    # row. A chunk that fails goes row by row. The server may have taken the rows before the failing one by
+    # then, so every chunk runs in a savepoint and is rolled back to it first: otherwise the row by row
+    # INSERT would hit the primary key of the staging table, and report that in place of the real error.
     from ._chunks import python_columns
 
     start_time = time.perf_counter()
@@ -287,17 +344,23 @@ def _pyodbc_fast_executemany(merge: dbmerge):
         # machine. As text with its own offset, the server reads it right.
         processors[f] = lambda v: v.isoformat(sep=' ') if getattr(v, 'tzinfo', None) is not None else v
 
+    if not merge.conn.in_transaction():
+        merge.conn.begin()
     cursor = merge.conn.connection.dbapi_connection.cursor()
     cursor.fast_executemany = True
     try:
         for begin in range(0, merge.total_row_count, merge.chunk_size):
             end = min(begin + merge.chunk_size, merge.total_row_count)
+            savepoint = merge.conn.begin_nested()
             try:
                 columns = python_columns(merge, begin, end, processors=processors)
                 cursor.executemany(sql, list(zip(*columns.values())))
             except Exception as e:
+                savepoint.rollback()
                 logger.debug(f'Rows {begin}..{end} could not be sent with fast_executemany ({e}), inserting them row by row')
                 merge._insert_rows_to_temp(begin, end)
+            else:
+                savepoint.commit()
     finally:
         cursor.close()
 

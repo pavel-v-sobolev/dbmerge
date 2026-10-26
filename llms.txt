@@ -24,7 +24,7 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB
 |---|---|
 | `engine` | SQLAlchemy `Engine` from `create_engine()`. For ClickHouse also a clickhouse-connect client. |
 | `table_name` | Target table. |
-| `data` | Source rows. Mutually exclusive with `source_table_name` (passing both raises). |
+| `data` | Source rows. Mutually exclusive with `source_table_name` (passing both raises). Every dict of a list must have the same keys, and a DataFrame no duplicate column names. |
 | `source_table_name` / `source_schema` | Read the source straight from a table or view instead of Python memory. |
 | `key` | List of column names forming the unique key. Defaults to the target's primary key; **required** when the table does not exist yet. Key values always come from your data, so a key column DBMerge creates is never `AUTO_INCREMENT`/`SERIAL`/`IDENTITY`. |
 | `delete_mode` | `'no'` (default), `'delete'`, `'mark'`. |
@@ -41,7 +41,7 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB
 
 `table_created` / `added_fields` report the schema changes the merge made to the target table. `added_fields` is a `{column name: SQLAlchemy type}` mapping — the type each column was really created with, after any adjustment for the target engine. It covers only columns added to an already existing table, never the auto-managed timestamp/delete-flag columns, and stays empty with `can_create_columns=False`. Use them downstream: a dataset built incrementally from a `merged_on_field` watermark can not detect a new column by itself — adding a column moves no watermark — so `added_fields` is the signal to rebuild it in full.
 
-`chunk_size` defaults to 10000 rows (1000000 on ClickHouse). `bulk_load=True` loads the staging table in bulk where the driver allows it (`COPY` on PostgreSQL/CockroachDB, bulk copy with mssql-python, `fast_executemany` with pyodbc, Arrow on DuckDB and ClickHouse); it stores the same values as the row by row `INSERT`, and `False` turns it off.
+`chunk_size` defaults to 10000 rows (100000 for the bulk copy of mssql-python, 1000000 on ClickHouse). `bulk_load=True` loads the staging table in bulk where the driver allows it (`COPY` on PostgreSQL/CockroachDB, bulk copy with mssql-python, `fast_executemany` with pyodbc, Arrow on DuckDB and ClickHouse); it stores the same values as the row by row `INSERT`, and `False` turns it off.
 
 Phases run in this order: staging load → `UPDATE` → `INSERT` → `DELETE`/mark.
 
@@ -136,7 +136,7 @@ with dbmerge(engine=engine, data=data, table_name="Facts", key=['id'],
 - **Automatic schema creation is a convenience, not a schema tool.** It infers types from sample values and cannot recover precision, scale, length or timezone policy, and each backend resolves the resulting generic type differently. In production, manage the schema with migrations and pass `can_create_table=False, can_create_columns=False`.
 - **`delete_mark_field` must be a dedicated flag column.** The mark phase writes `1`/`True` into it and the update phase writes `0`/`False` back, so any other meaning the column carries is destroyed. It cannot be part of `key`, nor the same column as `merged_on_field`/`inserted_on_field` — those combinations are rejected.
 - **PostgreSQL/CockroachDB need `JSONB`, not `JSON`** (`from sqlalchemy.dialects.postgresql import JSONB`) — plain `JSON` cannot be compared to detect changes and is rejected.
-- **Exceptions are not exported from the package root.** Import them as `from dbmerge.dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError, TableNotFoundError, TempTableAlreadyExists`, or simply catch `RuntimeError` — all of them subclass it. The package root exports only `dbmerge`, `mergeResult`, `drop_table_if_exists`, `format_ms`, `__version__`.
+- **Exceptions** are exported from the package root: `from dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError, TableNotFoundError, TempTableAlreadyExists` (the old `from dbmerge.dbmerge import …` works too), or simply catch `RuntimeError` — all of them subclass it. The package root exports `dbmerge`, `mergeResult`, `drop_table_if_exists`, `format_ms`, `__version__` and these exceptions.
 
 ## Audit timestamps
 
