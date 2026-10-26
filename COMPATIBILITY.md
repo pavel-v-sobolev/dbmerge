@@ -35,7 +35,7 @@ The databases and drivers DBMerge is tested with, how each of them loads the sta
 - **ClickHouse through clickhouse-sqlalchemy** (`clickhouse://`, `clickhouse+native://`). Its driver opens a new session for every statement, so a temporary staging table does not survive between them. DBMerge refuses such an engine with `IncorrectParameter`; use clickhouse-connect.
 - **Oracle**: `UPDATE` with a `JOIN` is not available in its SQLAlchemy dialect.
 
-**Versions in the tests:** PostgreSQL 18, CockroachDB 24.3, MariaDB 10.11, MySQL 8.4, SQL Server 2022, SQLite 3.50, DuckDB 1.5 and 2.0, ClickHouse 23.8, 24.8 and 26.9; Python 3.14 with pandas 3, polars and pyarrow. The oldest ClickHouse DBMerge accepts is 23.8. SQLAlchemy 2.1 needs Python 3.11 or newer.
+**Versions in the tests:** PostgreSQL 18, CockroachDB 24.3, MariaDB 10.11, MySQL 8.4, SQL Server 2022, SQLite 3.50, DuckDB 1.5 and 2.0, ClickHouse 23.8, 24.8 and 26.9; Python 3.14 and 3.15, with pandas 3, polars and pyarrow. The oldest ClickHouse DBMerge accepts is 23.8. SQLAlchemy 2.1 needs Python 3.11 or newer.
 
 ---
 
@@ -101,6 +101,7 @@ CockroachDB runs `SERIALIZABLE` transactions by default. A merge step over many 
 
 - **`datetimeoffset` with mssql-python.** A `datetimeoffset` column keeps the offset each value came with: `12:00+03:00` is stored as `12:00+03:00`, not as `09:00+00:00`. The bulk copy of mssql-python can not keep it: from Arrow it stores every value in UTC, and from tuples it keeps the offset but moves the time by it. A chunk where such a column has a value with an offset other than UTC is therefore loaded row by row, with a warning once per process. Values in UTC, and columns of other types, go through bulk copy.
 - **pyodbc** with `fast_executemany` writes an aware `datetime` into a `datetimeoffset` column as its wall-clock time with the offset of the client machine. DBMerge sends such values as text with their own offset instead, so `bulk_load` stores the same as the row by row `INSERT`.
+- **pyodbc on Python 3.15** has no ready-made wheel yet (5.3.0): pip builds it from source, which needs a C++ compiler and the unixODBC headers (`unixodbc-dev` on Debian and Ubuntu).
 - **pymssql** truncates microseconds to milliseconds. Its own bulk copy (`bulk_copy`) is not used: it refuses `date` values, drops the offset of an aware `datetime` and stores an empty string as `NULL`.
 
 ### DuckDB
