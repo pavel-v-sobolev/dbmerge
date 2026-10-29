@@ -2,6 +2,16 @@
 
 All notable changes to DBMerge. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/). Releases before 2.0.0 are described in [GitHub Releases](https://github.com/pavel-v-sobolev/dbmerge/releases).
 
+## [2.1.0] - 2026-10-28
+
+### Added
+
+- **`source_table_name` on ClickHouse.** The source can be any table or view ClickHouse reads, including a PostgreSQL or MySQL database attached to ClickHouse with its database engine; the server copies it into the staging table itself. A `ReplacingMergeTree` source is read with `FINAL`. A target created from a source takes its column types, with the key columns made not nullable. See [Source tables on ClickHouse](DOCUMENTATION.md#source-tables-on-clickhouse).
+
+### Fixed
+
+- **`in_()` with a list of values in a condition.** On ClickHouse every condition with it failed, and so did `insert_condition` and `source_condition` with DuckDB, psycopg 3 and mysql-connector-python: the list reached the database as an unexpanded `__[POSTCOMPILE_…]` placeholder.
+
 ## [2.0.1] - 2026-10-26
 
 ### Fixed
@@ -61,5 +71,6 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 - **DuckDB:** a float column created by an earlier version is `DECIMAL(18,3)` and keeps rounding. Change it to `DOUBLE` and reload the data if the decimals matter.
 - **pymssql** keeps milliseconds only, a limitation of the driver, and has no bulk load. Prefer pyodbc or mssql-python on MS SQL Server.
 
+[2.1.0]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.0.1...2.1.0
 [2.0.1]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.0.0...2.0.1
 [2.0.0]: https://github.com/pavel-v-sobolev/dbmerge/compare/1.0.24...2.0.0

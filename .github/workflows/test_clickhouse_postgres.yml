@@ -1,0 +1,86 @@
+name: ClickHouse from PostgreSQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A ClickHouse table filled from PostgreSQL through source_table_name: PostgreSQL is attached to ClickHouse with
+# the PostgreSQL database engine, and ClickHouse reads it itself.
+jobs:
+  test_clickhouse_postgres:
+    name: ClickHouse ${{ matrix.clickhouse }} from PostgreSQL, SQLAlchemy ${{ matrix.sqlalchemy }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 23.8 is the oldest server dbmerge accepts.
+        clickhouse: ['23.8', 'latest']
+        sqlalchemy: ['2.0', '2.1']
+
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:${{ matrix.clickhouse }}
+        env:
+          # Lets the passwordless "default" user connect from outside the container.
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+        ports:
+          - 8123:8123
+      # ClickHouse reaches it as postgres:5432 (the service containers share a network), the tests as localhost:5432.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dbmerge
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install DB system libraries
+        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev libpq-dev
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+
+      # uv.lock pins SQLAlchemy 2.0; "uv run --no-sync" below keeps the upgrade.
+      - name: Install SQLAlchemy 2.1
+        if: matrix.sqlalchemy == '2.1'
+        run: uv pip install "sqlalchemy~=2.1.0"
+
+      - name: Create data directory
+        run: mkdir -p data
+
+      - name: Initialize sample data
+        run: |
+          uv run --no-sync python tests/sample_data_in_sqlite.py
+
+      - name: Run pytest
+        env:
+          DBMERGE_TEST_ENGINES: clickhouse
+          DBMERGE_TEST_CLICKHOUSE_POSTGRES: postgres:5432
+        run: |
+          uv run --no-sync pytest tests/test_all.py -v --tb=short -k linked_postgresql

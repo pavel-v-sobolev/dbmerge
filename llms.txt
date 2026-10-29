@@ -166,7 +166,7 @@ It is dropped when the context manager exits. On PostgreSQL, SQLite, MariaDB and
 - **SQLite:** no schema support; `schema`/`temp_schema` are reset to `None` with a warning.
 - **MS SQL Server:** use pyodbc or mssql-python (SQLAlchemy 2.1+) for a fast staging load; pymssql loads row by row and truncates microseconds to milliseconds.
 - **DuckDB:** use a database file: with `:memory:` every connection sees its own database.
-- **ClickHouse:** through clickhouse-connect (`clickhousedb://` or its client), server 23.8+. The target must be a `ReplacingMergeTree` whose `ORDER BY` is exactly the merge key; a changed row is written as a new version, so read the table with `FINAL`. No transactions, no `source_table_name`, duplicate source keys are not refused. See the ClickHouse section of DOCUMENTATION.md.
+- **ClickHouse:** through clickhouse-connect (`clickhousedb://` or its client), server 23.8+. The target must be a `ReplacingMergeTree` whose `ORDER BY` is exactly the merge key; a changed row is written as a new version, so read the table with `FINAL`. No transactions, duplicate source keys are not refused. `source_table_name` can be any table ClickHouse reads, a PostgreSQL database attached with its database engine included. See the ClickHouse section of DOCUMENTATION.md.
 - **CockroachDB:** uses the `sqlalchemy-cockroachdb` dialect over the PostgreSQL wire protocol. `exec(commit_all_steps=False)` is markedly faster: one commit costs a consensus round whatever it carries (200 000 rows inserted in ~6s against ~16s on a single node; no difference on the update phase).
 
 ## Docs

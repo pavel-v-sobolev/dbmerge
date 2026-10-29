@@ -1,10 +1,11 @@
 """
-DuckDB support for dbmerge: reading a table from the catalog.
+DuckDB support for dbmerge: reading a table from the catalog, and the time of the database.
 
-DuckDB goes through the generic flow of dbmerge.py, all but one step: reflect_table here stands in for the
-SQLAlchemy reflection there (see dbmerge._dialect_hook). duckdb_engine, its SQLAlchemy dialect,
-is built on the PostgreSQL one and reflects a table through the pg_catalog views DuckDB emulates, which
-falls short:
+DuckDB goes through the generic flow of dbmerge.py, all but two steps (see dbmerge._dialect_hook):
+database_time reads now() without its time zone, and reflect_table stands in for the SQLAlchemy reflection.
+
+duckdb_engine, the SQLAlchemy dialect of DuckDB, is built on the PostgreSQL one and reflects a table through
+the pg_catalog views DuckDB emulates, which falls short:
 - under SQLAlchemy 2.1 it fails outright: the reflection reads pg_catalog.pg_collation and the REGCLASS
   type, and DuckDB has neither (duckdb/duckdb#27168);
 - the primary key is never found, so the merge key could not be taken from the table;
@@ -18,7 +19,7 @@ The module is imported only when a DuckDB engine is used.
 
 import re
 
-from sqlalchemy import Table, Column, MetaData, PrimaryKeyConstraint, text
+from sqlalchemy import Table, Column, MetaData, PrimaryKeyConstraint, text, select, cast
 from sqlalchemy import Boolean, SmallInteger, Integer, BigInteger, REAL, Double, Numeric, String, LargeBinary
 from sqlalchemy import Date, Time, DateTime, Interval, Uuid, JSON
 from sqlalchemy.types import UserDefinedType
@@ -59,6 +60,12 @@ class DuckDBType(UserDefinedType):
 
 def reflect_table(merge, table_name, schema):
     return read_table(merge.conn, merge.metadata, table_name, schema)
+
+
+def database_time(merge):
+    # DuckDB's now() is a TIMESTAMP WITH TIME ZONE, and turning that into Python needs pytz, which DuckDB
+    # does not install. dbmerge reads this time only to name the staging table, and the local time will do.
+    return merge.conn.scalar(select(cast(merge._now(), DateTime)))
 
 
 def read_table(connection, metadata: MetaData, table_name, schema):

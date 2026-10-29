@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete, exists, literal, literal_column
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
 from sqlalchemy import String, Text, Integer, BigInteger, Numeric, Double, Boolean, DateTime, Date, Time, JSON, Uuid, LargeBinary
-from sqlalchemy import types, dialects, func, schema, cast
+from sqlalchemy import types, dialects, func, schema
 
 POLARS_TO_SQLALCHEMY_TYPE_MAP = {
     'Int8': BigInteger(),
@@ -340,8 +340,6 @@ class dbmerge:
             dialect_name = self.dialect_name
             # The module that does what this dialect needs done differently, None for the generic flow.
             self._dialect_module = _load_dialect_module(dialect_name)
-            if hook := self._dialect_hook('validate_init_params'):
-                hook(**init_params)
 
             self.data = data
             self.engine = engine
@@ -1173,6 +1171,13 @@ class dbmerge:
         return func.now()
 
 
+    def _database_time(self):
+        """The current time by the database clock, as the driver returns it."""
+        if hook := self._dialect_hook('database_time'):
+            return hook(self)
+        return self.conn.scalar(select(self._now()))
+
+
     def _set_new_field_type(self, field_name, field_type):
         # A field about to be created is listed in new_fields, and - unless it is one of the
         # automatically managed columns - also in data_fields, so both have to stay in sync.
@@ -1572,7 +1577,9 @@ class dbmerge:
             # - psycopg (3) reports -1 for INSERT ... SELECT.
             # - mysql-connector in its pure Python mode reports -1 for INSERT ... SELECT. It falls back to that
             #   mode by itself once pyarrow is loaded into the process, which pandas 3 does.
-            compiled = statement.compile(dialect=self.conn.dialect)
+            # render_postcompile: a value list of in_() is expanded into its parameters only when SQLAlchemy
+            # executes a statement itself, and would reach the driver as a __[POSTCOMPILE_...] placeholder.
+            compiled = statement.compile(dialect=self.conn.dialect, compile_kwargs={'render_postcompile': True})
             params = compiled.construct_params()
             if compiled.positional:
                 params = tuple(params[name] for name in compiled.positiontup)
@@ -1642,14 +1649,7 @@ class dbmerge:
         database and against other processes' tables, and the hosts running them need not agree on
         the time; the database is the one clock all of them share.
         """
-        if hook := self._dialect_hook('scalar'):
-            value = hook(self, select(self._now()))
-        elif self.dialect_name == 'duckdb':
-            # DuckDB's now() is a TIMESTAMP WITH TIME ZONE, and turning that into Python needs pytz,
-            # which DuckDB does not install. The name needs the local time only.
-            value = self.conn.scalar(select(cast(self._now(), DateTime)))
-        else:
-            value = self.conn.scalar(select(self._now()))
+        value = self._database_time()
         if isinstance(value, str):
             # sqlite has no datetime type and returns CURRENT_TIMESTAMP as text.
             value = datetime.fromisoformat(value)
@@ -1752,6 +1752,8 @@ class dbmerge:
         self.conn.execute(insert(self.temp_table), data_slice)
         
     def _insert_source_table_to_temp(self):
+        if hook := self._dialect_hook('insert_source_table_to_temp'):
+            return hook(self)
 
         start_time = time.perf_counter()
 

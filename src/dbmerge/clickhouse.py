@@ -83,14 +83,6 @@ DEFAULT_CHUNK_SIZE = 1_000_000
 LOAD_SETTINGS = {'input_format_null_as_default': 0, 'async_insert': 0}
 
 
-def validate_init_params(source_table_name, **other_params):
-    # Called right after dbmerge._validate_init_params, with the same arguments of dbmerge.__init__.
-    # Only the ones ClickHouse can not handle are checked here, the rest are already checked there.
-    if source_table_name is not None:
-        raise IncorrectParameter('source_table_name is not supported on ClickHouse: '
-                                 'pass the data itself in "data".')
-
-
 class _ClientConnection:
     """
     Stands in for the SQLAlchemy connection when dbmerge is given a clickhouse-connect client instead of
@@ -132,8 +124,11 @@ def open_session(merge: dbmerge):
 
     # A schema is a database in ClickHouse. The current one is written out, so that the catalog can be
     # queried by name and every statement names its table in full.
-    if merge.schema is None:
-        merge.schema = _query(merge, 'SELECT currentDatabase()')[0][0]
+    if merge.schema is None or (merge.source_table_name is not None and merge.source_schema is None):
+        current_database = _query(merge, 'SELECT currentDatabase()')[0][0]
+        merge.schema = merge.schema or current_database
+        if merge.source_table_name is not None:
+            merge.source_schema = merge.source_schema or current_database
     # A TEMPORARY staging table belongs to the session of the client and to no database (see
     # create_temp_table), so temp_schema is dropped quietly then, as on PostgreSQL. A client made without a
     # session (autogenerate_session_id=False, e.g. to be shared between threads) would lose such a table
@@ -242,8 +237,17 @@ def check_table(merge: dbmerge):
                                  f'does not have this column: every change would lose to the row it replaces. '
                                  f'Pass "{version}" in the data, or make it the merged_on_field.')
 
+    # Columns ClickHouse computes itself can not be written. A source table built like the target has them
+    # too, and their values are what the target computes anyway, so they are left out, as on the other
+    # engines; data that brings them is refused.
     computed = [f for f in merge.new_fields if f in info['computed_columns']]
-    if computed:
+    if computed and merge.source_table is not None:
+        logger.info(f'Columns {computed} are computed by ClickHouse in table "{table_name}", '
+                    f'they are not merged from the source table.')
+        for f in computed:
+            del merge.new_fields[f]
+            merge.data_fields.pop(f, None)
+    elif computed:
         raise IncorrectParameter(f'Columns {computed} of table "{table_name}" are computed by ClickHouse '
                                  f'(MATERIALIZED, ALIAS or EPHEMERAL) and can not be written.')
 
@@ -251,8 +255,13 @@ def check_table(merge: dbmerge):
 def adapt_types(merge: dbmerge):
     for f in merge.new_fields:
         field_type = merge.new_fields[f]
-        # A ClickHouse type given in data_types says everything about the column, nullability included.
         if isinstance(field_type, ChSqlaType):
+            # A ClickHouse type given in data_types says everything about the column, nullability included.
+            # One that comes from a source table is taken as it is too, but a key column is made not
+            # nullable: ORDER BY refuses a nullable column, and a source such as a PostgreSQL table
+            # declares every column nullable that is not NOT NULL there.
+            if f in merge.key and f not in merge.given_data_types:
+                merge._set_new_field_type(f, sqla_type_from_name(_not_nullable(field_type.name)))
             continue
         type_name = _clickhouse_type_name(f, field_type, detected=f not in merge.given_data_types)
         # A ClickHouse column is not nullable unless declared so, and a NULL written into it silently turns
@@ -292,9 +301,8 @@ def now():
     return func.now64(literal_column('6'))
 
 
-def scalar(merge: dbmerge, statement):
-    compiled = statement.compile(dialect=merge.ch_dialect)
-    return merge.client.query(str(compiled), parameters=compiled.params).result_rows[0][0]
+def database_time(merge: dbmerge):
+    return _scalar(merge, select(now()))
 
 
 def create_temp_table(merge: dbmerge, temp_table_name):
@@ -345,6 +353,25 @@ def insert_data_to_temp(merge: dbmerge):
             columns = python_columns(merge, begin, end, nested_as_json=json_fields, processors=processors)
             merge.client.insert(merge.temp_table.name, [columns[f] for f in fields], column_names=fields,
                                 column_oriented=True, database=merge.temp_schema, settings=LOAD_SETTINGS)
+    merge.temp_insert_time = time.perf_counter() - start_time
+
+
+def insert_source_table_to_temp(merge: dbmerge):
+    # The source is any table or view ClickHouse can read, a table of a PostgreSQL or MySQL database engine
+    # among them: the server copies it into the staging table itself.
+    start_time = time.perf_counter()
+    source = merge.source_table
+    rows = select(*[source.c[f] for f in merge.data_fields])
+    if merge.source_condition is not None:
+        rows = rows.where(merge.source_condition)
+    # A ReplacingMergeTree source still holds the replaced versions of a row until its parts are merged:
+    # only the current one is read.
+    if source.info['clickhouse']['engine'] in REPLACING_ENGINES:
+        rows = final(rows, source)
+    statement = insert(merge.temp_table).from_select(list(merge.data_fields), rows)
+    # insert_null_as_default=0: a NULL for a column that is not Nullable is refused, as it is in data
+    # (LOAD_SETTINGS); INSERT ... SELECT would store 0, '' or 1970-01-01 in its place otherwise.
+    _, merge.total_row_count = _insert(merge, statement, settings={'insert_null_as_default': 0})
     merge.temp_insert_time = time.perf_counter() - start_time
 
 
@@ -486,7 +513,7 @@ def delete_rows_missing_in_source(merge: dbmerge):
 
     # DELETE reports no row count, so the keys are counted first. With others writing into the table at
     # the same time, this is an estimate rather than an exact figure.
-    merge.deleted_row_count = scalar(merge, select(func.count()).select_from(doomed_keys.subquery()))
+    merge.deleted_row_count = _scalar(merge, select(func.count()).select_from(doomed_keys.subquery()))
     statement = delete(merge.table).where(_key(merge, merge.table).in_(doomed_keys))
     merge.delete_sql, _ = _execute(merge, statement)
     merge.delete_time = time.perf_counter() - start_time
@@ -529,10 +556,21 @@ def _adapt(condition, target, staging):
     return condition
 
 
+def _compile(merge: dbmerge, statement):
+    # render_postcompile: the value list of an in_() in a condition is expanded into its parameters only when
+    # SQLAlchemy executes a statement itself; the client here would get a __[POSTCOMPILE_...] placeholder.
+    return statement.compile(dialect=merge.ch_dialect, compile_kwargs={'render_postcompile': True})
+
+
 def _execute(merge: dbmerge, statement, settings=None):
-    compiled = statement.compile(dialect=merge.ch_dialect)
+    compiled = _compile(merge, statement)
     sql = str(compiled)
     return sql, merge.client.command(sql, parameters=compiled.params, settings=settings)
+
+
+def _scalar(merge: dbmerge, statement):
+    compiled = _compile(merge, statement)
+    return merge.client.query(str(compiled), parameters=compiled.params).result_rows[0][0]
 
 
 # The SELECT of every INSERT ... SELECT here gives no aliases to its columns: INSERT takes them by position,
@@ -540,10 +578,11 @@ def _execute(merge: dbmerge, statement, settings=None):
 # t.Deleted of the condition and fail.
 
 
-def _insert(merge: dbmerge, statement):
+def _insert(merge: dbmerge, statement, settings=None):
     # A token of its own for every insert: a Replicated or Shared table drops an insert whose data repeats
     # one of the recent ones, which would lose a value that returned to what it once was.
-    sql, summary = _execute(merge, statement, settings={'insert_deduplication_token': uuid.uuid4().hex})
+    settings = {**(settings or {}), 'insert_deduplication_token': uuid.uuid4().hex}
+    sql, summary = _execute(merge, statement, settings=settings)
     return sql, summary.written_rows
 
 
@@ -606,6 +645,17 @@ def _nullable(type_name):
         inner = type_name[len('LowCardinality('):-1]
         return type_name if inner.startswith('Nullable(') else f'LowCardinality(Nullable({inner}))'
     return f'Nullable({type_name})'
+
+
+def _not_nullable(type_name):
+    # The type name without its Nullable wrapper: Nullable(Int32) -> Int32,
+    # LowCardinality(Nullable(String)) -> LowCardinality(String). Only the outer level is
+    # unwrapped, Array(Nullable(Int32)) stays as it is.
+    if type_name.startswith('Nullable('):
+        return type_name[len('Nullable('):-1]
+    if type_name.startswith('LowCardinality(Nullable('):
+        return 'LowCardinality(' + type_name[len('LowCardinality(Nullable('):-2] + ')'
+    return type_name
 
 
 def _base_type_name(type_name):

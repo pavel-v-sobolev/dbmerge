@@ -58,7 +58,7 @@ with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
   On MySQL/MariaDB a **string column of the merge key** must be given an explicit length here: InnoDB indexes at most 3072 bytes per key, shared by all of its columns, so no default length is safe.
 - **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name). On ClickHouse it is a database, and defaults to the current database of the connection.
 - **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created. Defaults to `schema`. The table is named `tmp_<yymmddHHMMSS>_<table>_<hex8>` and dropped when the context manager exits — see [The Staging Table](#the-staging-table) for the naming rules and for how it is created on each engine. Quietly ignored on PostgreSQL and DuckDB, which keep temporary tables in a schema of their own, and on ClickHouse whenever the staging table is a temporary one there.
-- **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`. A column the target computes itself (`GENERATED ALWAYS AS …`) is left out: the target computes it anyway. Not supported on ClickHouse.
+- **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`. A column the target computes itself (`GENERATED ALWAYS AS …`) is left out: the target computes it anyway. On ClickHouse it can also be a table of a PostgreSQL or MySQL database attached to ClickHouse — see [Source tables on ClickHouse](#source-tables-on-clickhouse).
 - **`source_schema`** *(str | None, optional)*: The database schema of the source table or view.
 - **`can_create_table`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target table if it does not exist.
 - **`can_create_columns`** *(bool, optional)*: Defaults to `True`. Allows the module to append missing columns to the target table.
@@ -382,13 +382,32 @@ It is a `TEMPORARY` table in the session of the clickhouse-connect client: no ot
 
 A regular staging table can be left over by a process killed mid-merge; its name tells how old it is — see [The Staging Table](#the-staging-table).
 
+### Source tables on ClickHouse
+
+`source_table_name` takes any table or view ClickHouse can read, and the server copies it into the staging table itself, without the data passing through Python. That includes a PostgreSQL or MySQL database attached to ClickHouse with its database engine — a common way to keep a ClickHouse table in step with an operational database:
+
+```python
+# Once, in ClickHouse:
+#   CREATE DATABASE shop_pg ENGINE = PostgreSQL('pg-host:5432', 'shop', 'reader', 'password', 'public')
+
+with dbmerge(engine=engine, source_table_name='facts', source_schema='shop_pg',
+             table_name='Facts', key=['shop', 'product', 'day'], delete_mode='delete') as merge:
+    result = merge.exec(source_condition=merge.source_table.c['day'] >= date(2025, 1, 1),
+                        delete_condition=merge.table.c['day'] >= date(2025, 1, 1))
+```
+
+- `source_schema` is a ClickHouse database and defaults to the current one.
+- A `ReplacingMergeTree` source is read with `FINAL`, so only the current version of each row is merged.
+- A target created from a source takes the column types of the source. The key columns are made not nullable, since `ORDER BY` refuses nullable columns, and PostgreSQL tables come with every column nullable that is not `NOT NULL` there.
+- A table of a database engine has no sorting key, so `key` must be given when the target does not exist yet.
+- A `NULL` for a target column that is not `Nullable` fails the load, as it does from `data`.
+
 ### Duplicate keys on ClickHouse
 
 The staging table on ClickHouse has no primary key, so duplicate keys in the source are not refused. All of them are written and counted, and `ReplacingMergeTree` keeps one — in practice the last, but this is not guaranteed. Remove duplicates from the source if it matters which one stays. A `NULL` in a key column still fails the load, as on the other engines, since `ORDER BY` columns are not nullable.
 
 ### Not supported
 
-- `source_table_name`.
 - `commit_all_steps`: there are no transactions, every statement is final as soon as it runs.
 - clickhouse-sqlalchemy (`clickhouse://` engines): its driver opens a new session for every statement, so the temporary staging table would not survive. Use clickhouse-connect.
 

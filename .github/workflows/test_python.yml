@@ -47,11 +47,11 @@ jobs:
 
       # Not "uv sync": uv.lock pins packages that have no wheels for every Python here (pyarrow 25, pyodbc
       # on 3.15), and its dev extra brings pyarrow in. The latest releases are installed instead, as a user
-      # of that Python gets them. scramp 1.5.0 breaks pg8000 1.31.5.
+      # of that Python gets them.
       - name: Install dependencies
         run: |
           uv venv --python ${{ matrix.python }}
-          uv pip install -e . pytest pandas polars numpy duckdb_engine psycopg2-binary "psycopg[binary]" pg8000 "scramp<1.5"
+          uv pip install -e . pytest pandas polars numpy duckdb_engine psycopg2-binary "psycopg[binary]" pg8000
           if [ "${{ matrix.pyarrow }}" = "true" ]; then uv pip install pyarrow; fi
 
       - name: Show versions

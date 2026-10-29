@@ -35,7 +35,7 @@ The databases and drivers DBMerge is tested with, how each of them loads the sta
 - **ClickHouse through clickhouse-sqlalchemy** (`clickhouse://`, `clickhouse+native://`). Its driver opens a new session for every statement, so a temporary staging table does not survive between them. DBMerge refuses such an engine with `IncorrectParameter`; use clickhouse-connect.
 - **Oracle**: `UPDATE` with a `JOIN` is not available in its SQLAlchemy dialect.
 
-**Versions in the tests:** PostgreSQL 18, CockroachDB 24.3, MariaDB 10.11, MySQL 8.4, SQL Server 2022, SQLite 3.50, DuckDB 1.5 and 2.0, ClickHouse 23.8, 24.8 and 26.9; Python 3.14 and 3.15 with pandas 3, polars and pyarrow, and Python 3.10 and 3.12 without pyarrow (SQLite, DuckDB, PostgreSQL). The oldest ClickHouse DBMerge accepts is 23.8. SQLAlchemy 2.1 needs Python 3.11 or newer.
+**Versions in the tests:** PostgreSQL 18, CockroachDB 24.3, MariaDB 10.11, MySQL 8.4, SQL Server 2022, SQLite 3.50, DuckDB 1.5 and 2.0, ClickHouse 23.8, 24.8 and 26.10; Python 3.14 and 3.15 with pandas 3, polars and pyarrow, and Python 3.10 and 3.12 without pyarrow (SQLite, DuckDB, PostgreSQL). The oldest ClickHouse DBMerge accepts is 23.8. SQLAlchemy 2.1 needs Python 3.11 or newer.
 
 ---
 
@@ -76,7 +76,7 @@ Some data goes row by row even with `bulk_load=True`, so that what is stored doe
 
 ### PostgreSQL
 
-**pg8000 and scramp 1.5.0.** pg8000 1.31.5 does not connect with scramp 1.5.0, released on 2026-10-25: `AttributeError: module 'scramp' has no attribute 'make_channel_binding'`. Install `scramp<1.5` until a pg8000 release fixes it.
+**pg8000 and scramp 1.5.0.** pg8000 1.31.5 does not connect with scramp 1.5.0, released on 2026-10-25: `AttributeError: module 'scramp' has no attribute 'make_channel_binding'`. pg8000 1.31.6 fixes it; with 1.31.5, install `scramp<1.5`.
 
 **A timezone-aware `datetime` in a `timestamp` column without time zone** is stored differently by different drivers. psycopg2 and psycopg 3 convert it to the session `TimeZone`, pg8000 converts it to UTC. With the session in `Europe/Moscow`:
 
@@ -119,4 +119,4 @@ CockroachDB runs `SERIALIZABLE` transactions by default. A merge step over many 
 ClickHouse merges work differently from every other database; see [ClickHouse](DOCUMENTATION.md#clickhouse) in the documentation.
 
 - **23.8** is the oldest version DBMerge accepts; every merge works from there on.
-- `source_table_name` is not supported on ClickHouse.
+- `source_table_name` can name a table of a PostgreSQL or MySQL database attached to ClickHouse with its database engine. The tests cover PostgreSQL 16 and 18 with ClickHouse 23.8 and newer (CI workflow "ClickHouse from PostgreSQL"); MySQL 8.4 was checked by hand.

@@ -70,6 +70,9 @@ for _name in engines:
 
 # DBMERGE_TEST_ENGINES=postgres,postgres-pg8000 runs the tests of these engines only. A substring for -k
 # would not do: "mssql" is also part of "mssql-pymssql" and "mssql-python".
+# Every URL, before DBMERGE_TEST_ENGINES narrows engines down: a test of one engine may need another as a source.
+all_engine_urls = dict(engines)
+
 if os.environ.get('DBMERGE_TEST_ENGINES'):
     _selected = os.environ['DBMERGE_TEST_ENGINES'].split(',')
     _unknown = [name for name in _selected if name not in engines]
@@ -142,10 +145,6 @@ def _final_on_clickhouse(engine, stmt, tbl):
         return final(stmt, tbl)
     return stmt
 
-
-def skip_on_clickhouse_source_table(engine_name):
-    if engine_name == 'clickhouse':
-        pytest.skip('source_table_name is not supported on ClickHouse')
 
 
 def count_all_rows(engine, date_from=None, date_to=None):
@@ -761,7 +760,6 @@ def test_a_set_from_temp_with_deletion(engine_name,type_of_data):
                                                      for type_of_data in ('list of dict', 'dict of list', 'pandas','polars')])
 def test_update_from_source_table_with_delete_in_a_period(engine_name,type_of_data):
     logger.debug(f'TEST UPDATE FROM SOURCE TABLE WITH DELETE/UPDATE OF IN A SET {engine_name} {type_of_data}')
-    skip_on_clickhouse_source_table(engine_name)
     engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
 
@@ -1437,7 +1435,8 @@ def test_pandas_duplicate_columns_are_refused(engine_name):
 def test_computed_target_column_is_not_written(engine_name):
     # A column the target computes itself (DB-07). Merged from a source table built like the target, it is
     # left out and computed by the target; brought in "data", it is refused before anything is written.
-    skip_on_clickhouse_source_table(engine_name)
+    if engine_name == 'clickhouse':
+        pytest.skip('ClickHouse computes MATERIALIZED and ALIAS columns, which SQLAlchemy Computed does not create')
     if engine_name == 'duckdb':
         pytest.skip('DuckDB does not tell a generated column from a default in its catalog')
     logger.debug(f'TEST COMPUTED TARGET COLUMN IS NOT WRITTEN {engine_name}')
@@ -1532,6 +1531,141 @@ def test_clickhouse_reports_column_and_row_of_a_bad_value(type_of_data):
         with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', key=['id'],
                      data_types={'amount_x': types.BigInteger()}) as merge:
             merge.exec(chunk_size=600)      # the bad row lands in the second chunk: the row number is not per chunk
+
+
+def _attach_postgresql():
+    """
+    The PostgreSQL of the tests attached to ClickHouse as the database dbmerge_pg (its schema "source"), the
+    likely source of source_table_name on ClickHouse. ClickHouse reaches PostgreSQL itself, at an address that
+    may differ from the one the tests use - in CI they are separate containers - so
+    DBMERGE_TEST_CLICKHOUSE_POSTGRES gives it as host:port. Returns the engines of ClickHouse and of that
+    PostgreSQL.
+    """
+    from sqlalchemy.engine import make_url
+    address = os.environ.get('DBMERGE_TEST_CLICKHOUSE_POSTGRES')
+    if 'clickhouse' not in engines or not address:
+        pytest.skip('needs ClickHouse and DBMERGE_TEST_CLICKHOUSE_POSTGRES, the address of PostgreSQL for ClickHouse')
+    engine = make_engine('clickhouse')
+    url = make_url(all_engine_urls['postgres'])
+    pg = create_engine(url)
+    _made_engines.append(pg)
+    try:
+        with pg.begin() as conn:
+            conn.exec_driver_sql('CREATE SCHEMA IF NOT EXISTS source')
+    except Exception as e:
+        pytest.skip(f'PostgreSQL is not available: {e}')
+    with engine.connect() as conn:
+        conn.exec_driver_sql('DROP DATABASE IF EXISTS dbmerge_pg')
+        conn.exec_driver_sql(f"CREATE DATABASE dbmerge_pg ENGINE = PostgreSQL('{address}', '{url.database}', "
+                             f"'{url.username}', '{url.password}', 'source')")
+    return engine, pg
+
+
+def _detach_postgresql(engine, pg, table_name):
+    with engine.connect() as conn:
+        conn.exec_driver_sql('DROP DATABASE IF EXISTS dbmerge_pg')
+    with pg.begin() as conn:
+        conn.exec_driver_sql(f'DROP TABLE IF EXISTS source.{table_name}')
+
+
+def _same_as_source(engine, table_name):
+    """The target table, read as it is now (FINAL), holds what ClickHouse reads from the PostgreSQL table."""
+    with engine.connect() as conn:
+        source = conn.exec_driver_sql(f'SELECT * FROM dbmerge_pg.{table_name} ORDER BY 1, 2, 3').all()
+        target = conn.exec_driver_sql('SELECT * FROM target.Facts FINAL ORDER BY 1, 2, 3').all()
+    return [tuple(r) for r in source] == [tuple(r) for r in target]
+
+
+def test_clickhouse_linked_postgresql_types():
+    # A ClickHouse table filled from a PostgreSQL table of many types through the PostgreSQL database engine.
+    # The target takes the types ClickHouse reads them as - but a key column that is nullable in PostgreSQL is
+    # made not nullable, as ORDER BY wants - and a second merge of the same data must find nothing to change.
+    engine, pg = _attach_postgresql()
+    prepare_and_clean_data(engine)
+    with pg.begin() as conn:
+        conn.exec_driver_sql('DROP TABLE IF EXISTS source.ch_types')
+        conn.exec_driver_sql("""CREATE TABLE source.ch_types (id integer, s text, v varchar(10), c char(3), i2 smallint,
+            i8 bigint, n numeric(12,2), nn numeric, d double precision, r real, f boolean, dt date, ts timestamp(6),
+            tz timestamptz, t time, u uuid, j jsonb, by bytea, arr integer[], tarr text[])""")
+        conn.exec_driver_sql("""INSERT INTO source.ch_types VALUES
+            (1, 'text "quoted", with a comma', 'ünïcödé', 'ab', -32768, 9223372036854775807, 1234567890.12,
+             0.1234567890123, 1.5e300, 1.25, true, '1900-01-01', '2025-06-01 12:34:56.123456', '2025-06-01 12:00+03',
+             '13:45:00', '12345678-1234-4678-9234-567812345678', '{"a": [1, null]}', '\\x00ff', '{1,2,NULL}', '{"x","y"}'),
+            (2, '', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+            (3, 'gone soon', NULL, NULL, 0, 0, 0, 0, 0, 0, false, '2299-12-31', NULL, NULL, NULL, NULL, 'null', NULL, '{}', '{}')""")
+    try:
+        def merge(**kw):
+            with dbmerge(engine=engine, source_table_name='ch_types', source_schema='dbmerge_pg',
+                         table_name='Facts', schema='target', **kw) as merge:
+                result = merge.exec()
+            return result.inserted_row_count, result.updated_row_count, result.deleted_row_count
+
+        assert merge(key=['id']) == (3, 0, 0)
+        with engine.connect() as conn:
+            types = dict(conn.exec_driver_sql("SELECT name, type FROM system.columns WHERE database = 'dbmerge_pg' "
+                                              "AND table = 'ch_types'").all())
+            created = dict(conn.exec_driver_sql("SELECT name, type FROM system.columns WHERE database = 'target' "
+                                                "AND table = 'Facts'").all())
+        assert types['id'] == 'Nullable(Int32)' and created['id'] == 'Int32', (types['id'], created['id'])
+        assert {c: t for c, t in created.items() if c != 'id'} == {c: t for c, t in types.items() if c != 'id'}
+
+        assert merge(delete_mode='delete') == (0, 0, 0), 'the same data merged again must change nothing'
+
+        with pg.begin() as conn:
+            conn.exec_driver_sql("""UPDATE source.ch_types SET s = 'changed', v = NULL, i2 = 1, n = 2.5, nn = NULL,
+                d = -0.0001, r = 2.5, f = false, dt = '2299-12-31', ts = '2025-06-01 12:34:56.123457', tz = NULL,
+                u = '87654321-4321-4765-8321-876543218765', j = '{"a": [1, 2]}', by = '\\x01', arr = '{1,2}',
+                tarr = '{}' WHERE id = 1""")
+            conn.exec_driver_sql("UPDATE source.ch_types SET s = NULL, arr = '{7}' WHERE id = 2")
+            conn.exec_driver_sql("DELETE FROM source.ch_types WHERE id = 3")
+            conn.exec_driver_sql("INSERT INTO source.ch_types (id, s) VALUES (4, 'new')")
+        assert merge(delete_mode='delete') == (1, 2, 1)
+        assert _same_as_source(engine, 'ch_types')
+        assert merge(delete_mode='delete') == (0, 0, 0), 'the same data merged again must change nothing'
+    finally:
+        _detach_postgresql(engine, pg, 'ch_types')
+
+
+def test_clickhouse_linked_postgresql_sample_data():
+    # A ClickHouse table kept in step with a PostgreSQL table through the PostgreSQL database engine: every merge
+    # of ClickHouse must count what the merge of the same change into PostgreSQL counted, and leave the same rows.
+    engine, pg = _attach_postgresql()
+    prepare_and_clean_data(engine)
+    drop_table_if_exists(pg, 'ch_facts', schema='source')
+
+    def into_postgresql(data, **kw):
+        with dbmerge(engine=pg, data=data, table_name='ch_facts', schema='source', key=key,
+                     data_types=data_types, **kw) as merge:
+            result = merge.exec()
+        return result.inserted_row_count, result.updated_row_count, result.deleted_row_count
+
+    try:
+        assert into_postgresql(get_data(limit=50000)) == (50000, 0, 0)
+        with dbmerge(engine=engine, source_table_name='ch_facts', source_schema='dbmerge_pg',
+                     table_name='Facts', schema='target', key=key) as merge:
+            assert merge.exec().inserted_row_count == 50000
+        assert _same_as_source(engine, 'ch_facts')
+
+        # inserts, updates and deletes at once: get_modified_data changes prices, adds rows and leaves some out
+        changed = into_postgresql(get_modified_data(limit=50000), delete_mode='delete')
+        assert all(changed), changed
+        with dbmerge(engine=engine, source_table_name='ch_facts', source_schema='dbmerge_pg',
+                     table_name='Facts', schema='target', delete_mode='delete') as merge:
+            result = merge.exec()
+        assert (result.inserted_row_count, result.updated_row_count, result.deleted_row_count) == changed
+        assert _same_as_source(engine, 'ch_facts')
+
+        # a merge of a part only: one shop leaves PostgreSQL, and the scoped merge removes just that shop
+        with pg.begin() as conn:
+            removed = conn.exec_driver_sql('DELETE FROM source.ch_facts WHERE "Shop" = \'Shop1\'').rowcount
+        with dbmerge(engine=engine, source_table_name='ch_facts', source_schema='dbmerge_pg',
+                     table_name='Facts', schema='target', delete_mode='delete') as merge:
+            result = merge.exec(source_condition=merge.source_table.c['Shop'].in_(['Shop1', 'Shop2']),
+                                delete_condition=merge.table.c['Shop'].in_(['Shop1', 'Shop2']))
+        assert (result.inserted_row_count, result.updated_row_count, result.deleted_row_count) == (0, 0, removed)
+        assert removed > 0 and _same_as_source(engine, 'ch_facts')
+    finally:
+        _detach_postgresql(engine, pg, 'ch_facts')
 
 
 # The engines that load the staging table with COPY.
