@@ -29,15 +29,21 @@ import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Engine, Table, Column, func, literal, literal_column, tuple_, and_, or_
+from sqlalchemy import Engine, Table, Column, func, literal, literal_column, tuple_, and_, or_, true, false
 from sqlalchemy import select, insert, delete
 from sqlalchemy import Boolean, SmallInteger, Integer, BigInteger, Float, Numeric, String, DateTime, Date
 from sqlalchemy import Uuid, LargeBinary, JSON
-from sqlalchemy.sql.util import ClauseAdapter
+from sqlalchemy.sql import operators
+from sqlalchemy.sql.elements import BinaryExpression, Grouping, TextClause, Tuple
+from sqlalchemy.sql.selectable import CompoundSelect, ScalarSelect, Select, TextualSelect
+from sqlalchemy.sql.util import ClauseAdapter, find_tables
+from sqlalchemy.sql.visitors import replacement_traverse
 
 from clickhouse_connect.cc_sqlalchemy.dialect import ClickHouseDialect
 from clickhouse_connect.cc_sqlalchemy.datatypes.base import ChSqlaType, sqla_type_from_name
 from clickhouse_connect.cc_sqlalchemy.sql import final
+from clickhouse_connect.driver.binding import DT64Param, format_query_value
+from clickhouse_connect.driver.exceptions import DatabaseError
 
 try:
     import pyarrow as pa
@@ -63,6 +69,10 @@ MIN_SERVER_VERSION = (23, 8)
 # with the data kept on several replicas.
 REPLACING_ENGINES = ('ReplacingMergeTree', 'ReplicatedReplacingMergeTree', 'SharedReplacingMergeTree')
 
+# Engines of a database attached from another server. ClickHouse reads its tables and views by querying that
+# server, and sends along only the filters it can translate: comparisons of columns with constants.
+EXTERNAL_DATABASE_ENGINES = ('PostgreSQL', 'MySQL')
+
 # Columns whose value ClickHouse produces itself, so an INSERT can not write them.
 COMPUTED_COLUMN_KINDS = ('MATERIALIZED', 'ALIAS', 'EPHEMERAL')
 
@@ -74,6 +84,9 @@ NOT_NULLABLE_TYPE_PREFIXES = ('Array(', 'Map(', 'Tuple(', 'Nested(', 'JSON', 'Ob
 # rows load in 0.12s as one insert and in 0.44s as inserts of 10,000 (the generic default), and a large
 # load in small inserts piles up parts faster than they are merged, until the server refuses the insert.
 DEFAULT_CHUNK_SIZE = 1_000_000
+
+# The default max_query_size of ClickHouse, the longest statement it parses (see _execute).
+DEFAULT_MAX_QUERY_SIZE = 262_144
 
 # Settings of every insert into the staging table.
 # input_format_null_as_default=0: otherwise a NULL arriving for a non-nullable column is silently stored as
@@ -154,17 +167,21 @@ def create_schema_if_not_exists(merge: dbmerge, schema_name):
 def reflect_table(merge: dbmerge, table_name, schema):
     rows = _query(merge, 'SELECT engine, engine_full, sorting_key FROM system.tables '
                          'WHERE database = {db:String} AND name = {name:String}', db=schema, name=table_name)
-    if not rows:
-        return None
-    engine, engine_full, sorting_key = rows[0]
+    if rows:
+        engine, engine_full, sorting_key = rows[0]
+        column_rows = _query(merge, 'SELECT name, type, default_kind, is_in_sorting_key, is_in_partition_key '
+                                    'FROM system.columns WHERE database = {db:String} AND table = {name:String} '
+                                    'ORDER BY position', db=schema, name=table_name)
+    else:
+        engine, column_rows = _external_view(merge, table_name, schema)
+        if engine is None:
+            return None
+        engine_full, sorting_key = '', ''
 
     columns = []
     partition_columns = []
     computed_columns = []
-    for name, type_name, default_kind, in_sorting_key, in_partition_key in _query(
-            merge, 'SELECT name, type, default_kind, is_in_sorting_key, is_in_partition_key '
-                   'FROM system.columns WHERE database = {db:String} AND table = {name:String} '
-                   'ORDER BY position', db=schema, name=table_name):
+    for name, type_name, default_kind, in_sorting_key, in_partition_key in column_rows:
         if in_partition_key:
             partition_columns.append(name)
         if default_kind in COMPUTED_COLUMN_KINDS:
@@ -193,6 +210,23 @@ def reflect_table(merge: dbmerge, table_name, schema):
         'version_column': _unquote(identifiers[0]) if identifiers else None,
     }
     return table
+
+
+def _external_view(merge: dbmerge, table_name, schema):
+    """
+    The engine and the columns (as system.columns gives them) of a view in a PostgreSQL or MySQL database
+    attached to ClickHouse, or (None, None) when there is none. system.tables lists only the tables of such a
+    database, while ClickHouse reads its views all the same, and DESCRIBE finds them.
+    """
+    database = _query(merge, 'SELECT engine FROM system.databases WHERE name = {db:String}', db=schema)
+    if not database or database[0][0] not in EXTERNAL_DATABASE_ENGINES:
+        return None, None
+    try:
+        described = merge.client.query(f'DESCRIBE TABLE {_table_name(merge, schema, table_name)}').result_rows
+    except DatabaseError:
+        return None, None
+    return database[0][0], [(name, type_name, default_kind, 0, 0)
+                            for name, type_name, default_kind, *_ in described]
 
 
 def check_table(merge: dbmerge):
@@ -361,18 +395,65 @@ def insert_source_table_to_temp(merge: dbmerge):
     # among them: the server copies it into the staging table itself.
     start_time = time.perf_counter()
     source = merge.source_table
+    engine = source.info['clickhouse']['engine']
     rows = select(*[source.c[f] for f in merge.data_fields])
     if merge.source_condition is not None:
-        rows = rows.where(merge.source_condition)
+        condition = merge.source_condition
+        if engine in EXTERNAL_DATABASE_ENGINES:
+            condition = _subqueries_as_values(merge, condition)
+        rows = rows.where(condition)
     # A ReplacingMergeTree source still holds the replaced versions of a row until its parts are merged:
     # only the current one is read.
-    if source.info['clickhouse']['engine'] in REPLACING_ENGINES:
+    if engine in REPLACING_ENGINES:
         rows = final(rows, source)
     statement = insert(merge.temp_table).from_select(list(merge.data_fields), rows)
     # insert_null_as_default=0: a NULL for a column that is not Nullable is refused, as it is in data
     # (LOAD_SETTINGS); INSERT ... SELECT would store 0, '' or 1970-01-01 in its place otherwise.
     _, merge.total_row_count = _insert(merge, statement, settings={'insert_null_as_default': 0})
     merge.temp_insert_time = time.perf_counter() - start_time
+
+
+def _subqueries_as_values(merge: dbmerge, condition):
+    """
+    The condition with every IN and NOT IN of one column over a subquery replaced by the rows of that subquery.
+
+    ClickHouse sends the filter of a query to the server a PostgreSQL or MySQL table lives on only as far
+    as it compares columns with constants. It keeps an IN over a subquery to itself and reads the whole
+    table to apply it, so a merge of the few rows changed since the last run would copy the whole source.
+    With the rows of the subquery written out, the filter goes to that server and is applied there.
+
+    Left to ClickHouse are:
+    - an IN of several columns: PostgreSQL fails on a list of some thousands of tuples (stack depth limit
+      exceeded), while a list of one column goes through at hundreds of thousands of values;
+    - a subquery correlated with the source (see _correlated), which run on its own picks other rows.
+    NULL is left out of the values: ClickHouse skips it in the set of an IN, while to PostgreSQL a NULL in
+    the list of a NOT IN would make it pass no row at all.
+    """
+    def replace(element):
+        if not (isinstance(element, BinaryExpression)
+                and element.operator in (operators.in_op, operators.not_in_op)):
+            return None
+        subquery = element.right
+        while isinstance(subquery, (Grouping, ScalarSelect)):
+            subquery = subquery.element
+        if (not isinstance(subquery, (Select, CompoundSelect, TextualSelect, TextClause))
+                or isinstance(element.left, Tuple) or _correlated(subquery, merge.source_table)):
+            return None
+        values = [row[0] for row in _rows(merge, subquery) if row[0] is not None]
+        if element.operator is operators.in_op:
+            return element.left.in_(values) if values else false()
+        return element.left.not_in(values) if values else true()
+
+    return replacement_traverse(condition, {}, replace)
+
+
+def _correlated(subquery, source):
+    # SQLAlchemy correlates a subquery that names the source along with other tables, at any depth: it leaves
+    # the source out of that FROM, so that the subquery refers to the row of the source being filtered. A
+    # subquery of the source alone keeps it in its FROM and stands on its own.
+    if source not in find_tables(subquery, check_columns=True):
+        return False
+    return not (isinstance(subquery, Select) and subquery.get_final_froms() == [source])
 
 
 def drop_table(merge: dbmerge, table):
@@ -563,14 +644,40 @@ def _compile(merge: dbmerge, statement):
 
 
 def _execute(merge: dbmerge, statement, settings=None):
-    compiled = _compile(merge, statement)
-    sql = str(compiled)
-    return sql, merge.client.command(sql, parameters=compiled.params, settings=settings)
+    sql, parameters, settings = _prepared(merge, statement, settings)
+    return sql, merge.client.command(sql, parameters=parameters, settings=settings)
 
 
 def _scalar(merge: dbmerge, statement):
+    return _rows(merge, statement)[0][0]
+
+
+def _rows(merge: dbmerge, statement):
+    sql, parameters, settings = _prepared(merge, statement)
+    return merge.client.query(sql, parameters=parameters, settings=settings).result_rows
+
+
+def _prepared(merge: dbmerge, statement, settings=None):
+    """The text of a statement, with the parameters and settings to run it through the client."""
     compiled = _compile(merge, statement)
-    return merge.client.query(str(compiled), parameters=compiled.params).result_rows[0][0]
+    sql = str(compiled)
+    # The client binds a datetime as text in the time zone of the server, with whole seconds only. A column
+    # reads such text in its own time zone, though, as DateTime64(6, 'UTC') does, and the seconds move the
+    # bound of a condition such as merged_on > last run to the start of its second. As toDateTime64 of the
+    # text with microseconds (DT64Param), it is the moment it names, compared exactly with a DateTime or a
+    # DateTime64 of any time zone; the text alone fails against a DateTime on ClickHouse 24.8 and older.
+    parameters = dict(compiled.params)
+    for name, value in compiled.params.items():
+        if isinstance(value, datetime):
+            sql = sql.replace(f'%({name})s', f'toDateTime64(%({name})s, 6)')
+            parameters[name] = DT64Param(value)
+    # The values of a long in_() list go into the text of the statement, which ClickHouse refuses beyond
+    # max_query_size (256 KiB by default): a few thousand keys, as a merge from a PostgreSQL source gets them
+    # (see _subqueries_as_values).
+    size = len(sql.encode()) + sum(len(str(format_query_value(v)).encode()) for v in parameters.values())
+    if size > DEFAULT_MAX_QUERY_SIZE:
+        settings = {**(settings or {}), 'max_query_size': 2 * size}
+    return sql, parameters, settings
 
 
 # The SELECT of every INSERT ... SELECT here gives no aliases to its columns: INSERT takes them by position,

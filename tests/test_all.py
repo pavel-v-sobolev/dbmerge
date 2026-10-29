@@ -12,7 +12,7 @@ import decimal
 import pytest
 import logging
 
-from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_, cast, type_coerce
+from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_, cast, type_coerce, case
 from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, Double, JSON, Uuid, StaticPool, Computed
 from sqlalchemy import types
 from sqlalchemy.exc import NoSuchModuleError, DBAPIError
@@ -1514,6 +1514,40 @@ def test_exceptions_are_exported_from_the_package_root():
     assert exported <= set(package.__all__) and all(hasattr(package, name) for name in exported)
 
 
+def test_clickhouse_condition_takes_a_datetime_as_its_moment():
+    # A datetime in a condition is compared as the moment it names: with its microseconds against a DateTime64,
+    # with its fraction against a DateTime of whole seconds (which ClickHouse 24.8 and older refuse to compare
+    # with text that has a fraction), and as a moment against a column of a time zone of its own (which reads
+    # text in its own zone, not in the zone of the server the client writes the text in). A list of values
+    # longer than max_query_size goes through too.
+    if 'clickhouse' not in engines:
+        pytest.skip('ClickHouse is not among the tested engines')
+    engine = make_engine('clickhouse')
+    prepare_and_clean_data(engine)
+
+    def deleted(condition):
+        with engine.connect() as conn:
+            conn.exec_driver_sql('DROP TABLE IF EXISTS target.Facts')
+            conn.exec_driver_sql("CREATE TABLE target.Facts (id Int32, sec DateTime, micro DateTime64(6), "
+                                 "utc DateTime64(6, 'UTC')) ENGINE = ReplacingMergeTree ORDER BY id")
+            conn.exec_driver_sql("INSERT INTO target.Facts VALUES "
+                                 "(0, '2025-01-01 12:00:00', '2025-01-01 12:00:00.000000', '2025-01-01 12:00:00.000000'), "
+                                 "(1, '2025-01-01 12:00:01', '2025-01-01 12:00:00.000001', '2025-01-01 12:00:00.000001'), "
+                                 "(2, '2025-01-01 12:00:02', '2025-01-01 12:00:00.000002', '2025-01-01 12:00:00.000002')")
+        with dbmerge(engine=engine, data=[], table_name='Facts', schema='target', delete_mode='delete') as merge:
+            merge.exec(delete_condition=condition(merge.table.c))
+        with engine.connect() as conn:
+            left = [row[0] for row in conn.exec_driver_sql('SELECT id FROM target.Facts ORDER BY id')]
+        return merge.deleted_row_count, left
+
+    assert deleted(lambda c: c['sec'] >= datetime(2025, 1, 1, 12, 0, 0, 500000)) == (2, [0])
+    assert deleted(lambda c: c['micro'] > datetime(2025, 1, 1, 12, 0, 0, 1)) == (1, [0, 1])
+    assert deleted(lambda c: c['utc'] == datetime(2025, 1, 1, 12, 0, 0, 1, tzinfo=timezone.utc)) == (1, [0, 2])
+    moscow = timezone(timedelta(hours=3))
+    assert deleted(lambda c: c['utc'] == datetime(2025, 1, 1, 15, 0, 0, 2, tzinfo=moscow)) == (1, [0, 1])
+    assert deleted(lambda c: c['id'].in_(list(range(-60_000, 0)) + [0, 2])) == (2, [1])
+
+
 @pytest.mark.parametrize("type_of_data", ('list of dict', 'dict of list', 'pandas'))
 def test_clickhouse_reports_column_and_row_of_a_bad_value(type_of_data):
     # ClickHouse loads in bulk only, through Arrow. Arrow names neither the column nor the row of a value it
@@ -1666,6 +1700,62 @@ def test_clickhouse_linked_postgresql_sample_data():
         assert removed > 0 and _same_as_source(engine, 'ch_facts')
     finally:
         _detach_postgresql(engine, pg, 'ch_facts')
+
+
+def test_clickhouse_linked_postgresql_view_merged_since_the_last_run():
+    # The rows of a PostgreSQL view changed since the last run, merged into ClickHouse. A view of the attached
+    # database is a source like its tables, though system.tables lists only the tables. The changed rows are
+    # picked by an IN over a subquery, which ClickHouse does not send to PostgreSQL: it would read the whole
+    # view and filter it itself. Here the rows left out of the run fail to be read at all (a division by zero
+    # in the view, of a value PostgreSQL can not fold at planning), so the merge fails unless only the changed
+    # rows are read. The bound of the window is one microsecond after a change, which must stay out of the run.
+    engine, pg = _attach_postgresql()
+    prepare_and_clean_data(engine)
+    with pg.begin() as conn:
+        conn.exec_driver_sql('DROP VIEW IF EXISTS source.ch_window_view')
+        conn.exec_driver_sql('DROP TABLE IF EXISTS source.ch_window')
+        conn.exec_driver_sql('CREATE TABLE source.ch_window (id integer PRIMARY KEY, qty numeric, '
+                             'unreadable boolean NOT NULL DEFAULT false, changed_on timestamp NOT NULL)')
+        conn.exec_driver_sql("INSERT INTO source.ch_window (id, qty, changed_on) "
+                             "SELECT g, g, '2025-01-01 00:00:00' FROM generate_series(1, 1000) g")
+        conn.exec_driver_sql('CREATE VIEW source.ch_window_view AS SELECT id, '
+                             'CASE WHEN unreadable THEN qty / (id - id) ELSE qty * 2 END AS qty, changed_on '
+                             'FROM source.ch_window')
+    try:
+        def merge(condition=None):
+            with dbmerge(engine=engine, source_table_name='ch_window_view', source_schema='dbmerge_pg',
+                         table_name='Facts', schema='target', key=['id']) as merge:
+                result = merge.exec(source_condition=condition(merge.source_table) if condition else None)
+            return result.total_row_count, result.inserted_row_count, result.updated_row_count
+
+        assert merge() == (1000, 1000, 0)
+
+        last_run = datetime(2025, 1, 1, 0, 0, 0, 1)
+        with pg.begin() as conn:
+            conn.exec_driver_sql("UPDATE source.ch_window SET qty = qty + 1, "
+                                 "changed_on = '2025-01-01 00:00:00.000002' WHERE id <= 3")
+            conn.exec_driver_sql("UPDATE source.ch_window SET qty = qty + 1, "
+                                 "changed_on = '2025-01-01 00:00:00.000001' WHERE id = 4")
+            conn.exec_driver_sql('UPDATE source.ch_window SET unreadable = true WHERE id > 4')
+
+        def changed(view):
+            return view.c['id'].in_(select(view.c['id']).where(view.c['changed_on'] > last_run))
+        assert merge(changed) == (3, 0, 3)
+        with engine.connect() as conn:
+            qty = dict(conn.exec_driver_sql('SELECT id, qty FROM target.Facts FINAL WHERE id <= 5').all())
+        assert qty == {1: 4, 2: 6, 3: 8, 4: 8, 5: 10}, 'id 4 changed at the bound of the window, not after it'
+
+        # A NOT IN goes to PostgreSQL as well, without the NULLs of its subquery: PostgreSQL passes no row for a
+        # NOT IN whose list holds a NULL, while ClickHouse skips the NULL. The change of id 4, left out of the
+        # window above, comes now.
+        table = Table('ch_window', MetaData(), Column('id', Integer), Column('unreadable', types.Boolean),
+                      schema='dbmerge_pg')
+        unreadable = select(case((table.c['unreadable'], table.c['id'])))
+        assert merge(lambda view: view.c['id'].not_in(unreadable)) == (4, 0, 1)
+    finally:
+        with pg.begin() as conn:
+            conn.exec_driver_sql('DROP VIEW IF EXISTS source.ch_window_view')
+        _detach_postgresql(engine, pg, 'ch_window')
 
 
 # The engines that load the staging table with COPY.

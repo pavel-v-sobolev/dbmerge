@@ -344,7 +344,7 @@ A `NULL` arriving for a column that is not `Nullable` fails the load. It is not 
 4. **Mark** writes a new version of each row missing from the source, with `delete_mark_field` set.
 5. **Delete** is a lightweight `DELETE` of every version of the keys missing from the source.
 
-The conditions of `exec()` are built on `merge.table` and `merge.temp_table` as everywhere else. In `update_condition` and `delete_condition`, `merge.table` stands for the current version of the row.
+The conditions of `exec()` are built on `merge.table` and `merge.temp_table` as everywhere else. In `update_condition` and `delete_condition`, `merge.table` stands for the current version of the row. A `datetime` in a condition is compared as the moment it names, microseconds included, with a `DateTime` or a `DateTime64` of any time zone: an aware one by its offset, a naive one in the time zone of the server.
 
 DBMerge itself needs nothing beyond ClickHouse 23.8: its own statements use only joins and `IN` / `NOT IN` over subqueries that do not refer to the outer row. A condition you write yourself may need a newer server, though — when it holds a **correlated subquery**, one that refers to the row being checked, like the `EXISTS` guard in [Conditional Insert Example](#execution-exec): `g.c['category'] == merge.temp_table.c['category']` inside it refers to the staging row. ClickHouse runs such a condition out of the box from 25.8 on; on 25.4–25.7 only with the setting `allow_experimental_correlated_subqueries = 1`, which can go into the engine URL (`clickhousedb://…/default?allow_experimental_correlated_subqueries=1`); 25.3 and older can not run it at all. On an older server, write the same condition with `NOT IN` over a subquery that stands on its own:
 
@@ -397,6 +397,17 @@ with dbmerge(engine=engine, source_table_name='facts', source_schema='shop_pg',
 ```
 
 - `source_schema` is a ClickHouse database and defaults to the current one.
+- A view of the attached database is a source as well, though `system.tables` lists only its tables.
+- ClickHouse sends to PostgreSQL or MySQL only the part of `source_condition` that compares columns with constants, and applies the rest itself, after reading the whole source. An `IN` or `NOT IN` of one column over a subquery is therefore run by DBMerge first, and its rows go into the condition as constants: a merge of the rows changed since the last run reads only those rows from PostgreSQL. An `IN` of several columns (`tuple_(…).in_(…)`) is left to ClickHouse, as PostgreSQL fails on a list of some thousands of tuples, and so is a subquery correlated with the source, which names it along with other tables.
+
+  ```python
+  with dbmerge(engine=engine, source_table_name='orders_view', source_schema='shop_pg',
+               table_name='Orders', key=['id']) as merge:
+      view = merge.source_table
+      changed = select(view.c['id']).where(view.c['changed_on'] > last_run)
+      merge.exec(source_condition=view.c['id'].in_(changed))
+  ```
+- A `timestamptz` column of PostgreSQL comes as `DateTime64(6)` in the time zone of the PostgreSQL session, and a condition on it is compared in the time zone of ClickHouse: keep the two the same.
 - A `ReplacingMergeTree` source is read with `FINAL`, so only the current version of each row is merged.
 - A target created from a source takes the column types of the source. The key columns are made not nullable, since `ORDER BY` refuses nullable columns, and PostgreSQL tables come with every column nullable that is not `NOT NULL` there.
 - A table of a database engine has no sorting key, so `key` must be given when the target does not exist yet.

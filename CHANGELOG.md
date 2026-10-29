@@ -2,6 +2,15 @@
 
 All notable changes to DBMerge. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/). Releases before 2.0.0 are described in [GitHub Releases](https://github.com/pavel-v-sobolev/dbmerge/releases).
 
+## [2.1.1] - 2026-10-29
+
+### Fixed
+
+- **A view of a PostgreSQL or MySQL database attached to ClickHouse** works as `source_table_name`. It was not found: `system.tables` lists only the tables of such a database.
+- **`source_condition` with an `IN` or `NOT IN` of one column over a subquery, on a source of such a database**, reads only the rows it picks. ClickHouse sends to the other server only the filters that compare columns with constants, so it read the whole source and filtered it itself. DBMerge now runs the subquery first and writes its rows into the condition. An `IN` of several columns and a subquery correlated with the source are still left to ClickHouse.
+- **A `datetime` in a condition on ClickHouse is compared as the moment it names.** clickhouse-connect bound it as text with whole seconds, in the time zone of the server, which moved the bound of a condition such as `merged_on > last_run` to the start of its second, and missed the moment in a column of a time zone of its own, such as `DateTime64(6, 'UTC')`, on a server outside UTC.
+- **A long `in_()` list in a condition on ClickHouse** no longer fails with `Max query size exceeded`: `max_query_size` is raised for the statement.
+
 ## [2.1.0] - 2026-10-28
 
 ### Added
@@ -71,6 +80,7 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 - **DuckDB:** a float column created by an earlier version is `DECIMAL(18,3)` and keeps rounding. Change it to `DOUBLE` and reload the data if the decimals matter.
 - **pymssql** keeps milliseconds only, a limitation of the driver, and has no bulk load. Prefer pyodbc or mssql-python on MS SQL Server.
 
+[2.1.1]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.1.0...2.1.1
 [2.1.0]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.0.1...2.1.0
 [2.0.1]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.0.0...2.0.1
 [2.0.0]: https://github.com/pavel-v-sobolev/dbmerge/compare/1.0.24...2.0.0
