@@ -141,3 +141,5 @@ Read [Data Loss Risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCU
 
 - [Full Module Documentation](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md)
 - [Advanced Examples (Python)](https://github.com/pavel-v-sobolev/dbmerge/blob/main/user_guide.py)
+- [ClickHouse: overview and PostgreSQL integration](CLICKHOUSE.md)
+- [Описание ClickHouse на русском](CLICKHOUSE_RU.md)
