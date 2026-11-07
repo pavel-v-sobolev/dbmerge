@@ -24,6 +24,7 @@ from dbmerge.duckdb import read_table as read_duckdb_table
 # Through the module: the constants live only there (the exceptions are in the package root as well).
 from dbmerge.dbmerge import (IncorrectParameter, IncorrectDataError, NoKeyError,
                             MAX_TEMP_TABLE_NAME_LEN, TEMP_TABLE_TIMESTAMP_FORMAT)
+from dbmerge import cockroach as cockroach_retry
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
 
@@ -88,6 +89,67 @@ def _to_polars(frame):
         return pl.from_pandas(frame)
     return pl.DataFrame({c: [None if isinstance(v, float) and v != v else v for v in frame[c].tolist()]
                          for c in frame.columns})
+
+
+def test_cockroach_retry_recognizes_only_serialization_failures():
+    class PgError(Exception):
+        sqlstate = '40001'
+
+    class OtherPgError(Exception):
+        sqlstate = '23505'
+
+    assert cockroach_retry._is_retryable(DBAPIError.instance('statement', {}, PgError(), Exception))
+    assert not cockroach_retry._is_retryable(DBAPIError.instance('statement', {}, OtherPgError(), Exception))
+
+
+def test_cockroach_retry_retries_whole_merge_and_resets_statistics(monkeypatch):
+    class PgError(Exception):
+        sqlstate = '40001'
+
+    class FakeConnection:
+        closed = False
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class FakeEngine:
+        def connect(self):
+            return FakeConnection()
+
+    class FakeMerge:
+        engine = FakeEngine()
+        conn = FakeConnection()
+        temp_table = type('TempTable', (), {'name': 'staging', 'schema': None})()
+        total_row_count = inserted_row_count = updated_row_count = deleted_row_count = 9
+        total_time = temp_insert_time = insert_time = update_time = delete_time = 9
+
+        def _close_connection(self):
+            pass
+
+        def _drop_temp_table(self):
+            self.temp_table = None
+
+        def _create_temp_table(self):
+            self.created = True
+
+    merge = FakeMerge()
+    monkeypatch.setattr(cockroach_retry, 'MAX_RETRIES', 1)
+    monkeypatch.setattr(cockroach_retry.time, 'sleep', lambda _: None)
+    calls = []
+
+    def run_steps():
+        calls.append(True)
+        if len(calls) == 1:
+            raise DBAPIError.instance('statement', {}, PgError(), Exception)
+        return 'complete'
+
+    assert cockroach_retry.execute_merge(merge, run_steps) == 'complete'
+    assert len(calls) == 2
+    assert merge.created
+    assert merge.total_row_count == merge.inserted_row_count == 0
 
 
 def make_engine(engine_name):

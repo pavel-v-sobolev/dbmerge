@@ -93,7 +93,7 @@ The bulk load repeats what its driver does, so switching `bulk_load` changes not
 
 ### CockroachDB
 
-CockroachDB runs `SERIALIZABLE` transactions by default. A merge step over many rows stays open long enough for an unrelated commit to break it, and `COMMIT` fails with a transient `RETRY_SERIALIZABLE` error that the client is expected to retry. DBMerge does not retry. The tests run with `create_engine(url, isolation_level='READ COMMITTED')`, where CockroachDB retries such statements itself.
+CockroachDB runs `SERIALIZABLE` transactions by default. A merge step over many rows can fail with a transaction serialization error (`SQLSTATE 40001`). DBMerge retries the complete merge up to five times with a fresh connection and staging table. With `commit_all_steps=True`, stages committed before the retry remain committed; retry does not make the merge atomic. The tests also exercise `READ COMMITTED`, where CockroachDB retries statements internally.
 
 **COPY does not apply the limits of a column type.** The COPY of CockroachDB, which loads the staging table with `bulk_load=True`, stores a value that does not fit its column without an error: a string longer than `VARCHAR(n)` or `CHAR(n)` is cut to `n` characters, a number beyond the precision of `DECIMAL(p,s)` is stored as it is, and extra decimal places are not rounded. The row by row `INSERT` refuses or rounds such values, as PostgreSQL does with COPY too. Checked on CockroachDB 24.3 and 26.3. If your data may not fit the column types, pass `exec(bulk_load=False)` on CockroachDB.
 

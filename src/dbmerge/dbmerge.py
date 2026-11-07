@@ -191,7 +191,7 @@ ALEMBIC_DEFAULT_IMPL_DIALECTS = ('duckdb',)
 # almost all of them, duckdb.py only reads the table. A clickhouse-connect client passed instead of an
 # engine counts as the clickhousedb dialect.
 CLICKHOUSE_DIALECT = 'clickhousedb'
-DIALECT_MODULES = {CLICKHOUSE_DIALECT: 'clickhouse', 'duckdb': 'duckdb'}
+DIALECT_MODULES = {CLICKHOUSE_DIALECT: 'clickhouse', 'duckdb': 'duckdb', 'cockroachdb': 'cockroach'}
 
 @dataclass
 class mergeResult:
@@ -730,76 +730,72 @@ class dbmerge:
         self.chunk_size = chunk_size
         
         try:
-            
-            if self.source_table_name is None:
-                self._insert_data_to_temp()
-            else:
-                self._insert_source_table_to_temp()
-            data_msg = f'Temp data: {self.total_row_count} rows ({format_ms(self.temp_insert_time)})'
-            if commit_all_steps:
-                self.conn.commit()
-
-
-            self._update_not_matching_data()
-            updated_msg = f'Updated: {self.updated_row_count} rows ({format_ms(self.update_time)})'
-            if commit_all_steps:
-                self.conn.commit()
-
-            self._insert_missing_data()
-            inserted_msg = f'Inserted: {self.inserted_row_count} rows ({format_ms(self.insert_time)})'
-            if commit_all_steps:
-                self.conn.commit()
-
-            if self.delete_mode=='delete':
-                self._delete_rows_missing_in_source()
-                delete_msg = f'Deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
-
-            elif self.delete_mode=='mark':
-                self._mark_rows_missing_in_source()
-                delete_msg = f'Marked deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
-
-            else:                  #self.delete_mode=='no':
-                delete_msg = 'Deleted: no'
-                self.delete_time=0
-
-
-            self.conn.commit()           
-
-            self.total_time = self.temp_insert_time+self.insert_time+\
-                              self.update_time+self.delete_time
-            
-            logger.info(f'Merged data into table "{self.table_full_name}". '+\
-                        ', '.join([data_msg,inserted_msg,updated_msg,delete_msg])+', '+\
-                        f'Total time: {format_ms(self.total_time)}')
-            
-            return mergeResult(total_row_count = self.total_row_count,
-                               inserted_row_count = self.inserted_row_count,
-                               updated_row_count = self.updated_row_count,
-                               deleted_row_count = self.deleted_row_count,
-                               total_time = self.total_time, 
-                               temp_insert_time = self.temp_insert_time,
-                               insert_time = self.insert_time,
-                               update_time = self.update_time,
-                               delete_time = self.delete_time,
-                               table_created = self.table_created,
-                               # copied, so that the result stays a snapshot: the same mapping is
-                               # also readable on the instance, and the two should not share it
-                               added_fields = dict(self.added_fields))
-    
-        
+            return self._execute_steps(commit_all_steps)
         except Exception:
-            # A rollback that fails too (the connection broke, say) must not hide the error of the merge.
             try:
                 if hasattr(self, 'conn'):
                     self.conn.rollback()
             except Exception as e:
                 logger.warning(f'Rollback after a failed merge failed as well: {e}')
             raise
-
         finally:
-            self._close()
-            self.merge_finished = True
+            try:
+                self._close()
+            finally:
+                self.merge_finished = True
 
+
+    def _execute_steps(self, commit_all_steps: bool) -> mergeResult:
+        if hook := self._dialect_hook('execute_merge'):
+            return hook(self, lambda: self._exec_steps(commit_all_steps))
+        return self._exec_steps(commit_all_steps)
+
+
+    def _exec_steps(self, commit_all_steps: bool) -> mergeResult:
+        """Run merge steps without validation or connection cleanup (for dialect retry hooks)."""
+        if self.source_table_name is None:
+            self._insert_data_to_temp()
+        else:
+            self._insert_source_table_to_temp()
+        data_msg = f'Temp data: {self.total_row_count} rows ({format_ms(self.temp_insert_time)})'
+        if commit_all_steps:
+            self.conn.commit()
+
+        self._update_not_matching_data()
+        updated_msg = f'Updated: {self.updated_row_count} rows ({format_ms(self.update_time)})'
+        if commit_all_steps:
+            self.conn.commit()
+
+        self._insert_missing_data()
+        inserted_msg = f'Inserted: {self.inserted_row_count} rows ({format_ms(self.insert_time)})'
+        if commit_all_steps:
+            self.conn.commit()
+
+        if self.delete_mode == 'delete':
+            self._delete_rows_missing_in_source()
+            delete_msg = f'Deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
+        elif self.delete_mode == 'mark':
+            self._mark_rows_missing_in_source()
+            delete_msg = f'Marked deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
+        else:
+            delete_msg = 'Deleted: no'
+            self.delete_time = 0
+
+        self.conn.commit()
+        self.total_time = self.temp_insert_time + self.insert_time + self.update_time + self.delete_time
+        logger.info(f'Merged data into table "{self.table_full_name}". ' + ', '.join(
+            [data_msg, inserted_msg, updated_msg, delete_msg]) + f', Total time: {format_ms(self.total_time)}')
+        return mergeResult(total_row_count=self.total_row_count,
+                           inserted_row_count=self.inserted_row_count,
+                           updated_row_count=self.updated_row_count,
+                           deleted_row_count=self.deleted_row_count,
+                           total_time=self.total_time,
+                           temp_insert_time=self.temp_insert_time,
+                           insert_time=self.insert_time,
+                           update_time=self.update_time,
+                           delete_time=self.delete_time,
+                           table_created=self.table_created,
+                           added_fields=dict(self.added_fields))
 
 
     def __enter__(self):

@@ -2,6 +2,16 @@
 
 All notable changes to DBMerge. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/). Releases before 2.0.0 are described in [GitHub Releases](https://github.com/pavel-v-sobolev/dbmerge/releases).
 
+## [2.1.2] - 2026-11-06
+
+### Fixed
+
+- **CockroachDB:** retry the complete merge up to five times after a transaction serialization failure (`SQLSTATE 40001`). Each retry uses a fresh connection and staging table, with a short exponential backoff. Other database errors are raised without retrying.
+
+### Notes
+
+- With `commit_all_steps=True`, stages committed before a retry remain committed; retrying the merge does not make those stages atomic. Schema changes are also outside the merge transaction, as before.
+
 ## [2.1.1] - 2026-10-29
 
 ### Fixed
@@ -80,6 +90,7 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 - **DuckDB:** a float column created by an earlier version is `DECIMAL(18,3)` and keeps rounding. Change it to `DOUBLE` and reload the data if the decimals matter.
 - **pymssql** keeps milliseconds only, a limitation of the driver, and has no bulk load. Prefer pyodbc or mssql-python on MS SQL Server.
 
+[2.1.2]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.1.1...2.1.2
 [2.1.1]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.1.0...2.1.1
 [2.1.0]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.0.1...2.1.0
 [2.0.1]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.0.0...2.0.1
