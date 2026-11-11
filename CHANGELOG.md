@@ -2,6 +2,19 @@
 
 All notable changes to DBMerge. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/). Releases before 2.0.0 are described in [GitHub Releases](https://github.com/pavel-v-sobolev/dbmerge/releases).
 
+## [2.2.0] - 2026-11-11
+
+### Added
+
+- **Oracle**, through python-oracledb (`pip install dbmerge[oracle]`), tested on Oracle XE 21c in Thin mode. Updates run as correlated scalar `SELECT`s guarded by `EXISTS` (Oracle's SQLAlchemy dialect has no `UPDATE … FROM`); the staging table is a `GLOBAL TEMPORARY` table with `ON COMMIT PRESERVE ROWS`; CLOB/NCLOB/BLOB values are compared with `DBMS_LOB.COMPARE`. Inferred strings become `CLOB` (a string key needs an explicit `String(length)`), inferred datetimes become `TIMESTAMP` to keep microseconds, and inferred floats become `BINARY_DOUBLE`. Native JSON and `LONG` columns are not supported, and schemas are existing Oracle users — dbmerge never creates them. See [Oracle support](ORACLE.md).
+- **Oracle bulk load:** `bulk_load=True` loads the staging table with python-oracledb's array DML (`cursor.executemany`), with `setinputsizes` taken from the same column types SQLAlchemy uses, so a `TIMESTAMP` keeps its microseconds. Each chunk runs in a savepoint and falls back to the row by row `INSERT` when the array DML refuses it, reporting the same error.
+- **Oracle CI:** a `test_oracle.yml` workflow runs the shared matrix and the Oracle-specific tests against Oracle XE 21c.
+- **Per-database test hooks** in `tests/db_hooks`: a database can prepare its engine once per URL, skip scenarios it does not support, and adapt parity input and computed-column options. Oracle uses them for its schema owners, native-JSON skips and virtual computed columns.
+
+### Notes
+
+- Oracle is tested on SQLAlchemy 2.0 and not yet on 2.1, where the dialect gains a native `JSON` type; on 2.0 native JSON columns can not be merged.
+
 ## [2.1.2] - 2026-11-06
 
 ### Fixed
@@ -90,6 +103,7 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 - **DuckDB:** a float column created by an earlier version is `DECIMAL(18,3)` and keeps rounding. Change it to `DOUBLE` and reload the data if the decimals matter.
 - **pymssql** keeps milliseconds only, a limitation of the driver, and has no bulk load. Prefer pyodbc or mssql-python on MS SQL Server.
 
+[2.2.0]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.1.2...2.2.0
 [2.1.2]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.1.1...2.1.2
 [2.1.1]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.1.0...2.1.1
 [2.1.0]: https://github.com/pavel-v-sobolev/dbmerge/compare/2.0.1...2.1.0

@@ -4,7 +4,7 @@
 
 Install: `pip install dbmerge`. Requires SQLAlchemy 2.x. Accepts `list[dict]`, `dict[str, list]`, `pandas.DataFrame`, `polars.DataFrame`, or an existing database table/view.
 
-Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB, ClickHouse ([COMPATIBILITY.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md) lists the drivers and versions). **Not supported:** Oracle.
+Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB, ClickHouse, Oracle ([COMPATIBILITY.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md) lists the drivers and versions). Oracle support has limitations — see [ORACLE.md](https://github.com/pavel-v-sobolev/dbmerge/blob/main/ORACLE.md).
 
 ## Rules for AI coding assistants
 
@@ -41,7 +41,7 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB
 
 `table_created` / `added_fields` report the schema changes the merge made to the target table. `added_fields` is a `{column name: SQLAlchemy type}` mapping — the type each column was really created with, after any adjustment for the target engine. It covers only columns added to an already existing table, never the auto-managed timestamp/delete-flag columns, and stays empty with `can_create_columns=False`. Use them downstream: a dataset built incrementally from a `merged_on_field` watermark can not detect a new column by itself — adding a column moves no watermark — so `added_fields` is the signal to rebuild it in full.
 
-`chunk_size` defaults to 10000 rows (100000 for the bulk copy of mssql-python, 1000000 on ClickHouse). `bulk_load=True` loads the staging table in bulk where the driver allows it (`COPY` on PostgreSQL/CockroachDB, bulk copy with mssql-python, `fast_executemany` with pyodbc, Arrow on DuckDB and ClickHouse); it stores the same values as the row by row `INSERT`, and `False` turns it off.
+`chunk_size` defaults to 10000 rows (100000 for the bulk copy of mssql-python, 1000000 on ClickHouse). `bulk_load=True` loads the staging table in bulk where the driver allows it (`COPY` on PostgreSQL/CockroachDB, bulk copy with mssql-python, `fast_executemany` with pyodbc, Arrow on DuckDB and ClickHouse, array DML with python-oracledb on Oracle); it stores the same values as the row by row `INSERT`, and `False` turns it off.
 
 Phases run in this order: staging load → `UPDATE` → `INSERT` → `DELETE`/mark.
 

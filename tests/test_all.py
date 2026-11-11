@@ -15,6 +15,7 @@ import logging
 from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_, cast, type_coerce, case
 from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, Double, JSON, Uuid, StaticPool, Computed
 from sqlalchemy import types
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import NoSuchModuleError, DBAPIError
 
 from sample_data_in_sqlite import get_data, get_modified_data
@@ -25,6 +26,7 @@ from dbmerge.duckdb import read_table as read_duckdb_table
 from dbmerge.dbmerge import (IncorrectParameter, IncorrectDataError, NoKeyError,
                             MAX_TEMP_TABLE_NAME_LEN, TEMP_TABLE_TIMESTAMP_FORMAT)
 from dbmerge import cockroach as cockroach_retry
+from db_hooks import dialect_hook
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s - %(message)s")
 
@@ -59,7 +61,7 @@ engines = {'sqlite':"""sqlite:///data/data.sqlite""",
            # a file, not :memory: - every connection to :memory: is a database of its own, so the
            # checks below would not see what the merge wrote
            'duckdb':'duckdb:///data/data.ddb',
-           #'oracle':"oracle+oracledb://system:oracle@localhost/?service_name=XEPDB1"
+           'oracle':"oracle+oracledb://system:oracle@localhost:1521/?service_name=XEPDB1",
          }
 
 # Any URL above can be replaced from the environment, e.g. DBMERGE_TEST_URL_CLICKHOUSE for another server
@@ -169,12 +171,33 @@ def make_engine(engine_name):
     except (NoSuchModuleError, ImportError) as e:
         pytest.skip(f'{engine_name} is not available here: {e}')
     _made_engines.append(engine)
+    if hook := dialect_hook(engine.dialect.name, 'prepare_engine'):
+        # Prepare each database URL once, not on every short-lived test engine.
+        url = engine.url.render_as_string(hide_password=False)
+        if url not in _prepared_databases:
+            hook(engine)
+            _prepared_databases.add(url)
     return engine
 
 
 # The engines make_engine made, disposed after every test: a pooled connection stays open until its engine
 # is disposed or collected, and a whole run once used up the 151 connections of MariaDB.
 _made_engines = []
+_prepared_databases = set()
+
+
+@pytest.fixture(autouse=True)
+def _prepare_database_test(request):
+    engine_name = getattr(request.node, 'callspec', None)
+    if engine_name is None:
+        return
+    engine_name = engine_name.params.get('engine_name')
+    if engine_name is None:
+        return
+    # Resolve through the URL, so overrides and driver aliases keep working.
+    dialect_name = make_url(engines[engine_name]).get_backend_name()
+    if hook := dialect_hook(dialect_name, 'prepare_test'):
+        hook(request)
 
 
 @pytest.fixture(autouse=True)
@@ -1365,7 +1388,7 @@ def test_reported_schema_changes(engine_name):
     assert 'Extra' not in tbl.c, 'the column was really not created'
 
 
-def _parity_data(type_of_data, postgres_family=False):
+def _parity_data(type_of_data, postgres_family=False, dialect_name=None):
     # Values that a loader can get wrong: an empty string next to NULL, quotes, separators and line breaks,
     # a large integer, microseconds, time zones, dates far from today, JSON, UUID, and NULL everywhere.
     # The UUIDs are proper version 4 ones: the native UUID type of MariaDB, which SQLAlchemy 2.1 creates for
@@ -1390,6 +1413,8 @@ def _parity_data(type_of_data, postgres_family=False):
                                      datetime(2025, 6, 1, 12, 0, tzinfo=msk))):
             row['StampTzToNaive'] = value
         data_types['StampTzToNaive'] = DateTime(timezone=False)
+    if hook := dialect_hook(dialect_name, 'prepare_parity_data'):
+        hook(data, data_types)
     if type_of_data == 'dict of list':
         data = {k: [d[k] for d in data] for k in data[0].keys()}
     elif type_of_data == 'pandas':
@@ -1439,7 +1464,8 @@ def test_bulk_load_stores_what_row_by_row_stores(engine_name, type_of_data):
     logger.debug(f'TEST BULK LOAD STORES WHAT ROW BY ROW STORES {engine_name} {type_of_data}')
     engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
-    data, data_types = _parity_data(type_of_data, engine.dialect.name in ('postgresql', 'cockroachdb'))
+    data, data_types = _parity_data(type_of_data, engine.dialect.name in ('postgresql', 'cockroachdb'),
+                                  engine.dialect.name)
     for table_name, bulk_load in (('Facts', False), ('Facts_bulk', True)):
         with dbmerge(engine=engine, data=data, table_name=table_name, schema='target', temp_schema='tmp',
                      key=key, data_types=data_types) as merge:
@@ -1505,8 +1531,11 @@ def test_computed_target_column_is_not_written(engine_name):
     engine = make_engine(engine_name)
     schema = None if engine.dialect.name == 'sqlite' else 'target'
     metadata = MetaData()
+    computed_options = {'persisted': True}
+    if hook := dialect_hook(engine.dialect.name, 'computed_column_options'):
+        computed_options = hook()
     source, target = [Table(name, metadata, Column('id', Integer, primary_key=True, autoincrement=False),
-                            Column('a', Integer), Column('doubled', Integer, Computed('a * 2', persisted=True)),
+                            Column('a', Integer), Column('doubled', Integer, Computed('a * 2', **computed_options)),
                             schema=schema)
                       for name in ('Generated_source', 'Generated')]
     # One table per transaction: CockroachDB refuses two schema changes in one under READ COMMITTED.

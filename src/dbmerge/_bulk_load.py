@@ -53,6 +53,9 @@ def loader_for(merge: dbmerge):
     elif merge.dialect_name == 'mssql' and merge.conn.dialect.driver == 'pyodbc':
         return _pyodbc_fast_executemany
 
+    elif merge.dialect_name == 'oracle':
+        return _oracle_executemany
+
     return None
 
 
@@ -358,6 +361,83 @@ def _pyodbc_fast_executemany(merge: dbmerge):
             except Exception as e:
                 savepoint.rollback()
                 logger.debug(f'Rows {begin}..{end} could not be sent with fast_executemany ({e}), inserting them row by row')
+                merge._insert_rows_to_temp(begin, end)
+            else:
+                savepoint.commit()
+    finally:
+        cursor.close()
+
+    merge.temp_insert_time = time.perf_counter() - start_time
+
+
+def _oracle_executemany(merge: dbmerge):
+    # python-oracledb's array DML: a whole chunk goes in one round trip, not one per row. SQLAlchemy's own
+    # executemany for Oracle calls the same cursor.executemany, but wraps it in compile, setinputsizes and
+    # parameter-processing work on every call, which roughly doubles the load time. Driving the cursor
+    # directly is therefore the bulk loader. Each chunk runs in a savepoint, like the pyodbc
+    # fast_executemany: a chunk the array DML refuses goes the row by row way, without the rows the array
+    # DML may already have stored before the failing one (which would then fail the retry on the primary key
+    # of the staging table instead of reporting the original error).
+    from ._chunks import python_columns
+
+    start_time = time.perf_counter()
+    dialect = merge.conn.dialect
+    dbapi = dialect.loaded_dbapi
+    preparer = dialect.identifier_preparer
+    fields = list(merge.data_fields)
+    placeholders = ', '.join(':' + str(i + 1) for i in range(len(fields)))
+    sql = (f'INSERT INTO {preparer.format_table(merge.temp_table)} '
+           f'({", ".join(preparer.quote(f) for f in fields)}) VALUES ({placeholders})')
+
+    # Send exactly what the row by row INSERT sends: every column through its own bind processor (a NUMBER
+    # column turns a Decimal into a float, a Boolean into an int, and so on). JSON columns keep the more
+    # careful processor of _json_processors where there is one.
+    processors = _json_processors(merge)
+    for f in fields:
+        if f in processors:
+            continue
+        processor = merge.temp_table.c[f].type.bind_processor(dialect)
+        if processor is not None:
+            processors[f] = processor
+
+    # setinputsizes tells the driver the column type of each placeholder, as SQLAlchemy does before it
+    # executes. Without it a Python datetime is bound as DATE (whole seconds): with a TIMESTAMP column the
+    # microseconds would be lost. The driver type comes from the same get_dbapi_type that SQLAlchemy uses.
+    inputsizes = []
+    for f in fields:
+        type_impl = merge.temp_table.c[f].type.dialect_impl(dialect)
+        get_dbapi_type = getattr(type_impl, 'get_dbapi_type', None)
+        inputsizes.append(get_dbapi_type(dbapi) if get_dbapi_type is not None else None)
+
+    if not merge.conn.in_transaction():
+        merge.conn.begin()
+    cursor = merge.conn.connection.dbapi_connection.cursor()
+    try:
+        cursor.setinputsizes(*inputsizes)
+    except Exception as e:
+        # A column type the driver can not be told about: the generic INSERT, which binds every value the
+        # SQLAlchemy way, loads the table instead.
+        cursor.close()
+        logger.debug(f'Array DML can not set its input sizes ({e}), inserting the staging table row by row')
+        for begin in range(0, merge.total_row_count, merge.chunk_size):
+            merge._insert_rows_to_temp(begin, min(begin + merge.chunk_size, merge.total_row_count))
+        merge.temp_insert_time = time.perf_counter() - start_time
+        return
+
+    try:
+        for begin in range(0, merge.total_row_count, merge.chunk_size):
+            end = min(begin + merge.chunk_size, merge.total_row_count)
+            savepoint = merge.conn.begin_nested()
+            try:
+                columns = python_columns(merge, begin, end, processors=processors)
+                cursor.executemany(sql, list(zip(*columns.values())))
+            except Exception as e:
+                # A column with values of different Python types is refused by python-oracledb Thin mode
+                # before anything is sent (DPY-3013); other chunks may fail on a value the column type
+                # rejects. Either way, the row by row INSERT reports the same error, or succeeds where only
+                # the array DML has a limitation.
+                savepoint.rollback()
+                logger.debug(f'Rows {begin}..{end} could not be sent with array DML ({e}), inserting them row by row')
                 merge._insert_rows_to_temp(begin, end)
             else:
                 savepoint.commit()

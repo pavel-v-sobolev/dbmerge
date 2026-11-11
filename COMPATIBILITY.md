@@ -6,34 +6,38 @@ The databases and drivers DBMerge is tested with, how each of them loads the sta
 
 ## Databases and Drivers
 
-| Database | Driver | Engine URL | SQLAlchemy 2.0 | SQLAlchemy 2.1 | Bulk staging load |
-|---|---|---|---|---|---|
-| PostgreSQL | psycopg2 | `postgresql+psycopg2://` | ✅ | ✅ | `COPY FROM STDIN` |
-| PostgreSQL | psycopg 3 | `postgresql+psycopg://` | ✅ | ✅ | `COPY FROM STDIN` |
-| PostgreSQL | pg8000 | `postgresql+pg8000://` | ✅ | ✅ | `COPY FROM STDIN` |
-| CockroachDB | psycopg2 + sqlalchemy-cockroachdb | `cockroachdb://` | ✅ | ✅ ³ | `COPY FROM STDIN` |
-| CockroachDB | psycopg 3 + sqlalchemy-cockroachdb | `cockroachdb+psycopg://` | ✅ | ✅ ³ | `COPY FROM STDIN` |
-| MariaDB | MariaDB Connector/Python | `mariadb+mariadbconnector://` | ✅ | ✅ | — |
-| MySQL | PyMySQL | `mysql+pymysql://` | ✅ | ✅ | — |
-| MySQL | mysql-connector-python | `mysql+mysqlconnector://` | ✅ | ✅ | — |
-| MySQL | mysqlclient | `mysql+mysqldb://` | ✅ | ✅ | — |
-| MS SQL Server | pyodbc + ODBC Driver 18 | `mssql+pyodbc://` | ✅ | ✅ | `fast_executemany` |
-| MS SQL Server | mssql-python | `mssql+mssqlpython://` | — ¹ | ✅ | bulk copy |
-| MS SQL Server | pymssql | `mssql+pymssql://` | ⚠️ ² | ⚠️ ² | — |
-| SQLite | sqlite3 (standard library) | `sqlite://` | ✅ | ✅ | — |
-| DuckDB | duckdb_engine | `duckdb://` | ✅ | ✅ | Arrow |
-| ClickHouse | clickhouse-connect | `clickhousedb://`, or a client | ✅ | ✅ | Arrow |
+| Database | Driver | Engine URL | SQLAlchemy 2.0 | SQLAlchemy 2.1 | Bulk staging load | Measured: row by row → bulk |
+|---|---|---|---|---|---|---|
+| PostgreSQL | psycopg2 | `postgresql+psycopg2://` | ✅ | ✅ | `COPY FROM STDIN` | 1M rows: 24 s → 5.5 s |
+| PostgreSQL | psycopg 3 | `postgresql+psycopg://` | ✅ | ✅ | `COPY FROM STDIN` | 1M rows: 15.6 s → 5.3 s |
+| PostgreSQL | pg8000 | `postgresql+pg8000://` | ✅ | ✅ | `COPY FROM STDIN` | 1M rows: 192 s → 5.4 s |
+| CockroachDB | psycopg2 + sqlalchemy-cockroachdb | `cockroachdb://` | ✅ | ✅ ³ | `COPY FROM STDIN` | 1M rows: 24 s → 5.5 s |
+| CockroachDB | psycopg 3 + sqlalchemy-cockroachdb | `cockroachdb+psycopg://` | ✅ | ✅ ³ | `COPY FROM STDIN` | 1M rows: 15.6 s → 5.3 s |
+| MariaDB | MariaDB Connector/Python | `mariadb+mariadbconnector://` | ✅ | ✅ | — | — |
+| MySQL | PyMySQL | `mysql+pymysql://` | ✅ | ✅ | — | — |
+| MySQL | mysql-connector-python | `mysql+mysqlconnector://` | ✅ | ✅ | — | — |
+| MySQL | mysqlclient | `mysql+mysqldb://` | ✅ | ✅ | — | — |
+| MS SQL Server | pyodbc + ODBC Driver 18 | `mssql+pyodbc://` | ✅ | ✅ | `fast_executemany` | 100k rows: 61.7 s → 3.1 s |
+| MS SQL Server | mssql-python | `mssql+mssqlpython://` | — ¹ | ✅ | bulk copy | 200k rows: 121.6 s → 2.5 s |
+| MS SQL Server | pymssql | `mssql+pymssql://` | ⚠️ ² | ⚠️ ² | — | — |
+| SQLite | sqlite3 (standard library) | `sqlite://` | ✅ | ✅ | — | — |
+| DuckDB | duckdb_engine | `duckdb://` | ✅ | ✅ | Arrow | 200k rows: 3.6 s → 0.34 s |
+| ClickHouse | clickhouse-connect | `clickhousedb://`, or a client | ✅ | ✅ | Arrow | 1M rows: 20 s → 1.3 s |
+| Oracle XE 21c | python-oracledb (Thin) | `oracle+oracledb://` | ⚠️ ⁴ | Not tested ⁵ | executemany (array DML) | 200k rows: 0.76 s → 0.33 s |
 
-✅ passes every test  ·  ⚠️ works, with the limitation in the note  ·  — no such combination
+✅ passes every test  ·  ⚠️ works, with the limitation in the note  ·  — no such combination  ·  Not tested — not run in the test suite
 
 1. SQLAlchemy has the `mssql+mssqlpython` dialect only from 2.1 on.
 2. pymssql truncates microseconds to milliseconds, on every path: a `datetime` of `12:00:00.123456` is stored as `12:00:00.123`. Everything else works. It has no bulk load in DBMerge either — see [MS SQL Server](#ms-sql-server). For SQL Server, prefer pyodbc or mssql-python.
 3. sqlalchemy-cockroachdb 2.0.4 declares `SQLAlchemy<2.1`, so with SQLAlchemy 2.1 it has to be 2.0.3, the last release without that limit. The tests ran with 2.0.3 on SQLAlchemy 2.1 and with 2.0.4 on SQLAlchemy 2.0.
 
+4. Oracle runs in the shared `tests/test_all.py` matrix: 79 passed, 17 skipped on XE 21.3 / SQLAlchemy 2.0. Four skips are the native-JSON scenario (one per input format); the rest are tests specific to other databases. Loader parity uses explicit JSON text instead of native JSON. Additional Oracle-specific tests cover LOBs and transaction cleanup, and verify that `bulk_load=True` drives the array-DML loader. Native JSON and LONG are not supported. See [Oracle support](ORACLE.md) for setup and limitations.
+
+5. Oracle has not been run against SQLAlchemy 2.1 yet — the suite runs on 2.0. From 2.1 the Oracle dialect grows a native `JSON` type, so the four native-JSON scenarios (see ⁴) would then run instead of being skipped.
+
 **Not supported:**
 
 - **ClickHouse through clickhouse-sqlalchemy** (`clickhouse://`, `clickhouse+native://`). Its driver opens a new session for every statement, so a temporary staging table does not survive between them. DBMerge refuses such an engine with `IncorrectParameter`; use clickhouse-connect.
-- **Oracle**: `UPDATE` with a `JOIN` is not available in its SQLAlchemy dialect.
 
 **Versions in the tests:** PostgreSQL 18, CockroachDB 24.3, MariaDB 10.11, MySQL 8.4, SQL Server 2022, SQLite 3.50, DuckDB 1.5 and 2.0, ClickHouse 23.8, 24.8 and 26.10; Python 3.14 and 3.15 with pandas 3, polars and pyarrow, and Python 3.10 and 3.12 without pyarrow (SQLite, DuckDB, PostgreSQL). The oldest ClickHouse DBMerge accepts is 23.8. SQLAlchemy 2.1 needs Python 3.11 or newer.
 
@@ -43,13 +47,7 @@ The databases and drivers DBMerge is tested with, how each of them loads the sta
 
 Every merge first loads the data into a staging table (see [The Staging Table](DOCUMENTATION.md#the-staging-table)). By default this is SQLAlchemy's `INSERT` with many parameter sets, which most drivers send row by row. Where the database and its driver offer a faster way, `exec()` uses it, and stores exactly the same values as the row by row `INSERT` would — with one exception, values that do not fit their column on CockroachDB (see [CockroachDB](#cockroachdb)). `exec(bulk_load=False)` turns it off.
 
-| Database and driver | How the staging table is loaded | Measured: row by row → bulk |
-|---|---|---|
-| PostgreSQL, CockroachDB — psycopg2, psycopg 3, pg8000 | `COPY … FROM STDIN` in CSV, through the merge's own connection | 1M rows: psycopg2 24 s → 5.5 s; psycopg 3 15.6 s → 5.3 s; pg8000 192 s → 5.4 s |
-| MS SQL Server — mssql-python | TDS bulk copy (`cursor.bulkcopy`, from Arrow when pyarrow is installed) | 200k rows: 121.6 s → 2.5 s |
-| MS SQL Server — pyodbc | `fast_executemany`: a chunk is sent as one array of parameters | 100k rows: 61.7 s → 3.1 s |
-| DuckDB | an Arrow table, read by DuckDB in place with one `INSERT … SELECT` per chunk | the test suite: 10 min → 3.7 min |
-| ClickHouse | `insert_arrow` of clickhouse-connect | 1M rows: 20 s through SQLAlchemy → 1.3 s |
+The **last column of the table above** measures the staging load on the versions listed at the bottom of this document, as `bulk_load=False` → `bulk_load=True` in seconds. Row counts differ because each number comes from the dataset its test suite loads. PostgreSQL and CockroachDB share the same `COPY` drivers, so the same numbers apply; DuckDB is measured on a 200k-row table (and with pyarrow its whole test suite drops from about 10 minutes to 3.7). On Oracle both paths are array DML (`cursor.executemany`): the numbers show only the SQLAlchemy overhead that `bulk_load=True` skips, not a switch from row by row to a direct-path load.
 
 **pyarrow** is optional everywhere, including ClickHouse. Without it:
 
@@ -67,6 +65,7 @@ Some data goes row by row even with `bulk_load=True`, so that what is stored doe
 - mssql-python: a chunk with a `datetimeoffset` value whose offset is not UTC — see [MS SQL Server](#ms-sql-server) — and a chunk the bulk copy fails on. Bulk copy runs on a second connection that mssql-python opens from the connection string; if that connection fails, the data goes row by row.
 - pyodbc: a chunk `fast_executemany` fails on. It is rolled back to a savepoint first, so the row by row `INSERT` reports the real error rather than the primary key of the staging table.
 - DuckDB: a chunk Arrow can not put in a table (a column of mixed types).
+- Oracle: a chunk the array DML refuses — a column with values of different Python types, which python-oracledb Thin mode checks before it sends anything (DPY-3013), or any other value the column rejects. The chunk is rolled back to a savepoint and inserted row by row, which reports the same error the row by row path reports.
 
 **Chunk size.** `chunk_size` is the number of rows per insert. It defaults to 10,000; to 100,000 for the bulk copy of mssql-python, where every chunk opens a connection of its own (a million rows load in 5.4s in chunks of 10,000, in 1.5s in chunks of 100,000); and to 1,000,000 on ClickHouse, where every insert creates a new part of the table.
 

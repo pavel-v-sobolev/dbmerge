@@ -1,0 +1,94 @@
+name: Oracle
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test_oracle:
+    name: Oracle, SQLAlchemy 2.0
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Oracle XE image is ~15 GB on disk, more than the ~14 GB a standard runner
+      # leaves for the workflow. Drop the preinstalled toolchains the job does not need.
+      - name: Free disk space for Oracle XE
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune -af || true
+          df -h /
+
+      # Started with docker run (not a service container) so readiness can be polled and
+      # the logs shown on failure, as in test_cockroach.yml. The database initializes in the
+      # background while the dependencies install below.
+      - name: Start Oracle XE
+        run: |
+          docker run -d --name oracle --shm-size=1g \
+            -p 1521:1521 \
+            -e ORACLE_PWD=oracle \
+            container-registry.oracle.com/database/express:21.3.0-xe
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+          uv pip install oracledb
+
+      - name: Create data directory
+        run: mkdir -p data
+
+      - name: Initialize sample data
+        run: |
+          uv run --no-sync python tests/sample_data_in_sqlite.py
+
+      - name: Wait for Oracle
+        run: |
+          for i in $(seq 1 120); do
+            status=$(docker inspect --format='{{.State.Health.Status}}' oracle 2>/dev/null || echo starting)
+            if [ "$status" = "healthy" ]; then
+              echo "Oracle is healthy"; exit 0
+            fi
+            echo "waiting for Oracle... ($i): $status"; sleep 5
+          done
+          echo "Oracle did not become healthy"; docker logs oracle; exit 1
+
+      # The shared matrix uses SYSTEM and creates the TARGET/SOURCE/TMP schema owners itself.
+      - name: Run shared test matrix
+        env:
+          DBMERGE_TEST_ENGINES: oracle
+        run: |
+          uv run --no-sync pytest tests/test_all.py -v --tb=short
+
+      # The additional Oracle-specific tests run under a minimally privileged user.
+      - name: Create Oracle test user
+        run: |
+          uv run --no-sync python - <<'PY'
+          import oracledb
+          with oracledb.connect(user='system', password='oracle', dsn='localhost:1521/XEPDB1') as c:
+              cur = c.cursor()
+              try:
+                  cur.execute("CREATE USER dbmerge_test IDENTIFIED BY oracle")
+              except oracledb.DatabaseError as e:
+                  if 'ORA-01920' not in str(e):
+                      raise
+              cur.execute("GRANT CREATE SESSION, CREATE TABLE TO dbmerge_test")
+              cur.execute("ALTER USER dbmerge_test QUOTA 100M ON USERS")
+              c.commit()
+          PY
+
+      - name: Run Oracle-specific tests
+        env:
+          DBMERGE_TEST_URL_ORACLE: 'oracle+oracledb://dbmerge_test:oracle@localhost:1521/?service_name=XEPDB1'
+        run: |
+          uv run --no-sync pytest tests/test_oracle.py -v --tb=short

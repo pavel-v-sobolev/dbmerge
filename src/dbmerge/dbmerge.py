@@ -180,7 +180,7 @@ ROUNDING_NUMERIC_DIALECTS = ('mysql', 'mariadb', 'mssql', 'duckdb')
 MYSQL_MAX_KEY_BYTES = 3072
 
 # Drivers that report no row count for an INSERT ... SELECT built by SQLAlchemy (see _execute_dml).
-INSERT_COUNT_AS_TEXT_DRIVERS = ('psycopg', 'mysqlconnector')
+INSERT_COUNT_AS_TEXT_DRIVERS = ('psycopg', 'mysqlconnector', 'oracledb', 'cx_oracle')
 
 # Dialects alembic has no implementation for, which add columns with its default one (see _register_alembic_impl).
 ALEMBIC_DEFAULT_IMPL_DIALECTS = ('duckdb',)
@@ -191,7 +191,8 @@ ALEMBIC_DEFAULT_IMPL_DIALECTS = ('duckdb',)
 # almost all of them, duckdb.py only reads the table. A clickhouse-connect client passed instead of an
 # engine counts as the clickhousedb dialect.
 CLICKHOUSE_DIALECT = 'clickhousedb'
-DIALECT_MODULES = {CLICKHOUSE_DIALECT: 'clickhouse', 'duckdb': 'duckdb', 'cockroachdb': 'cockroach'}
+DIALECT_MODULES = {CLICKHOUSE_DIALECT: 'clickhouse', 'duckdb': 'duckdb', 'cockroachdb': 'cockroach',
+                   'oracle': 'oracle'}
 
 @dataclass
 class mergeResult:
@@ -1573,6 +1574,7 @@ class dbmerge:
             # - psycopg (3) reports -1 for INSERT ... SELECT.
             # - mysql-connector in its pure Python mode reports -1 for INSERT ... SELECT. It falls back to that
             #   mode by itself once pyarrow is loaded into the process, which pandas 3 does.
+            # - Oracle's SQLAlchemy execution context loses INSERT ... SELECT's rowcount as well.
             # render_postcompile: a value list of in_() is expanded into its parameters only when SQLAlchemy
             # executes a statement itself, and would reach the driver as a __[POSTCOMPILE_...] placeholder.
             compiled = statement.compile(dialect=self.conn.dialect, compile_kwargs={'render_postcompile': True})
