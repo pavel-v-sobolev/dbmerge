@@ -13,7 +13,7 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 
 ### Notes
 
-- Oracle is tested on SQLAlchemy 2.0 and not yet on 2.1, where the dialect gains a native `JSON` type; on 2.0 native JSON columns can not be merged.
+- Oracle runs on SQLAlchemy 2.0 and 2.1. Native JSON and `LONG` columns are not supported on 2.0; from 2.1 the dialect grows a native `JSON` type, but the shared suite still skips the native-JSON scenario.
 
 ## [2.1.2] - 2026-11-06
 

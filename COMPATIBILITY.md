@@ -23,17 +23,15 @@ The databases and drivers DBMerge is tested with, how each of them loads the sta
 | SQLite | sqlite3 (standard library) | `sqlite://` | ✅ | ✅ | — | — |
 | DuckDB | duckdb_engine | `duckdb://` | ✅ | ✅ | Arrow | 200k rows: 3.6 s → 0.34 s |
 | ClickHouse | clickhouse-connect | `clickhousedb://`, or a client | ✅ | ✅ | Arrow | 1M rows: 20 s → 1.3 s |
-| Oracle XE 21c | python-oracledb (Thin) | `oracle+oracledb://` | ⚠️ ⁴ | Not tested ⁵ | executemany (array DML) | 200k rows: 0.76 s → 0.33 s |
+| Oracle XE 21c | python-oracledb (Thin) | `oracle+oracledb://` | ⚠️ ⁴ | ⚠️ ⁴ | executemany (array DML) | 200k rows: 0.76 s → 0.33 s |
 
-✅ passes every test  ·  ⚠️ works, with the limitation in the note  ·  — no such combination  ·  Not tested — not run in the test suite
+✅ passes every test  ·  ⚠️ works, with the limitation in the note  ·  — no such combination
 
 1. SQLAlchemy has the `mssql+mssqlpython` dialect only from 2.1 on.
 2. pymssql truncates microseconds to milliseconds, on every path: a `datetime` of `12:00:00.123456` is stored as `12:00:00.123`. Everything else works. It has no bulk load in DBMerge either — see [MS SQL Server](#ms-sql-server). For SQL Server, prefer pyodbc or mssql-python.
 3. sqlalchemy-cockroachdb 2.0.4 declares `SQLAlchemy<2.1`, so with SQLAlchemy 2.1 it has to be 2.0.3, the last release without that limit. The tests ran with 2.0.3 on SQLAlchemy 2.1 and with 2.0.4 on SQLAlchemy 2.0.
 
-4. Oracle runs in the shared `tests/test_all.py` matrix: 79 passed, 17 skipped on XE 21.3 / SQLAlchemy 2.0. Four skips are the native-JSON scenario (one per input format); the rest are tests specific to other databases. Loader parity uses explicit JSON text instead of native JSON. Additional Oracle-specific tests cover LOBs and transaction cleanup, and verify that `bulk_load=True` drives the array-DML loader. Native JSON and LONG are not supported. See [Oracle support](ORACLE.md) for setup and limitations.
-
-5. Oracle has not been run against SQLAlchemy 2.1 yet — the suite runs on 2.0. From 2.1 the Oracle dialect grows a native `JSON` type, so the four native-JSON scenarios (see ⁴) would then run instead of being skipped.
+4. Oracle runs in the shared `tests/test_all.py` matrix on SQLAlchemy 2.0 and 2.1: 79 passed, 17 skipped on XE 21.3. Four skips are the native-JSON scenario (one per input format); the rest are tests specific to other databases. Loader parity uses explicit JSON text instead of native JSON. Additional Oracle-specific tests cover LOBs and transaction cleanup, and verify that `bulk_load=True` drives the array-DML loader. Native JSON and LONG are not supported on 2.0; from 2.1 the dialect grows a native `JSON` type, but the shared suite still skips the native-JSON scenario. See [Oracle support](ORACLE.md) for setup and limitations.
 
 **Not supported:**
 

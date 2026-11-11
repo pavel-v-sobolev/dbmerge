@@ -8,8 +8,13 @@ on:
 
 jobs:
   test_oracle:
-    name: Oracle, SQLAlchemy 2.0
+    name: Oracle, SQLAlchemy ${{ matrix.sqlalchemy }}
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sqlalchemy: ['2.0', '2.1']
 
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +49,11 @@ jobs:
         run: |
           uv sync --extra dev
           uv pip install oracledb
+
+      # uv.lock pins SQLAlchemy 2.0; "uv run --no-sync" below keeps the upgrade.
+      - name: Install SQLAlchemy 2.1
+        if: matrix.sqlalchemy == '2.1'
+        run: uv pip install "sqlalchemy~=2.1.0"
 
       - name: Create data directory
         run: mkdir -p data

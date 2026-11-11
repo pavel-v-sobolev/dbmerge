@@ -1,8 +1,8 @@
 # Oracle support
 
 Oracle uses the existing public API with hooks in `src/dbmerge/oracle.py`.
-Live integration tests cover Oracle XE 21.3, SQLAlchemy 2.0 and python-oracledb
-Thin mode. Other Oracle versions and Thick mode have not been verified.
+Live integration tests cover Oracle XE 21.3, SQLAlchemy 2.0 and 2.1, and
+python-oracledb Thin mode. Other Oracle versions and Thick mode have not been verified.
 
 ## Installation and connection
 
@@ -101,11 +101,12 @@ per URL, handle unsupported scenarios, adapt parity input and select computed
 column options. No hook means the existing generic behavior. Shared assertions
 and merge scenarios remain in `tests/test_all.py`.
 
-On Oracle XE 21.3 / SQLAlchemy 2.0 the shared suite passes 79 tests and skips 17:
-four native-JSON inference cases and thirteen tests specific to other databases.
-Loader parity serializes structured values as explicit Text/CLOB because native
-JSON is unsupported. Oracle computed columns are tested as virtual, rather than
-requesting persisted computed columns.
+On Oracle XE 21.3 / SQLAlchemy 2.0 and 2.1 the shared suite passes 79 tests and
+skips 17: four native-JSON inference cases and thirteen tests specific to other
+databases. Loader parity serializes structured values as explicit Text/CLOB because
+native JSON is unsupported on 2.0 (from 2.1 the dialect has a native `JSON` type,
+but the shared suite still skips that scenario). Oracle computed columns are tested
+as virtual, rather than requesting persisted computed columns.
 
 Additional Oracle-specific tests can run under a minimally privileged user:
 
