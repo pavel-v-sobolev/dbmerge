@@ -676,18 +676,21 @@ class dbmerge:
                     g = merge.table.alias()
                     guard = ~exists().where((g.c['category'] == merge.temp_table.c['category']) & (g.c['locked'] == True))
                     merge.exec(insert_condition=guard)
-            commit_all_steps (bool, optional): If set to True (default), then every step (temp insert, target insert, update, delete)
-                is committed immediately. If False, a single commit is issued after all steps complete successfully.
-                Must be a real boolean: a string such as 'false' is rejected instead of being treated as truthy.
-                It applies to the data only - schema changes (creating the target table, adding columns, creating and
-                dropping the staging table) are always committed on their own and never roll back with the data.
+            commit_all_steps (bool, optional): If True, every step (temp insert, target insert, update, delete) is committed
+                immediately; if False, a single commit is issued after all steps complete successfully. None (default) takes
+                the value given to the constructor. Must be a real boolean: a string such as 'false' is rejected instead of
+                being treated as truthy. It applies to the data only - schema changes (creating the target table, adding
+                columns, creating and dropping the staging table) are always committed on their own and never roll back with
+                the data.
             chunk_size (int, optional): Defines the batch size when inserting raw data (from lists of dicts, dicts of lists
-                or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. Defaults to 10000,
-                to 100,000 for the bulk copy of mssql-python (every chunk opens a connection of its own), and on ClickHouse
-                to 1,000,000: every insert creates a part of the table there, and small ones are costly.
+                or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. None (default) takes
+                the value given to the constructor, and that in turn defaults to 10000, to 100,000 for the bulk copy of
+                mssql-python (every chunk opens a connection of its own), and on ClickHouse to 1,000,000: every insert creates
+                a part of the table there, and small ones are costly.
             bulk_load (bool, optional): Load the staging table in bulk where the engine and its driver allow it
                 (COPY FROM STDIN on PostgreSQL and CockroachDB, bulk copy with mssql-python, fast_executemany with
-                pyodbc, Arrow on DuckDB), instead of the row by row INSERT of SQLAlchemy. The data stored is the same
+                pyodbc, Arrow on DuckDB), instead of the row by row INSERT of SQLAlchemy. None (default) takes the value
+                given to the constructor. The data stored is the same
                 either way, except on CockroachDB, whose COPY does not apply the limits of column types (VARCHAR(n),
                 DECIMAL(p,s)); False falls back to the row by row INSERT. ClickHouse always loads in bulk.
 
