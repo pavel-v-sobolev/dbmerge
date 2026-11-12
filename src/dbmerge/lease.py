@@ -21,7 +21,7 @@ from sqlalchemy import func, insert, or_, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
-from .tracking import _coerce_datetime
+from .tracking import _coerce_datetime, _now_expr
 
 LEASE_HEARTBEAT_PERIOD = 20.0
 LEASE_TTL = 900.0
@@ -74,7 +74,7 @@ class Lease:
         key = self.key(name)
         t = self.table
         with self.engine.connect() as conn:
-            now = _coerce_datetime(conn.scalar(select(func.now())))
+            now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             cutoff = now - timedelta(seconds=self.ttl)
             result = conn.execute(
                 update(t)
@@ -108,7 +108,7 @@ class Lease:
         key = self.key(name)
         t = self.table
         with self.engine.connect() as conn:
-            now = _coerce_datetime(conn.scalar(select(func.now())))
+            now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             cutoff = now - timedelta(seconds=self.ttl)
             found = conn.scalar(
                 select(t.c.id).where(t.c.table_name == key,

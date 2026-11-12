@@ -69,6 +69,15 @@ def _coerce_datetime(value: Any) -> datetime:
     return value
 
 
+def _now_expr(engine: Engine):
+    # The database clock, typed to match the tracking columns. MSSQL's CURRENT_TIMESTAMP is a naive
+    # DATETIME while DateTime(timezone=True) is a DATETIMEOFFSET; sysdatetimeoffset() returns the
+    # aware value the column stores, so "now" stays comparable with stored values.
+    if engine.dialect.name == "mssql":
+        return func.sysdatetimeoffset()
+    return func.now()
+
+
 @dataclass(frozen=True)
 class MergeRecord:
     """What the tracking table recorded about one merge."""
@@ -252,7 +261,7 @@ class MergeTracker:
         """Insert the row before the merge and register it for heartbeat. Returns (id, started_at)."""
         row_id = str(uuid.uuid4())
         with self.engine.connect() as conn:
-            now = _coerce_datetime(conn.scalar(select(func.now())))
+            now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             conn.execute(insert(self.table).values(
                 id=row_id, owner=self.owner, table_name=table_name,
                 database_type=database.type, server=database.server,
@@ -271,7 +280,7 @@ class MergeTracker:
             self._in_flight.discard(row_id)
         t = self.table
         with self.engine.connect() as conn:
-            now = _coerce_datetime(conn.scalar(select(func.now())))
+            now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             conn.execute(update(t).where(t.c.id == row_id)
                          .values(finished_at=now, changed=changed, boundary=boundary))
             # One finished row per table: the just-finished merge replaces every earlier finished
@@ -341,7 +350,7 @@ class MergeTracker:
             return self._db_now()
         t = self.table
         with self.engine.connect() as conn:
-            now = _coerce_datetime(conn.scalar(select(func.now())))
+            now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             cutoff = now - timedelta(seconds=self.heartbeat_ttl)
             conds = [t.c.table_name.in_(names), t.c.finished_at.is_(None),
                      t.c.heartbeat_at > cutoff]
@@ -407,7 +416,7 @@ class MergeTracker:
         """
         t = self.table
         with self.engine.connect() as conn:
-            cutoff = _coerce_datetime(conn.scalar(select(func.now()))) \
+            cutoff = _coerce_datetime(conn.scalar(select(_now_expr(self.engine)))) \
                 - timedelta(seconds=self.heartbeat_ttl)
             ids = conn.execute(
                 select(t.c.id)
@@ -463,4 +472,4 @@ class MergeTracker:
 
     def _db_now(self) -> datetime:
         with self.engine.connect() as conn:
-            return _coerce_datetime(conn.scalar(select(func.now())))
+            return _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
