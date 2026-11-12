@@ -34,7 +34,7 @@ from datetime import datetime, timedelta
 from typing import Any, Iterable
 
 from sqlalchemy import (Boolean, Column, DateTime, Engine, MetaData, String, Table, and_,
-                        delete, func, inspect, insert, schema, select, update)
+                        delete, func, inspect, insert, or_, schema, select, update)
 
 from .dbmerge import IncorrectParameter, _is_clickhouse_client, logger, mergeResult
 
@@ -109,6 +109,14 @@ def database_of(engine) -> Database:
     if url.port is not None:
         server = f"{server}:{url.port}"
     return Database(type=engine.dialect.name, server=server, database=url.database or "")
+
+
+def _matches_column(column, value):
+    # Oracle stores an empty string as NULL, so an empty value matches both a NULL and an empty
+    # string. The COALESCE(column, '') trick does not work there: '' itself is bound as NULL.
+    if value == "":
+        return or_(column.is_(None), column == "")
+    return column == value
 
 
 def _tracking_table(metadata: MetaData, name: str, schema: str | None) -> Table:
@@ -429,10 +437,9 @@ class MergeTracker:
 
     def _database_where(self, database: Database):
         t = self.table
-        # Oracle stores an empty string as NULL, so empty values match through COALESCE.
         return and_(t.c.database_type == database.type,
-                    func.coalesce(t.c.server, "") == database.server,
-                    func.coalesce(t.c.database_name, "") == database.database)
+                    _matches_column(t.c.server, database.server),
+                    _matches_column(t.c.database_name, database.database))
 
     def _ensure_schema(self) -> None:
         # The tracking table may live in a schema/database that does not exist yet (MySQL/MariaDB
