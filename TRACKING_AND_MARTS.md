@@ -63,10 +63,13 @@ with dbmerge(engine, table_name="orders", data=orders_rows,
 Параметры выполнения (`commit_all_steps`, `chunk_size`, `bulk_load`) задаются при создании merge — конструктор `dbmerge` их теперь принимает; в `exec()` они тоже остались, для обратной совместимости. Условия, которые строятся на таблицах самого merge (`source_condition`, `delete_condition`, `update_condition`, `insert_condition`), передаются через `track`:
 
 ```python
-        track_record, merge_result = tracker.track(
-            merge,
-            source_condition=merge.source_table.c["Period"] == period,
-        )
+with dbmerge(engine, table_name="orders",
+             source_table_name="orders_source", source_schema="source",
+             key=["id"], merged_on_field="merged_on") as merge:
+    track_record, merge_result = tracker.track(
+        merge,
+        source_condition=merge.source_table.c["Period"] == period,
+    )
 ```
 
 Имя таблицы берётся из самого `merge`, флаг «изменились ли строки» — из его результата.
