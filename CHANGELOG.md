@@ -2,6 +2,15 @@
 
 All notable changes to DBMerge. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/). Releases before 2.0.0 are described in [GitHub Releases](https://github.com/pavel-v-sobolev/dbmerge/releases).
 
+## [2.3.0] - 2026-11-12
+
+### Added
+
+- **Change tracking** (`dbmerge.tracking`): a `MergeTracker` journals every merge into one table (`dbmerge_tracking` by default) — when it started/finished, whether rows really changed, and the identity of the database the merged table lives in (`database_type`/`server`/`database_name`). Readers answer the two questions a downstream consumer asks: `boundary()` — up to which moment the data is settled (in-progress merges hold it back), and `changed_since()`/`last_merge()`/`watermark()` — when and whether a table changed. A crashed merge stops holding the boundary once its heartbeat expires and is picked up by `recover_abandoned()`. Tracking requires a transactional shared store: ClickHouse and DuckDB are rejected — track a ClickHouse mart through PostgreSQL.
+- **Marts** (`dbmerge.mart`): a `MartLoop` polls the tracking table and runs a `Handler` only when the declared sources really changed since the mart's watermark. `Handler` declares `name`/`mart_table`/`sources` and implements `handle`, optionally `setup` (one-time DDL) and `rebuild` (full rebuild; no resume — an interrupted rebuild starts over). The watermark is recorded on the mart's own tracking row via `tracker.track(merge, boundary=...)`.
+- **Lease** (`dbmerge.lease`): named role ownership with a heartbeat, stored in the same tracking table under a reserved `lease:<name>` key, so two processes never build the same mart.
+- **`dbmerge` execution defaults**: the constructor now accepts `commit_all_steps`, `chunk_size` and `bulk_load`; `exec()` keeps them for backward compatibility and an explicit argument overrides the constructor value.
+
 ## [2.2.0] - 2026-11-11
 
 ### Added

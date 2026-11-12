@@ -233,7 +233,10 @@ class dbmerge:
                  source_schema: str | None = None, 
                  can_create_table: bool = True,
                  can_create_columns: bool = True,
-                 can_create_schemas: bool = True) -> None:
+                 can_create_schemas: bool = True,
+                 commit_all_steps: bool = True,
+                 chunk_size: int | None = None,
+                 bulk_load: bool = True) -> None:
         """
         Init function prepares the database and internal structures before the merge operation.
         
@@ -307,6 +310,9 @@ class dbmerge:
             can_create_table (bool, optional): Allows the module to automatically create the target table if it does not exist (default is True).
             can_create_columns (bool, optional): Allows the module to append missing columns to the target table (default is True).
             can_create_schemas (bool, optional): Allows the module to automatically create target and temp schema if they don't exist (default is True).
+            commit_all_steps (bool, optional): Default commit_all_steps for exec() (default True). See exec().
+            chunk_size (int | None, optional): Default chunk_size for exec() (default None). See exec().
+            bulk_load (bool, optional): Default bulk_load for exec() (default True). See exec().
 
         Raises:
             IncorrectParameter: Raised when arguments are not correct, missing, or conflict with each other.
@@ -333,7 +339,9 @@ class dbmerge:
                                schema=schema, temp_schema=temp_schema,
                                source_table_name=source_table_name, source_schema=source_schema,
                                can_create_table=can_create_table, can_create_columns=can_create_columns,
-                               can_create_schemas=can_create_schemas)
+                               can_create_schemas=can_create_schemas,
+                               commit_all_steps=commit_all_steps, chunk_size=chunk_size,
+                               bulk_load=bulk_load)
             self._validate_init_params(**init_params)
 
             # The dialect is known only once the engine is known to be an engine at all.
@@ -358,6 +366,12 @@ class dbmerge:
             self.can_create_columns = can_create_columns
             self.can_create_table = can_create_table
             self.can_create_schemas = can_create_schemas
+
+            # Execution defaults (see exec). A merge run through MergeTracker has no place to pass
+            # these to exec, so they are set here and exec() falls back to them unless overridden.
+            self._commit_all_steps = commit_all_steps
+            self._chunk_size = chunk_size
+            self._bulk_load = bulk_load
 
             # A dialect module that opens the session itself reads the catalog its own way too: a
             # clickhouse-connect client can not be inspected at all.
@@ -622,7 +636,8 @@ class dbmerge:
 
     def exec(self, delete_condition: ColumnElement=None, source_condition: ColumnElement=None,
              update_condition: ColumnElement=None, insert_condition: ColumnElement=None,
-             commit_all_steps=True, chunk_size: int | None = None, bulk_load: bool = True) -> mergeResult:
+             commit_all_steps: bool | None = None, chunk_size: int | None = None,
+             bulk_load: bool | None = None) -> mergeResult:
         """
         Executes the merge operation. It returns a mergeResult class with statistical information.
 
@@ -684,6 +699,15 @@ class dbmerge:
         
         if self.merge_finished:
             raise IncorrectParameter(f'Merge exec already finished on table {self.table_full_name}')
+
+        # The constructor carries the defaults (a merge run through MergeTracker can not pass these
+        # to exec); an explicit argument here overrides them for this call only.
+        if commit_all_steps is None:
+            commit_all_steps = self._commit_all_steps
+        if chunk_size is None:
+            chunk_size = self._chunk_size
+        if bulk_load is None:
+            bulk_load = self._bulk_load
 
         # A bulk loader may take chunks of its own size when the caller has not chosen one (see _bulk_load).
         self.chunk_size_given = chunk_size is not None
@@ -1250,7 +1274,8 @@ class dbmerge:
                               delete_mark_values, merged_on_field, inserted_on_field,
                               skip_update_fields, skip_compare_fields, key,
                               data_types, schema, temp_schema, source_table_name, source_schema,
-                              can_create_table, can_create_columns, can_create_schemas):
+                              can_create_table, can_create_columns, can_create_schemas,
+                              commit_all_steps, chunk_size, bulk_load):
         """Validate user-supplied arguments up front so that a wrong type raises a
         clear IncorrectParameter instead of an obscure crash deeper in the merge."""
 
@@ -1320,6 +1345,16 @@ class dbmerge:
                             ('can_create_schemas', can_create_schemas)):
             if not isinstance(value, bool):
                 raise IncorrectParameter(f'"{name}" must be a boolean, got {type(value).__name__}.')
+
+        # execution defaults
+        for name, value in (('commit_all_steps', commit_all_steps),
+                            ('bulk_load', bulk_load)):
+            if not isinstance(value, bool):
+                raise IncorrectParameter(f'"{name}" must be a boolean, got {type(value).__name__}.')
+        if chunk_size is not None:
+            if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
+                raise IncorrectParameter(f'"chunk_size" must be a positive integer or None, '
+                                         f'got {chunk_size!r}.')
 
         if data is not None and source_table_name is not None:
             raise IncorrectParameter('Provide either "data" or "source_table_name", not both '

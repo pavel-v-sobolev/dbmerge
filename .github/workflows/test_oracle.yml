@@ -78,7 +78,7 @@ jobs:
         env:
           DBMERGE_TEST_ENGINES: oracle
         run: |
-          uv run --no-sync pytest tests/test_all.py -v --tb=short
+          uv run --no-sync pytest tests/test_all.py tests/test_tracking.py tests/test_mart.py -v --tb=short
 
       # The additional Oracle-specific tests run under a minimally privileged user.
       - name: Create Oracle test user

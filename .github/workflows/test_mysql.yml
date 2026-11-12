@@ -67,4 +67,4 @@ jobs:
         env:
           DBMERGE_TEST_ENGINES: ${{ matrix.engine }}
         run: |
-          uv run --no-sync pytest tests/test_all.py -v --tb=short
+          uv run --no-sync pytest tests/test_all.py tests/test_tracking.py tests/test_mart.py -v --tb=short
