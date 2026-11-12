@@ -34,7 +34,7 @@ from datetime import datetime, timedelta
 from typing import Any, Iterable
 
 from sqlalchemy import (Boolean, Column, DateTime, Engine, MetaData, String, Table, and_,
-                        delete, func, inspect, insert, select, update)
+                        delete, func, inspect, insert, schema, select, update)
 
 from .dbmerge import IncorrectParameter, _is_clickhouse_client, logger, mergeResult
 
@@ -173,6 +173,7 @@ class MergeTracker:
 
         self.metadata = MetaData()
         self.table = _tracking_table(self.metadata, table, schema)
+        self._ensure_schema()
         self._ensure_table()
 
         self._in_flight: set[str] = set()
@@ -381,7 +382,7 @@ class MergeTracker:
         if not names:
             return False
         t = self.table
-        conds = [t.c.table_name.in_(names), t.c.changed.is_(True), t.c.finished_at > since]
+        conds = [t.c.table_name.in_(names), t.c.changed == True, t.c.finished_at > since]
         if database is not None:
             conds.append(self._database_where(database))
         with self.engine.connect() as conn:
@@ -428,9 +429,22 @@ class MergeTracker:
 
     def _database_where(self, database: Database):
         t = self.table
+        # Oracle stores an empty string as NULL, so empty values match through COALESCE.
         return and_(t.c.database_type == database.type,
-                    t.c.server == database.server,
-                    t.c.database_name == database.database)
+                    func.coalesce(t.c.server, "") == database.server,
+                    func.coalesce(t.c.database_name, "") == database.database)
+
+    def _ensure_schema(self) -> None:
+        # The tracking table may live in a schema/database that does not exist yet (MySQL/MariaDB
+        # require one). Create it the way dbmerge creates its own schemas.
+        if self.schema is None or self.engine.dialect.name == "sqlite":
+            return
+        with self.engine.connect() as conn:
+            exists = self.engine.dialect.has_schema(conn, self.schema)
+            conn.commit()
+            if not exists:
+                conn.execute(schema.CreateSchema(self.schema))
+                conn.commit()
 
     def _ensure_table(self) -> None:
         inspector = inspect(self.engine)

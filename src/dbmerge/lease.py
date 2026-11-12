@@ -58,14 +58,16 @@ class Lease:
         """Create the lease row for a name if it does not exist yet. Idempotent."""
         key = self.key(name)
         t = self.table
-        with self.engine.begin() as conn:
+        with self.engine.connect() as conn:
             try:
                 conn.execute(insert(t).values(
                     id=key[:64], owner=None, table_name=key,
                     started_at=func.now(), heartbeat_at=func.now()))
+                conn.commit()
             except IntegrityError:
-                # Another process created it first. The row is there; nothing else to do.
-                pass
+                # Another process created it first. Roll the failed INSERT back: on PostgreSQL the
+                # transaction is now aborted, and the connection must not be returned in that state.
+                conn.rollback()
 
     def acquire(self, name: str) -> bool:
         """Claim the name, returning True if this process owns it now."""

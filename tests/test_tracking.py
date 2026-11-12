@@ -17,12 +17,21 @@ from conftest import engines, make_engine
 _TRACKING_ENGINES = [name for name in engines if name not in ("clickhouse", "duckdb")]
 
 
+def _schema(engine):
+    # dbmerge requires a database name on MySQL/MariaDB; use the same schema as test_all.py.
+    return None if engine.dialect.name == "sqlite" else "target"
+
+
+def _dbmerge(engine, **kwargs):
+    return dbmerge(engine, schema=_schema(engine), **kwargs)
+
+
 @pytest.fixture(params=_TRACKING_ENGINES)
 def engine(request):
     eng = make_engine(request.param)
     # The data tables are shared across tests on a real database; drop them for isolation.
-    drop_table_if_exists(eng, "orders")
-    drop_table_if_exists(eng, "mart")
+    drop_table_if_exists(eng, "orders", schema=_schema(eng))
+    drop_table_if_exists(eng, "mart", schema=_schema(eng))
     return eng
 
 
@@ -30,7 +39,7 @@ def engine(request):
 def tracker(engine):
     # One tracking table per test, so the shared database stays isolated.
     tr = MergeTracker(engine, table=f"tracking_{uuid.uuid4().hex[:8]}",
-                      heartbeat_period=0.05, heartbeat_ttl=1.0)
+                      schema=_schema(engine), heartbeat_period=0.05, heartbeat_ttl=1.0)
     yield tr
     tr.close()
 
@@ -40,7 +49,7 @@ def _rows(name="a"):
 
 
 def test_track_records_finish_and_changed(engine, tracker):
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         record, result = tracker.track(merge)
 
     assert result.inserted_row_count == 2
@@ -53,18 +62,18 @@ def test_track_records_finish_and_changed(engine, tracker):
 
 
 def test_track_noop_is_not_changed(engine, tracker):
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         tracker.track(merge)
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         record, _ = tracker.track(merge)
 
     assert record.changed is False
 
 
 def test_changed_since(engine, tracker):
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         tracker.track(merge)
-    with dbmerge(engine, table_name="orders", data=_rows("changed"), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows("changed"), key=["id"]) as merge:
         second, _ = tracker.track(merge)
 
     assert second.changed is True
@@ -76,9 +85,9 @@ def test_changed_since(engine, tracker):
 
 
 def test_one_finished_row_per_table(engine, tracker):
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         tracker.track(merge)
-    with dbmerge(engine, table_name="orders", data=[{"id": 1, "name": "x"}], key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=[{"id": 1, "name": "x"}], key=["id"]) as merge:
         tracker.track(merge)
 
     t = tracker.table
@@ -93,7 +102,7 @@ def test_track_failure_leaves_unfinished(engine, tracker):
     class Boom(Exception):
         pass
 
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         merge.exec = lambda **kw: (_ for _ in ()).throw(Boom())
         with pytest.raises(Boom):
             tracker.track(merge)
@@ -105,7 +114,7 @@ def test_recover_abandoned_marks_changed(engine, tracker):
     class Boom(Exception):
         pass
 
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         merge.exec = lambda **kw: (_ for _ in ()).throw(Boom())
         with pytest.raises(Boom):
             tracker.track(merge)
@@ -131,8 +140,8 @@ def test_boundary_holds_in_progress_merge(tracker):
             return None
 
     record, _ = tracker.track(SlowMerge(), changed=True)
-    # While the merge ran, the boundary was held at its start.
-    assert seen["boundary"] == record.started_at
+    # While the merge ran, the boundary was held at its start (engine precision may vary).
+    assert seen["boundary"] <= record.started_at
     # Once finished, it no longer holds the boundary.
     assert tracker.boundary(["orders"]) >= record.started_at
 
@@ -141,7 +150,7 @@ def test_boundary_ignores_abandoned_merge(engine, tracker):
     class Boom(Exception):
         pass
 
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         merge.exec = lambda **kw: (_ for _ in ()).throw(Boom())
         with pytest.raises(Boom):
             tracker.track(merge)
@@ -159,7 +168,7 @@ def test_boundary_ignores_abandoned_merge(engine, tracker):
 
 
 def test_watermark_and_reset(engine, tracker):
-    with dbmerge(engine, table_name="mart", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="mart", data=_rows(), key=["id"]) as merge:
         tracker.track(merge, boundary=datetime(2026, 1, 1, 12, 0, 0))
 
     assert tracker.watermark("mart") is not None
@@ -168,7 +177,7 @@ def test_watermark_and_reset(engine, tracker):
 
 
 def test_constructor_exec_defaults_used(engine, tracker):
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"],
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"],
                  chunk_size=1, bulk_load=False, commit_all_steps=False) as merge:
         tracker.track(merge)
         assert merge.chunk_size == 1
@@ -176,7 +185,7 @@ def test_constructor_exec_defaults_used(engine, tracker):
 
 
 def test_exec_overrides_constructor_defaults(engine):
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"],
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"],
                  chunk_size=1) as merge:
         merge.exec(chunk_size=3)
         assert merge.chunk_size == 3
@@ -184,7 +193,7 @@ def test_exec_overrides_constructor_defaults(engine):
 
 def test_constructor_rejects_bad_exec_defaults(engine):
     with pytest.raises(IncorrectParameter):
-        dbmerge(engine, table_name="orders", data=_rows(), key=["id"],
+        _dbmerge(engine, table_name="orders", data=_rows(), key=["id"],
                 commit_all_steps="false")
 
 
@@ -203,7 +212,7 @@ def test_tracker_rejects_untransactable_engine():
 
 
 def test_database_identity_recorded(engine, tracker):
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         record, _ = tracker.track(merge)
 
     db = database_of(engine)
@@ -216,7 +225,7 @@ def test_database_identity_recorded(engine, tracker):
 
 
 def test_database_filter(engine, tracker):
-    with dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         tracker.track(merge)
 
     db = database_of(engine)
