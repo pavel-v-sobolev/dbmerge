@@ -2,6 +2,12 @@
 
 All notable changes to DBMerge. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/). Releases before 2.0.0 are described in [GitHub Releases](https://github.com/pavel-v-sobolev/dbmerge/releases).
 
+## [2.3.1] - 2026-11-13
+
+### Added
+
+- **Per-table merge lease** (`MergeTracker.exec`): `with_lease=True` makes a merge exclusive per table, `wait_lease`/`wait_timeout`/`wait_interval` control waiting for a held lease, and the wait is logged at INFO with the current holder. `run_mart` no longer creates a `Lease` automatically — pass a shared one when cross-process exclusivity is needed.
+
 ## [2.3.0] - 2026-11-12
 
 ### Added

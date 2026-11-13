@@ -44,7 +44,7 @@ engine = create_engine(DB_URL, pool_pre_ping=True)
 signal.signal(signal.SIGTERM, request_stop)
 signal.signal(signal.SIGINT, request_stop)
 
-# One line per mart; each runs in its own thread with its own tracker and lease.
+# One line per mart; each runs in its own thread with its own tracker.
 with ThreadPoolExecutor(thread_name_prefix='mart') as executor:
     executor.submit(run_mart, OrdersByCustomer(), engine,
                     poll_interval=POLL_INTERVAL, schema=DB_SCHEMA)

@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import socket
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -151,6 +152,11 @@ def _tracking_table(metadata: MetaData, name: str, schema: str | None) -> Table:
         schema=schema,
     )
 
+def _lease_name(database: Database, table_name: str) -> str:
+    """A stable per-(database, table) key for the exec lease."""
+    return f"{database.type}|{database.server}|{database.database}|{table_name}"
+
+
 class MergeTracker:
     """A database-backed journal of merges: run a merge, then ask when and whether a table changed.
 
@@ -215,6 +221,7 @@ class MergeTracker:
         self._lock = threading.RLock()
         self._closed = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
+        self._lease = None
 
     # ------------------------------------------------------------------ context manager
 
@@ -227,7 +234,9 @@ class MergeTracker:
     # ------------------------------------------------------------------ tracking
 
     def exec(self, merge, *, boundary: datetime | None = None,
-             changed: bool | None = None, **exec_kwargs):
+             changed: bool | None = None, with_lease: bool = False,
+             wait_lease: bool = False, wait_timeout: float | None = None,
+             wait_interval: float = 30.0, **exec_kwargs):
         """Run ``merge.exec(**exec_kwargs)`` and record it in the tracking table.
 
         ``merge`` is a dbmerge instance (or anything with ``table_name``, ``exec`` and the
@@ -235,9 +244,17 @@ class MergeTracker:
         ``changed`` is derived from its counters unless it is passed explicitly. ``boundary`` is
         recorded on success and is the watermark the next mart update starts from.
 
-        Returns ``(MergeRecord, mergeResult)``. On failure the row is left unfinished with a stale
-        heartbeat: it stops holding the boundary once its heartbeat expires and can be recovered by
-        ``recover_abandoned``.
+        ``with_lease`` makes the merge exclusive per table: before starting, the tracker claims the
+        table's name in the journal, so a second process never merges the same table at the same
+        time. ``wait_lease`` decides what happens when the name is already held: without it the
+        merge is skipped, with it the tracker polls until the holder releases it or its heartbeat
+        expires. ``wait_interval`` is the poll period and ``wait_timeout`` the limit (``None`` means
+        no limit).
+
+        Returns ``(MergeRecord, mergeResult)``, or ``(None, None)`` when ``with_lease`` is set, the
+        table's name is held by another process and the merge is skipped. On failure the row is left
+        unfinished with a stale heartbeat: it stops holding the boundary once its heartbeat expires
+        and can be recovered by ``recover_abandoned``.
         """
         table_name = getattr(merge, "table_name", None)
         if not table_name:
@@ -251,27 +268,42 @@ class MergeTracker:
             raise IncorrectParameter(f"changed must be True, False or None, got {changed!r}")
         if boundary is not None and not isinstance(boundary, datetime):
             raise IncorrectParameter(f"boundary must be a datetime or None, got {boundary!r}")
+        if wait_interval <= 0:
+            raise IncorrectParameter("wait_interval must be positive")
 
         merge_engine = getattr(merge, "engine", None)
         database = database_of(merge_engine) if merge_engine is not None else Database("", "", "")
 
-        row_id, started_at = self._begin(table_name, database)
-        try:
-            merge_result = merge.exec(**exec_kwargs)
-        except BaseException:
-            self._abandon(row_id)
-            raise
+        lease_name = None
+        if with_lease:
+            lease_name = _lease_name(database, table_name)
+            if not self._acquire_lease(lease_name, wait=wait_lease, timeout=wait_timeout,
+                                       interval=wait_interval):
+                logger.info('Skipping merge of "%s": its lease is held by another process',
+                            table_name)
+                return (None, None)
 
-        if changed is None:
-            changed = (getattr(merge, "inserted_row_count", 0)
-                       + getattr(merge, "updated_row_count", 0)
-                       + getattr(merge, "deleted_row_count", 0)) > 0
-        finished_at = self._finish(row_id, table_name, changed, boundary)
-        return (MergeRecord(table_name=table_name, database_type=database.type,
-                            server=database.server, database_name=database.database,
-                            started_at=started_at, finished_at=finished_at,
-                            changed=changed, boundary=boundary),
-                merge_result)
+        try:
+            row_id, started_at = self._begin(table_name, database)
+            try:
+                merge_result = merge.exec(**exec_kwargs)
+            except BaseException:
+                self._abandon(row_id)
+                raise
+
+            if changed is None:
+                changed = (getattr(merge, "inserted_row_count", 0)
+                           + getattr(merge, "updated_row_count", 0)
+                           + getattr(merge, "deleted_row_count", 0)) > 0
+            finished_at = self._finish(row_id, table_name, changed, boundary)
+            return (MergeRecord(table_name=table_name, database_type=database.type,
+                                server=database.server, database_name=database.database,
+                                started_at=started_at, finished_at=finished_at,
+                                changed=changed, boundary=boundary),
+                    merge_result)
+        finally:
+            if lease_name is not None:
+                self._release_lease(lease_name)
 
     def _begin(self, table_name: str, database: Database):
         """Insert the row before the merge and register it for heartbeat. Returns (id, started_at)."""
@@ -351,6 +383,8 @@ class MergeTracker:
         thread = self._heartbeat_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=HEARTBEAT_JOIN_TIMEOUT)
+        if self._lease is not None:
+            self._lease.close()
 
     # ------------------------------------------------------------------ reading
 
@@ -457,6 +491,49 @@ class MergeTracker:
             result = conn.execute(
                 delete(t).where(t.c.table_name == table_name, t.c.finished_at.is_not(None)))
         return result.rowcount
+
+    # ------------------------------------------------------------------ lease
+
+    def _get_lease(self):
+        """The lease behind exec(with_lease=True), created lazily to avoid a circular import."""
+        if self._lease is None:
+            from .lease import Lease
+            self._lease = Lease(self.engine, self.table, self.owner,
+                                period=self.heartbeat_period, ttl=self.heartbeat_ttl)
+        return self._lease
+
+    def _acquire_lease(self, name, *, wait, timeout, interval) -> bool:
+        """Claim the per-table lease, optionally waiting for another holder to release it."""
+        lease = self._get_lease()
+        lease.ensure(name)
+        if lease.acquire(name):
+            return True
+        if not wait:
+            return False
+        logger.info('Waiting for the lease of "%s" (held by %s); checking every %.1fs',
+                    name, self._lease_owner(name) or "an unknown process", interval)
+        started = time.monotonic()
+        while True:
+            if self._closed.wait(interval):
+                return False
+            if lease.acquire(name):
+                logger.info('Lease of "%s" acquired after %.1fs', name,
+                            time.monotonic() - started)
+                return True
+            if timeout is not None and time.monotonic() - started >= timeout:
+                logger.warning('Timed out waiting for the lease of "%s" after %.1fs',
+                               name, time.monotonic() - started)
+                return False
+
+    def _lease_owner(self, name):
+        """The current holder of a lease key, for diagnostics."""
+        key = self._get_lease().key(name)
+        with self.engine.connect() as conn:
+            return conn.scalar(select(self.table.c.owner)
+                               .where(self.table.c.table_name == key))
+
+    def _release_lease(self, name) -> None:
+        self._get_lease().release(name)
 
     # ------------------------------------------------------------------ internals
 

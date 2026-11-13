@@ -233,7 +233,7 @@ dbmerge_tracking
 | member | what it does |
 |---|---|
 | `MergeTracker(engine, table_name=..., schema=..., ...)` | a long-lived journal; one tracker serves many merges. Optionally `with MergeTracker(engine) as tracker:` stops the heartbeat on exit |
-| `exec(merge, *, boundary=None, changed=None, **exec_kwargs)` | writes a tracking row, runs `merge.exec(**exec_kwargs)`, finishes the row; returns `(MergeRecord, mergeResult)` |
+| `exec(merge, *, boundary=None, changed=None, with_lease=False, wait_lease=False, wait_timeout=None, wait_interval=30.0, **exec_kwargs)` | writes a tracking row and runs `merge.exec(**exec_kwargs)`; `with_lease` makes the merge exclusive per table and `wait_lease` waits for the holder; returns `(MergeRecord, mergeResult)`, or `(None, None)` when skipped |
 | `boundary(table_names, database=None)` | the safe upper boundary over these tables |
 | `last_merge(table_name, database=None)` | the last finished row, or `None` |
 | `watermark(table_name, database=None)` | the boundary of the mart's last successful merge, or `None` |
@@ -252,10 +252,10 @@ dbmerge_tracking
 | `request_stop()` / `close()` | stop |
 
 `run_mart(mart, engine, tracker=None, *, poll_interval=2.0, schema=None, database=None, lease=None)`
-runs one mart until `request_stop()` is called: it wraps the handler into a `MartLoop`, creates a
-`MergeTracker` and a `Lease` for its name when none are passed, and runs the loop. `request_stop()`
-asks every loop started by `run_mart` to stop after its current pass — wire it to SIGTERM/SIGINT in
-a runner (see [examples/runner_marts.py](examples/runner_marts.py)).
+runs one mart until `request_stop()` is called: it wraps the handler into a `MartLoop`, creates the
+`MergeTracker` when none is passed, and runs the loop. `request_stop()` asks every loop started by
+`run_mart` to stop after its current pass — wire it to SIGTERM/SIGINT in a runner (see
+[examples/runner_marts.py](examples/runner_marts.py)).
 
 ### MartHandler
 

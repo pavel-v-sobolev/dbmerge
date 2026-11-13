@@ -1,5 +1,6 @@
 """Tests for dbmerge.tracking: the merge journal and its readers."""
 
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -233,3 +234,53 @@ def test_database_filter(engine, tracker):
     assert tracker.last_merge("orders", database=db) is not None
     assert tracker.last_merge("orders", database=other) is None
 
+
+def test_exec_with_lease_skips_and_waits(engine):
+    table_name = f"tracking_{uuid.uuid4().hex[:8]}"
+    schema = _schema(engine)
+    tracker_a = MergeTracker(engine, table_name=table_name, schema=schema,
+                             owner="a", heartbeat_period=0.05, heartbeat_ttl=1.0)
+    tracker_b = MergeTracker(engine, table_name=table_name, schema=schema,
+                             owner="b", heartbeat_period=0.05, heartbeat_ttl=1.0)
+
+    a_started = threading.Event()
+
+    class SlowMerge:
+        table_name = "orders"
+        inserted_row_count = updated_row_count = deleted_row_count = 0
+        merge_finished = False
+
+        def exec(self, **kwargs):
+            a_started.set()
+            time.sleep(0.4)
+            self.inserted_row_count = 1
+            return None
+
+    class FastMerge:
+        table_name = "orders"
+        inserted_row_count = 1
+        updated_row_count = deleted_row_count = 0
+        merge_finished = False
+
+        def exec(self, **kwargs):
+            return None
+
+    thread = threading.Thread(target=tracker_a.exec, args=(SlowMerge(),),
+                              kwargs={"with_lease": True}, daemon=True)
+    thread.start()
+    assert a_started.wait(timeout=5)
+
+    # Without wait_lease the held lease skips the merge entirely.
+    record, result = tracker_b.exec(FastMerge(), with_lease=True, wait_lease=False)
+    assert record is None and result is None
+
+    # With wait_lease it polls until the holder releases it, then runs.
+    record, result = tracker_b.exec(FastMerge(), with_lease=True, wait_lease=True,
+                                    wait_interval=0.05, wait_timeout=10)
+    assert record is not None and record.changed is True
+
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    tracker_a.close()
+    tracker_b.close()

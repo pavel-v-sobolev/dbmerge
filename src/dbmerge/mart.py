@@ -31,7 +31,7 @@ from sqlalchemy.engine import Engine
 
 from .dbmerge import logger
 from .lease import Lease
-from .tracking import Database, MergeTracker, _instance_owner
+from .tracking import Database, MergeTracker
 
 # The first run reads from the beginning of time rather than from a missing watermark.
 EPOCH = datetime(1900, 1, 1, tzinfo=timezone.utc)
@@ -249,15 +249,12 @@ def run_mart(mart, engine: Engine, tracker: MergeTracker | None = None, *,
     """Run one mart until :func:`request_stop` is called.
 
     ``mart`` is a ``MartHandler`` instance, a module or a callable (see :func:`as_handler`). The
-    ``MergeTracker`` and the ``Lease`` for the mart's name are created automatically when not
-    given, so two processes never build the same mart; pass them to share one across several
-    ``run_mart`` calls.
+    ``MergeTracker`` is created automatically when not given. Pass a shared ``Lease`` to enforce
+    one process per mart; without one the mart may run in two processes if this is started twice.
     """
     handler = as_handler(mart)
     if tracker is None:
         tracker = MergeTracker(engine, schema=schema)
-    if lease is None:
-        lease = Lease(engine, tracker.table, _instance_owner("mart"))
     loop = handler.loop(engine, tracker, poll_interval=poll_interval, lease=lease,
                         schema=schema, database=database)
     _running_loops.append(loop)
