@@ -146,6 +146,15 @@ DBMerge modifies your target table in bulk, and three deliberate design trade-of
 
 Read [Data Loss Risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#data-loss-risks) for the full list and the pre-merge checklist.
 
+## Change Tracking & Marts
+
+Beyond a single merge, DBMerge ships two optional layers that turn merges into a coordinated pipeline:
+
+- **`MergeTracker`** (`dbmerge.tracking`) journals every merge into one table, so a downstream consumer can ask when a table last changed (`is_changed_since`, `last_merge`), up to which moment the data is settled (`boundary`), and whether a merge is running right now.
+- **`MartLoop`** (`dbmerge.mart`) polls that journal and rebuilds a derived table (a *mart*) only when its declared sources really changed since the mart's watermark.
+
+See [Tracking and Marts](TRACKING_AND_MARTS.md) for the full reference and [examples/runner_marts.py](examples/runner_marts.py) for a ready-to-run template.
+
 ## Documentation
 
 - [Full Module Documentation](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md)
@@ -153,4 +162,5 @@ Read [Data Loss Risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCU
 - [Compatibility matrix](COMPATIBILITY.md)
 - [Oracle support](ORACLE.md)
 - [ClickHouse: overview and PostgreSQL integration](CLICKHOUSE.md)
+- [Tracking and Marts](TRACKING_AND_MARTS.md)
 - [Описание ClickHouse на русском](CLICKHOUSE_RU.md)

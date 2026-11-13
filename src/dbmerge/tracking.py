@@ -152,24 +152,40 @@ def _tracking_table(metadata: MetaData, name: str, schema: str | None) -> Table:
     )
 
 class MergeTracker:
-    """A database-backed journal of merges: track a merge, then ask when and whether a table changed.
+    """A database-backed journal of merges: run a merge, then ask when and whether a table changed.
 
     The tracker is used as a context manager so its heartbeat thread is stopped on exit, and the
     merge itself is the standard dbmerge context::
 
         with MergeTracker(engine) as tracker:
             with dbmerge(engine, table_name="orders", data=rows, key=["id"]) as merge:
-                record, result = tracker.track(merge)
+                record, result = tracker.exec(merge)
 
-    ``track`` inserts a row before the merge, runs ``merge.exec()`` itself, and marks the row
+    ``exec`` inserts a row before the merge, runs ``merge.exec()`` itself, and marks the row
     finished afterwards. A separate daemon thread keeps the row's heartbeat fresh while the merge
     runs, on its own connection, so a long merge is not mistaken for a dead one.
     """
 
-    def __init__(self, engine: Engine, table: str = TRACKING_TABLE,
+    def __init__(self, engine: Engine, table_name: str = TRACKING_TABLE,
                  schema: str | None = None, owner: str | None = None,
                  heartbeat_period: float = HEARTBEAT_PERIOD,
                  heartbeat_ttl: float = HEARTBEAT_TTL):
+        """Create a tracker writing its journal to a table of a transactional database.
+
+        Args:
+            engine: A SQLAlchemy ``Engine`` for the transactional database that holds the journal.
+                ClickHouse and DuckDB are rejected — they have no cross-process transactional
+                store; track merges into them by passing a PostgreSQL/CockroachDB engine here.
+            table_name: The name of the journal table. It is created lazily on first use, so a
+                project that never opts into tracking gets no extra table.
+            schema: The schema (or database on MySQL/MariaDB) holding the journal table. Created if
+                it does not exist; ignored on SQLite, which has no schemas.
+            owner: A string identifying this process in the journal's ``owner`` column, for
+                diagnostics only. Defaults to ``host:pid:random``.
+            heartbeat_period: How often a running merge refreshes its row's heartbeat, in seconds.
+            heartbeat_ttl: How long a heartbeat may stay stale before a merge is considered
+                abandoned, in seconds.
+        """
         if not isinstance(engine, Engine):
             raise IncorrectParameter(f"MergeTracker needs a SQLAlchemy Engine to write its journal to, "
                                      f"got {type(engine).__name__}.")
@@ -189,7 +205,7 @@ class MergeTracker:
         self.schema = schema
 
         self.metadata = MetaData()
-        self.table = _tracking_table(self.metadata, table, schema)
+        self.table = _tracking_table(self.metadata, table_name, schema)
         self._ensure_schema()
         self._ensure_table()
 
@@ -210,8 +226,8 @@ class MergeTracker:
 
     # ------------------------------------------------------------------ tracking
 
-    def track(self, merge, *, boundary: datetime | None = None,
-              changed: bool | None = None, **exec_kwargs):
+    def exec(self, merge, *, boundary: datetime | None = None,
+             changed: bool | None = None, **exec_kwargs):
         """Run ``merge.exec(**exec_kwargs)`` and record it in the tracking table.
 
         ``merge`` is a dbmerge instance (or anything with ``table_name``, ``exec`` and the
@@ -225,12 +241,12 @@ class MergeTracker:
         """
         table_name = getattr(merge, "table_name", None)
         if not table_name:
-            raise IncorrectParameter("track() expects a dbmerge instance; its table_name is empty")
+            raise IncorrectParameter("exec() expects a dbmerge instance; its table_name is empty")
         if not callable(getattr(merge, "exec", None)):
-            raise IncorrectParameter("track() expects a dbmerge instance with an exec() method")
+            raise IncorrectParameter("exec() expects a dbmerge instance with an exec() method")
         if getattr(merge, "merge_finished", False):
             raise IncorrectParameter(f"Merge of table \"{table_name}\" is already finished; "
-                                     f"track it before it runs")
+                                     f"run it via exec() before it runs")
         if changed is not None and not isinstance(changed, bool):
             raise IncorrectParameter(f"changed must be True, False or None, got {changed!r}")
         if boundary is not None and not isinstance(boundary, datetime):
@@ -392,8 +408,8 @@ class MergeTracker:
         with self.engine.connect() as conn:
             return conn.scalar(select(func.max(t.c.boundary)).where(*conds))
 
-    def changed_since(self, table_names: Iterable[str], since: datetime,
-                      database: Database | None = None) -> bool:
+    def is_changed_since(self, table_names: Iterable[str], since: datetime,
+                         database: Database | None = None) -> bool:
         """Whether any of the tables really changed (a finished, changed merge) after ``since``."""
         names = list(table_names)
         if not names:

@@ -1,12 +1,13 @@
 """Tests for dbmerge.mart: the MartLoop and its lease."""
 
+import threading
 import time
 import uuid
 
 import pytest
 
-from dbmerge import (Lease, MartLoop, MergeTracker, dbmerge, Handler, as_handler,
-                     drop_table_if_exists)
+from dbmerge import (Lease, MartLoop, MartHandler, MergeTracker, dbmerge, as_handler,
+                     drop_table_if_exists, request_stop, run_mart)
 
 from conftest import engines, make_engine
 
@@ -31,7 +32,7 @@ def engine(request):
 
 @pytest.fixture()
 def tracker(engine):
-    tr = MergeTracker(engine, table=f"tracking_{uuid.uuid4().hex[:8]}",
+    tr = MergeTracker(engine, table_name=f"tracking_{uuid.uuid4().hex[:8]}",
                       schema=_schema(engine), heartbeat_period=0.05, heartbeat_ttl=1.0)
     yield tr
     tr.close()
@@ -48,7 +49,7 @@ def test_mart_runs_when_source_changed(engine, tracker):
         seen.append(ctx)
         with _dbmerge(ctx.engine, table_name=ctx.mart_table,
                      data=[{"id": 1}], key=["id"]) as merge:
-            ctx.tracker.track(merge, boundary=ctx.boundary)
+            ctx.tracker.exec(merge, boundary=ctx.boundary)
 
     mart = MartLoop(engine, tracker, name="m", mart_table="mart",
                     sources=["orders"], handle=handle)
@@ -57,7 +58,7 @@ def test_mart_runs_when_source_changed(engine, tracker):
     assert seen == []
 
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
     time.sleep(1.1)
     assert mart.run_if_pending() is True           # first run: full rebuild
     assert len(seen) == 1 and seen[0].full_rebuild is True
@@ -67,7 +68,7 @@ def test_mart_runs_when_source_changed(engine, tracker):
 
     time.sleep(1.1)
     with _dbmerge(engine, table_name="orders", data=_rows("changed"), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
     time.sleep(1.1)
     assert mart.run_if_pending() is True           # a real change: incremental
     assert len(seen) == 2 and seen[1].full_rebuild is False
@@ -81,7 +82,7 @@ def test_mart_lease_exclusivity(engine, tracker):
     ran = []
 
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
 
     m1 = MartLoop(engine, tracker, "m", "mart", ["orders"],
                   lambda ctx: ran.append("m1"), lease=lease1)
@@ -96,7 +97,7 @@ def test_mart_lease_exclusivity(engine, tracker):
     m2.close()
 
 
-class RecordingHandler(Handler):
+class RecordingHandler(MartHandler):
     name = "h"
     mart_table = "mart"
     sources = ["orders"]
@@ -113,7 +114,7 @@ class RecordingHandler(Handler):
         self.handle_calls += 1
         with _dbmerge(ctx.engine, table_name=ctx.mart_table,
                      data=[{"id": 1}], key=["id"]) as merge:
-            ctx.tracker.track(merge, boundary=ctx.boundary)
+            ctx.tracker.exec(merge, boundary=ctx.boundary)
 
     def rebuild(self, ctx):
         self.rebuild_calls += 1
@@ -125,7 +126,7 @@ def test_handler_setup_and_rebuild(engine, tracker):
     mart = h.loop(engine, tracker)
 
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
     time.sleep(1.1)
 
     assert mart.run_if_pending() is True
@@ -136,7 +137,7 @@ def test_handler_setup_and_rebuild(engine, tracker):
 
     time.sleep(1.1)
     with _dbmerge(engine, table_name="orders", data=_rows("changed"), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
     time.sleep(1.1)
     assert mart.run_if_pending() is True                  # incremental: handle, not rebuild
     assert h.setup_calls == 1
@@ -151,14 +152,14 @@ def test_handler_min_interval_throttles(engine, tracker):
     mart = h.loop(engine, tracker)
 
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
     time.sleep(1.1)
     assert mart.run_if_pending() is True
 
     # A new change arrives, but min_interval has not elapsed → throttled.
     time.sleep(1.1)
     with _dbmerge(engine, table_name="orders", data=_rows("changed"), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
     assert mart.run_if_pending() is False
     assert h.handle_calls == 1
     mart.close()
@@ -187,4 +188,24 @@ def test_as_handler_normalizes():
     fn.sources = ["orders"]
     norm2 = as_handler(fn)
     assert norm2.name == "f" and norm2.handle is fn
+
+
+def test_run_mart_and_request_stop(engine, tracker):
+    class M(MartHandler):
+        name = "m"
+        mart_table = "mart"
+        sources = ["orders"]
+
+        def handle(self, ctx):
+            with _dbmerge(ctx.engine, table_name=ctx.mart_table,
+                         data=[{"id": 1}], key=["id"]) as merge:
+                ctx.tracker.exec(merge, boundary=ctx.boundary)
+
+    thread = threading.Thread(target=run_mart, args=(M(), engine, tracker),
+                              kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    time.sleep(0.2)          # let run_mart register its loop before stopping it
+    request_stop()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
 

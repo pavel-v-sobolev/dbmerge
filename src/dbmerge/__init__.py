@@ -10,10 +10,12 @@ from .dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError, TableNo
 from .tracking import (MergeTracker, MergeRecord, Database, database_of, TRACKING_TABLE,
                        HEARTBEAT_PERIOD, HEARTBEAT_TTL, TRACKING_UNSUPPORTED_DIALECTS)
 from .lease import Lease
-from .mart import MartLoop, MartContext, Handler, as_handler
+from .mart import (MartLoop, MartContext, MartHandler, Handler, as_handler, run_mart,
+                   request_stop)
 
 __all__ = ["dbmerge", "drop_table_if_exists", "format_ms", "mergeResult", "__version__",
            "IncorrectParameter", "IncorrectDataError", "NoKeyError", "TableNotFoundError", "TempTableAlreadyExists",
            "MergeTracker", "MergeRecord", "Database", "database_of", "TRACKING_TABLE",
            "HEARTBEAT_PERIOD", "HEARTBEAT_TTL", "TRACKING_UNSUPPORTED_DIALECTS",
-           "Lease", "MartLoop", "MartContext", "Handler", "as_handler"]
+           "Lease", "MartLoop", "MartContext", "MartHandler", "Handler", "as_handler",
+           "run_mart", "request_stop"]

@@ -38,7 +38,7 @@ def engine(request):
 @pytest.fixture()
 def tracker(engine):
     # One tracking table per test, so the shared database stays isolated.
-    tr = MergeTracker(engine, table=f"tracking_{uuid.uuid4().hex[:8]}",
+    tr = MergeTracker(engine, table_name=f"tracking_{uuid.uuid4().hex[:8]}",
                       schema=_schema(engine), heartbeat_period=0.05, heartbeat_ttl=1.0)
     yield tr
     tr.close()
@@ -48,9 +48,9 @@ def _rows(name="a"):
     return [{"id": 1, "name": name}, {"id": 2, "name": name}]
 
 
-def test_track_records_finish_and_changed(engine, tracker):
+def test_exec_records_finish_and_changed(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        record, result = tracker.track(merge)
+        record, result = tracker.exec(merge)
 
     assert result.inserted_row_count == 2
     assert record.table_name == "orders"
@@ -61,34 +61,34 @@ def test_track_records_finish_and_changed(engine, tracker):
     assert last is not None and last.changed is True
 
 
-def test_track_noop_is_not_changed(engine, tracker):
+def test_exec_noop_is_not_changed(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        record, _ = tracker.track(merge)
+        record, _ = tracker.exec(merge)
 
     assert record.changed is False
 
 
-def test_changed_since(engine, tracker):
+def test_is_changed_since(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
     with _dbmerge(engine, table_name="orders", data=_rows("changed"), key=["id"]) as merge:
-        second, _ = tracker.track(merge)
+        second, _ = tracker.exec(merge)
 
     assert second.changed is True
     # A change happened after this moment (well before the two merges).
     before = second.started_at - timedelta(seconds=10)
-    assert tracker.changed_since(["orders"], since=before) is True
+    assert tracker.is_changed_since(["orders"], since=before) is True
     # Nothing changed after the second merge finished.
-    assert tracker.changed_since(["orders"], since=second.finished_at) is False
+    assert tracker.is_changed_since(["orders"], since=second.finished_at) is False
 
 
 def test_one_finished_row_per_table(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
     with _dbmerge(engine, table_name="orders", data=[{"id": 1, "name": "x"}], key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
 
     t = tracker.table
     with engine.connect() as conn:
@@ -98,14 +98,14 @@ def test_one_finished_row_per_table(engine, tracker):
     assert count == 1
 
 
-def test_track_failure_leaves_unfinished(engine, tracker):
+def test_exec_failure_leaves_unfinished(engine, tracker):
     class Boom(Exception):
         pass
 
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         merge.exec = lambda **kw: (_ for _ in ()).throw(Boom())
         with pytest.raises(Boom):
-            tracker.track(merge)
+            tracker.exec(merge)
 
     assert tracker.last_merge("orders") is None
 
@@ -117,14 +117,14 @@ def test_recover_abandoned_marks_changed(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         merge.exec = lambda **kw: (_ for _ in ()).throw(Boom())
         with pytest.raises(Boom):
-            tracker.track(merge)
+            tracker.exec(merge)
 
     tracker.close()
     with engine.begin() as conn:
         conn.execute(update(tracker.table).values(heartbeat_at=datetime(2000, 1, 1)))
 
     assert tracker.recover_abandoned() == 1
-    assert tracker.changed_since(["orders"], since=datetime(2000, 1, 1)) is True
+    assert tracker.is_changed_since(["orders"], since=datetime(2000, 1, 1)) is True
 
 
 def test_boundary_holds_in_progress_merge(tracker):
@@ -139,7 +139,7 @@ def test_boundary_holds_in_progress_merge(tracker):
             seen["boundary"] = tracker.boundary(["orders"])
             return None
 
-    record, _ = tracker.track(SlowMerge(), changed=True)
+    record, _ = tracker.exec(SlowMerge(), changed=True)
     # While the merge ran, the boundary was held at its start (engine precision may vary).
     assert seen["boundary"] <= record.started_at
     # Once finished, it no longer holds the boundary.
@@ -153,7 +153,7 @@ def test_boundary_ignores_abandoned_merge(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         merge.exec = lambda **kw: (_ for _ in ()).throw(Boom())
         with pytest.raises(Boom):
-            tracker.track(merge)
+            tracker.exec(merge)
 
     tracker.close()
     with engine.begin() as conn:
@@ -169,7 +169,7 @@ def test_boundary_ignores_abandoned_merge(engine, tracker):
 
 def test_watermark_and_reset(engine, tracker):
     with _dbmerge(engine, table_name="mart", data=_rows(), key=["id"]) as merge:
-        tracker.track(merge, boundary=datetime(2026, 1, 1, 12, 0, 0))
+        tracker.exec(merge, boundary=datetime(2026, 1, 1, 12, 0, 0))
 
     assert tracker.watermark("mart") is not None
     tracker.reset("mart")
@@ -179,7 +179,7 @@ def test_watermark_and_reset(engine, tracker):
 def test_constructor_exec_defaults_used(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"],
                  chunk_size=1, bulk_load=False, commit_all_steps=False) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
         assert merge.chunk_size == 1
         assert merge.bulk_load is False
 
@@ -213,7 +213,7 @@ def test_tracker_rejects_untransactable_engine():
 
 def test_database_identity_recorded(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        record, _ = tracker.track(merge)
+        record, _ = tracker.exec(merge)
 
     db = database_of(engine)
     assert record.database_type == db.type
@@ -226,7 +226,7 @@ def test_database_identity_recorded(engine, tracker):
 
 def test_database_filter(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
-        tracker.track(merge)
+        tracker.exec(merge)
 
     db = database_of(engine)
     other = Database("postgresql", "other:5432", "otherdb")

@@ -1,194 +1,199 @@
-# Tracking и витрины (marts)
+# Tracking and Marts
 
-DBMerge синхронизирует данные в таблицу: вставляет недостающие, обновляет изменившиеся, помечает или удаляет лишние. Этот документ описывает две **необязательные** надстройки поверх merge:
+DBMerge synchronizes data into a table: it inserts missing rows, updates changed ones, and marks or deletes rows that are gone. This document describes two **optional** layers on top of a merge:
 
-- **Tracking** — журнал merge в базе, по которому можно узнать, когда таблица менялась и не идёт ли merge прямо сейчас.
-- **Mart (витрина)** — цикл, который пересчитывает производную таблицу, когда изменились исходные, и ничего не делает, когда изменений нет.
+- **Tracking** — a journal of merges in the database, telling you when a table last changed and whether a merge is running right now.
+- **Mart** — a loop that rebuilds a derived table when its sources change, and does nothing when they don't.
 
-Если надстройки не нужны, dbmerge работает как раньше — они включаются явно.
+If you don't need them, dbmerge works exactly as before — both are opt-in.
 
-## Общая картина
+## The big picture
 
 ```
-merge источника ──► строка в tracking-таблице ──► MartLoop видит изменение ──► пересчитывает витрину
-                     (started/finished/changed/boundary)
+a merge ──► a row in the tracking table ──► MartLoop sees the change ──► rebuilds the mart
+             (started/finished/changed/boundary)
 ```
 
-- Каждый merge, обёрнутый в `tracker.track(...)`, оставляет в tracking-таблице строку.
-- Пока merge идёт, строка «живая» (heartbeat обновляется) и держит границу безопасного чтения.
-- По завершении строка получает `finished_at` и флаг `changed` («изменились ли строки»).
-- `MartLoop` опрашивает эту таблицу и запускает пересчёт витрины, только если источники реально менялись.
+- Every merge wrapped in `tracker.exec(...)` leaves a row in the tracking table.
+- While the merge runs, the row is "alive" (its heartbeat is refreshed) and holds the safe boundary.
+- When the merge finishes, the row gets `finished_at` and a `changed` flag ("did rows actually change").
+- `MartLoop` polls this table and rebuilds the mart only when the sources really changed.
 
 ## Tracking
 
-### Зачем
+### Why
 
-Две программы работают независимо: одна пишет в таблицы (репликатор, загрузчик), другая считает по ним отчёты (витрина). Второй нужно знать:
+Two programs run independently: one writes into tables (a replicator, a loader), the other builds reports from them (a mart). The second one needs to know:
 
-1. «Изменилась ли таблица X после момента Y?»
-2. «Не пишет ли сейчас кто-то в X прямо в эту секунду?» — чтобы не прочитать строку наполовину.
+1. "Did table X change after moment Y?"
+2. "Is someone writing into X right now?" — so it doesn't read a half-written row.
 
-Ответ на оба вопроса даёт одна tracking-таблица.
+One tracking table answers both questions.
 
-### Где ведётся журнал
+### Where the journal lives
 
-Журнал живёт в **транзакционной** базе. Для ClickHouse или DuckDB трекер не создаётся — там нет настоящих транзакций или общей для процессов БД; витрину в ClickHouse трекают через PostgreSQL:
+The journal lives in a **transactional** database. `MergeTracker` refuses ClickHouse and DuckDB — they have no cross-process transactional store. A ClickHouse mart is tracked through PostgreSQL:
 
 ```python
-tracker = MergeTracker(postgres_engine)              # журнал в PostgreSQL
-with dbmerge(clickhouse_engine, table_name="mart",   # сам merge — в ClickHouse
+tracker = MergeTracker(postgres_engine)              # the journal in PostgreSQL
+with dbmerge(clickhouse_engine, table_name="mart",   # the merge itself in ClickHouse
              data=rows, key=["id"]) as merge:
-    tracker.track(merge)
+    tracker.exec(merge)
 ```
 
-Чтобы одинаковые имена таблиц из разных баз не смешивались, каждая строка журнала хранит, где живёт слитая таблица: `database_type`, `server`, `database_name`. Их берёт `database_of(engine)`; методы чтения принимают фильтр `database=...`.
+So that equal table names in different databases don't collide, every journal row records where the merged table lives: `database_type`, `server`, `database_name`. `database_of(engine)` returns them; the read methods take a `database=...` filter.
 
-### Минимальный пример
+### Minimal example
 
 ```python
 from dbmerge import dbmerge
 from dbmerge.tracking import MergeTracker
 
-tracker = MergeTracker(engine)          # таблица dbmerge_tracking создаётся сама; трекер живёт долго
+tracker = MergeTracker(engine)          # the dbmerge_tracking table is created lazily; the tracker is long-lived
 with dbmerge(engine, table_name="orders", data=orders_rows,
              key=["id"], merged_on_field="merged_on") as merge:
-    track_record, merge_result = tracker.track(merge)
+    record, result = tracker.exec(merge)
 ```
 
-`track(merge)` сам вызывает `merge.exec()` и возвращает `(track_record, merge_result)`:
+`tracker.exec(merge)` runs `merge.exec()` itself and returns `(record, result)`:
 
-- `track_record` — запись tracking-таблицы об этом merge (`MergeRecord`);
-- `merge_result` — обычный результат `exec()` (`mergeResult`).
+- `record` — what the journal recorded about this merge (`MergeRecord`);
+- `result` — the usual `exec()` result (`mergeResult`).
 
-Параметры выполнения (`commit_all_steps`, `chunk_size`, `bulk_load`) задаются при создании merge — конструктор `dbmerge` их теперь принимает; в `exec()` они тоже остались, для обратной совместимости. Условия, которые строятся на таблицах самого merge (`source_condition`, `delete_condition`, `update_condition`, `insert_condition`), передаются через `track`:
+Execution options (`commit_all_steps`, `chunk_size`, `bulk_load`) are set when the merge is created — the `dbmerge` constructor accepts them; `exec()` keeps them too, for backward compatibility. Conditions built on the merge's own tables (`source_condition`, `delete_condition`, `update_condition`, `insert_condition`) are passed through `tracker.exec`:
 
 ```python
 with dbmerge(engine, table_name="orders",
              source_table_name="orders_source", source_schema="source",
              key=["id"], merged_on_field="merged_on") as merge:
-    track_record, merge_result = tracker.track(
+    record, result = tracker.exec(
         merge,
         source_condition=merge.source_table.c["Period"] == period,
     )
 ```
 
-Имя таблицы берётся из самого `merge`, флаг «изменились ли строки» — из его результата.
+The table name is taken from the merge itself; the `changed` flag comes from its result.
 
-### Что можно спросить
+### What you can ask
 
 ```python
-# До какого момента данные точно «устоялись» (незавершённые merge не пропускает)?
+# Up to which moment is the data settled (in-progress merges hold it back)?
 boundary = tracker.boundary(["orders", "order_items"])   # datetime
 
-# Когда таблицу меняли в последний раз и менялись ли строки?
+# When did the table last change, and did rows actually change?
 last = tracker.last_merge("orders")                       # MergeRecord | None
 last.started_at, last.finished_at, last.changed
 
-# Граница последнего успешного обновления витрины (её «водяной знак»)?
+# The boundary of the mart's last successful update (its watermark)?
 tracker.watermark("orders_by_customer")                   # datetime | None
 
-# Были ли реальные изменения после момента since?
-tracker.changed_since(["orders", "order_items"], since=last_run_at)  # bool
+# Did any of the tables really change after `since`?
+tracker.is_changed_since(["orders", "order_items"], since=last_run_at)  # bool
 ```
 
-- `boundary(...)` — безопасная граница: до этого момента всё закоммичено и согласовано. Это предел для **водяного знака**, а не для чтения (читать можно и дальше).
-- `changed_since(...)` — было ли реальное изменение после `since`. Merge, который ничего не изменил (no-op), изменением не считается.
+- `boundary(...)` — the safe boundary: everything committed up to this moment is visible and settled. It caps the **watermark**, not the read (you may read further).
+- `is_changed_since(...)` — whether there was a real change after `since`. A no-op merge (nothing changed) does not count.
 
-### Как это хранится
+### How it is stored
 
-Одна таблица `dbmerge_tracking` (имя настраивается):
+One table, `dbmerge_tracking` (the name is configurable):
 
-| колонка | смысл |
+| column | meaning |
 |---|---|
-| `table_name` | какая таблица мержилась |
-| `started_at` / `finished_at` | начало / конец merge |
-| `heartbeat_at` | «я ещё жив» — обновляется, пока merge идёт |
-| `changed` | изменились ли строки (ставится при завершении) |
-| `boundary` | для витрин: окно, обработанное этим merge |
+| `table_name` | which table was merged |
+| `started_at` / `finished_at` | when the merge started / finished |
+| `heartbeat_at` | "I'm still alive" — refreshed while the merge runs |
+| `changed` | whether rows changed (set on finish) |
+| `boundary` | for marts: the window this merge processed |
 
-Правило хранения: **для каждой таблицы — не больше одной завершённой строки (последняя) и все незавершённые**. История не копится.
+Storage rule: **at most one finished row per table (the latest), plus any number of unfinished rows**. History does not grow.
 
-### Если merge упал
+### When a merge crashes
 
-Упавший merge оставляет строку с пустым `finished_at`, её heartbeat со временем протухает. Такая строка перестаёт держать `boundary`, а `recover_abandoned()` помечает её как «изменилась» — чтобы витрины, пропустившие этот merge, проснулись:
+A crashed merge leaves a row with an empty `finished_at`; its heartbeat eventually goes stale. Such a row stops holding the `boundary`, and `recover_abandoned()` marks it as changed so that marts which missed it wake up:
 
 ```python
-tracker.recover_abandoned()   # вызывайте в начале своего цикла
+tracker.recover_abandoned()   # call it at the start of your loop
 ```
 
-## Mart (витрины)
+## Marts
 
-### Зачем
+### Why
 
-Витрина — это таблица, собранная из одной или нескольких исходных. Её нужно пересчитывать, когда источники меняются, и не трогать, когда они не менялись. `MartLoop` берёт на себя всю механику «когда запускать», оставляя вам только сам расчёт.
+A mart is a table built from one or more source tables. It must be recalculated when the sources change, and left alone when they don't. `MartLoop` owns the "when to run" machinery and leaves only the calculation to you.
 
-### Минимальный пример
+### Minimal example
 
 ```python
 from dbmerge import dbmerge
 from dbmerge.tracking import MergeTracker
-from dbmerge.mart import Handler
+from dbmerge.mart import MartHandler
 
-class OrdersByCustomer(Handler):
-    name = "orders_by_customer"             # уникальное имя витрины (для аренды)
-    mart_table = "orders_by_customer"       # таблица-результат
-    sources = ["orders", "order_items"]     # за чем следить
+class OrdersByCustomer(MartHandler):
+    name = "orders_by_customer"             # unique mart name (for the lease)
+    mart_table = "orders_by_customer"       # the result table
+    sources = ["orders", "order_items"]     # what it reads
     min_interval = 5.0
 
     def setup(self, ctx):
-        # одноразовый DDL: создать витрину
-        with dbmerge(ctx.engine, table_name=self.mart_table, data=[],
-                     key=["customer_id"]) as merge:
-            merge.exec()
+        # One-time DDL: create the mart table. dbmerge can not create an empty table, so the
+        # DDL goes here and handle() merges into it. Anything the mart's SELECT needs (views,
+        # indexes) is created here too.
+        self.execute(ctx, """
+            CREATE TABLE IF NOT EXISTS orders_by_customer (
+                customer_id INTEGER PRIMARY KEY,
+                total NUMERIC
+            )
+        """)
 
     def handle(self, ctx):
-        # читаем всё, что изменилось после знака — без верхней границы: строки правее
-        # ctx.boundary обработаются сейчас и повторно в следующем окне
+        # Read everything changed since the watermark; the read is unbounded — rows to the right of
+        # ctx.boundary are processed now and again in the next window.
+        rows = build_rows(since=ctx.last_run_at)   # your SELECT, e.g. ... WHERE merged_on > :last_run_at
         with dbmerge(ctx.engine, table_name=self.mart_table,
-                     data=build_rows(since=ctx.last_run_at),
-                     key=["customer_id"]) as merge:
-            ctx.tracker.track(merge, boundary=ctx.boundary)
+                     data=rows, key=["customer_id"]) as merge:
+            ctx.tracker.exec(merge, boundary=ctx.boundary)
 
     def rebuild(self, ctx):
-        # полная пересборка; по умолчанию — то же, что handle с full_rebuild=True
+        # a full rebuild; by default the same as handle with full_rebuild=True
         self.handle(ctx)
 
-tracker = MergeTracker(engine)             # один трекер на процесс
+tracker = MergeTracker(engine)             # one tracker per process
 OrdersByCustomer().run_forever(engine, tracker)
 ```
 
-Низкоуровневый вариант без класса — `MartLoop(engine, tracker, name=..., mart_table=..., sources=..., handle=handle)`, где `handle` — обычная функция. `Handler` — удобная обёртка над ним.
+The low-level alternative without a class is `MartLoop(engine, tracker, name=..., mart_table=..., sources=..., handle=handle)`, where `handle` is a plain function. `MartHandler` is a convenience wrapper over it.
 
-Важно: чтобы `MartLoop` видел изменения источников, их merge тоже нужно оборачивать в `tracker.track(...)` — как в разделе Tracking.
+Important: for `MartLoop` to see source changes, the source merges must also be wrapped in `tracker.exec(...)` — as in the Tracking section.
 
-### Что делает MartLoop
+### What MartLoop does
 
-Каждый обход (раз в `poll_interval` секунд):
+Each pass (every `poll_interval` seconds):
 
-1. Помечает протухшие merge (`recover_abandoned`).
-2. Захватывает имя витрины — чтобы один mart не считали два процесса сразу.
-3. Читает свой «водяной знак»: `last_run_at = tracker.watermark(mart_table)` (первый запуск — с самого начала).
-4. Считает границу: `boundary = tracker.boundary(sources)`.
-5. Спрашивает: `tracker.changed_since(sources, since=last_run_at)`.
-   - нет изменений → пропуск;
-   - изменения есть, но `boundary <= last_run_at` → ждём (источник ещё в процессе записи).
-6. Иначе вызывает `handle(ctx)`.
+1. Recovers abandoned merges (`recover_abandoned`).
+2. Claims the mart name — so two processes never build the same mart.
+3. Reads its watermark: `last_run_at = tracker.watermark(mart_table)` (the first run starts from the beginning).
+4. Computes the boundary: `boundary = tracker.boundary(sources)`.
+5. Asks: `tracker.is_changed_since(sources, since=last_run_at)`.
+   - no change → skip;
+   - a change, but `boundary <= last_run_at` → wait (a source is still being written).
+6. Otherwise calls `handle(ctx)`.
 
-Главное: **решение «обновлять ли» принимается по датам, а не по сигналу**. Событие, которое «потерялось» (процесс упал, витрина была выключена), никуда не денется — следующий обход увидит его через `changed_since`. Поэтому `handle` обязан быть **идемпотентным**: его могут выполнить повторно.
+The key point: **"should I update" is decided from timestamps, not from a signal**. An event that was "lost" (a crash, a switched-off mart) is not lost — the next pass sees it through `is_changed_since`. Therefore `handle` must be **idempotent**: it may run again.
 
-### Водяной знак
+### The watermark
 
-`last_run_at` хранить отдельно не нужно. Когда `handle` завершает merge витрины с параметром `boundary=ctx.boundary`, этот `boundary` записывается в tracking-строку витрины — следующий запуск начнёт ровно с него.
+You don't store `last_run_at` separately. When `handle` finishes the mart merge with `boundary=ctx.boundary`, that boundary is written to the mart's tracking row — the next run starts exactly from it.
 
-Чтение в обработчике — **без верхней границы**: выбирайте строки по `> ctx.last_run_at`. Строки правее `ctx.boundary` обработаются сразу (витрина свежее) и повторно в следующем окне (at-least-once). Ограничен только **знак**: он всегда равен `ctx.boundary`, иначе курсор перепрыгнул бы ещё не закоммиченные строки незавершённого merge.
+The read in the handler is **unbounded**: select rows by `> ctx.last_run_at`. Rows to the right of `ctx.boundary` are processed now and again in the next window (at-least-once). Only the **watermark** is capped: it always equals `ctx.boundary`, otherwise the cursor would jump over rows of an unfinished merge that aren't committed yet.
 
-«Пересобрать витрину с нуля» = удалить её завершённую строку:
+"Rebuild the mart from scratch" = delete its finished row:
 
 ```python
-tracker.reset("orders_by_customer")   # следующий запуск пойдёт от начала
+tracker.reset("orders_by_customer")   # the next run starts from the beginning
 ```
 
-### Контекст обработчика
+### The handler context
 
 ```python
 @dataclass
@@ -198,20 +203,20 @@ class MartContext:
     name: str
     mart_table: str
     sources: frozenset[str]
-    last_run_at: datetime      # откуда читать изменения
-    boundary: datetime         # куда двигать водяной знак (не граница чтения)
-    full_rebuild: bool         # True на первом прогоне / после reset
-    lease_is_mine: Any         # SQL-условие «имя всё ещё наше»
+    last_run_at: datetime      # where to read changes from
+    boundary: datetime         # where to move the watermark (not a read cap)
+    full_rebuild: bool         # True on the first run / after reset
+    lease_is_mine: Any         # SQL condition "the mart name is still ours"
 ```
 
-## Схема таблицы
+## Table schema
 
 ```
 dbmerge_tracking
     id            String(64)  PK
-    owner         String(255) NULL      -- NULL у lease-строк («свободно»)
+    owner         String(255) NULL      -- NULL for lease rows ("free")
     table_name    String(255) NOT NULL
-    database_type String(64)  NULL      -- где живёт слитая таблица
+    database_type String(64)  NULL      -- where the merged table lives
     server        String(255) NULL
     database_name String(255) NULL
     started_at    DateTime(tz) NOT NULL
@@ -221,50 +226,58 @@ dbmerge_tracking
     boundary      DateTime(tz) NULL
 ```
 
-## Справочник
+## Reference
 
 ### MergeTracker
 
-| метод | что делает |
+| member | what it does |
 |---|---|
-| `MergeTracker(engine, …)` | долгоживущий журнал: один трекер обслуживает много merge. Опционально `with MergeTracker(engine) as tracker:` останавливает heartbeat при выходе |
-| `track(merge, *, boundary=None, changed=None, **exec_kwargs)` | пишет tracking-строку, вызывает `merge.exec(**exec_kwargs)`, завершает строку; возвращает `(MergeRecord, mergeResult)` |
-| `boundary(table_names, database=None)` | безопасная верхняя граница по таблицам |
-| `last_merge(table_name, database=None)` | последняя завершённая строка или `None` |
-| `watermark(table_name, database=None)` | граница последнего успешного merge витрины или `None` |
-| `changed_since(table_names, since, database=None)` | были ли реальные изменения после `since` |
-| `recover_abandoned()` | протухшие незавершённые → пометить как «изменилась» |
-| `reset(table_name)` | удалить завершённую строку (пересборка с нуля) |
+| `MergeTracker(engine, table_name=..., schema=..., ...)` | a long-lived journal; one tracker serves many merges. Optionally `with MergeTracker(engine) as tracker:` stops the heartbeat on exit |
+| `exec(merge, *, boundary=None, changed=None, **exec_kwargs)` | writes a tracking row, runs `merge.exec(**exec_kwargs)`, finishes the row; returns `(MergeRecord, mergeResult)` |
+| `boundary(table_names, database=None)` | the safe upper boundary over these tables |
+| `last_merge(table_name, database=None)` | the last finished row, or `None` |
+| `watermark(table_name, database=None)` | the boundary of the mart's last successful merge, or `None` |
+| `is_changed_since(table_names, since, database=None)` | whether there was a real change after `since` |
+| `recover_abandoned()` | marks stale unfinished rows as changed |
+| `reset(table_name)` | deletes the finished row (rebuild from scratch) |
 
-`database_of(engine)` возвращает `Database(type, server, database)` — идентификатор базы движка; его подставляют в `database=` методов чтения. Аренда имени витрины — класс `Lease` в той же таблице (ключ `lease:<name>`).
+`database_of(engine)` returns `Database(type, server, database)` — the identity of the engine's database; pass it as `database=` to the read methods. The mart-name lease is the `Lease` class in the same table (key `lease:<name>`).
 
 ### MartLoop
 
-| метод | что делает |
+| member | what it does |
 |---|---|
-| `run_forever()` | блокирующий цикл опроса |
-| `run_if_pending()` | один обход (для cron или своего цикла) |
-| `request_stop()` / `close()` | остановка |
+| `run_forever()` | a blocking poll loop |
+| `run_if_pending()` | one pass (for cron or your own loop) |
+| `request_stop()` / `close()` | stop |
 
-### Handler
+`run_mart(mart, engine, tracker=None, *, poll_interval=2.0, schema=None, database=None, lease=None)`
+runs one mart until `request_stop()` is called: it wraps the handler into a `MartLoop`, creates a
+`MergeTracker` and a `Lease` for its name when none are passed, and runs the loop. `request_stop()`
+asks every loop started by `run_mart` to stop after its current pass — wire it to SIGTERM/SIGINT in
+a runner (see [examples/runner_marts.py](examples/runner_marts.py)).
 
-Базовый класс витрины: объявите `name`, `mart_table`, `sources` и реализуйте методы.
+### MartHandler
 
-| метод | что делает |
+The base class of a mart: declare `name`, `mart_table`, `sources` and implement the methods.
+
+| member | what it does |
 |---|---|
-| `setup(ctx)` | одноразовая подготовка перед первым прогоном (DDL) |
-| `handle(ctx)` | инкрементальная работа; записывает знак через `tracker.track(..., boundary=ctx.boundary)` |
-| `rebuild(ctx)` | полная пересборка; по умолчанию — `handle` с `full_rebuild=True` |
-| `changed_since(ctx, *columns)` | OR-условие `column > ctx.last_run_at` |
-| `execute(ctx, sql, **params)` / `query(ctx, sql, **params)` | выполнить SQL в своей транзакции / вернуть строки |
-| `loop(engine, tracker, ...)` | собрать `MartLoop` |
-| `run_forever(engine, tracker, ...)` | запустить цикл |
+| `setup(ctx)` | one-time preparation before the first run (DDL) |
+| `handle(ctx)` | the incremental work; records the watermark via `tracker.exec(..., boundary=ctx.boundary)` |
+| `rebuild(ctx)` | a full rebuild; by default `handle` with `full_rebuild=True` |
+| `changed_since(ctx, *columns)` | an OR of `column > ctx.last_run_at` |
+| `execute(ctx, sql, **params)` / `query(ctx, sql, **params)` | run SQL in its own transaction / return rows |
+| `loop(engine, tracker, ...)` | build a `MartLoop` |
+| `run_forever(engine, tracker, ...)` | run the loop |
 
-`as_handler(obj)` приводит экземпляр `Handler`, модуль или функцию с атрибутами к `Handler`.
+`as_handler(obj)` normalizes a `MartHandler` instance, a module, or a callable with attributes into a `MartHandler`.
 
-## Ограничения, о которых стоит помнить
+## Things to remember
 
-- **Idempotency.** `handle` может выполниться повторно — данные не должны задваиваться.
-- **Latency.** Витрина обновляется с задержкой до `poll_interval` (это опрос, не push).
-- **`merged_on_field`.** Исходные таблицы мержатся с колонкой времени изменения, а обработчик выбирает строки по `> ctx.last_run_at` — иначе нечего будет «догонять» по окну.
-- **Один процесс на витрину.** Имя витрины захватывается арендой; второй процесс пропускает обход.
+- **Idempotency.** `handle` may run again — don't double-count.
+- **Latency.** The mart updates with a delay of up to `poll_interval` (this is polling, not push).
+- **`merged_on_field`.** Source tables are merged with a change-timestamp column, and the handler selects rows by `> ctx.last_run_at` — otherwise there is nothing to "catch up" over the window.
+- **One process per mart.** The mart name is claimed by a lease; a second process skips the pass.
+
+

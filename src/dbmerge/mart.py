@@ -10,9 +10,12 @@ machinery and leaves only the calculation to a ``handle`` callable:
 * it runs ``handle`` only when the sources really changed since the watermark.
 
 The decision is made from timestamps, not from a signal: a change that was missed (a crash, a mart
-that was switched off) is seen by the next pass through ``changed_since``. ``handle`` must therefore
+that was switched off) is seen by the next pass through ``is_changed_since``. ``handle`` must therefore
 be idempotent — it may run again. The handler records the new watermark itself by passing
-``boundary=ctx.boundary`` to ``tracker.track``.
+``boundary=ctx.boundary`` to ``tracker.exec``.
+
+``run_mart`` is the convenience entry point for a process that runs several marts: it wraps a handler
+into a ``MartLoop`` with a lease and runs it until :func:`request_stop` is called.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ from sqlalchemy.engine import Engine
 
 from .dbmerge import logger
 from .lease import Lease
-from .tracking import Database, MergeTracker
+from .tracking import Database, MergeTracker, _instance_owner
 
 # The first run reads from the beginning of time rather than from a missing watermark.
 EPOCH = datetime(1900, 1, 1, tzinfo=timezone.utc)
@@ -126,7 +129,7 @@ class MartLoop:
             # A merge that started before our watermark is still running: nothing is settled yet.
             return False
 
-        if not self.tracker.changed_since(self.sources, since=last_run_at,
+        if not self.tracker.is_changed_since(self.sources, since=last_run_at,
                                           database=self.database):
             return False
 
@@ -164,7 +167,7 @@ class MartLoop:
             t.c.heartbeat_at >= func.now() - timedelta(seconds=self._lease.ttl))
 
 
-class Handler:
+class MartHandler:
     """Base class for a mart: declare sources and the work, and let MartLoop drive the rest.
 
     Subclass and set ``name``, ``mart_table`` and ``sources``, then implement ``handle`` (and
@@ -181,7 +184,7 @@ class Handler:
         """One-time preparation before the first run (e.g. create the mart table)."""
 
     def handle(self, ctx: MartContext) -> None:
-        """The incremental work. Records the watermark via tracker.track(..., boundary=ctx.boundary)."""
+        """The incremental work. Records the watermark via tracker.exec(..., boundary=ctx.boundary)."""
         raise NotImplementedError(f"{type(self).__name__}.handle(ctx) is not implemented")
 
     def rebuild(self, ctx: MartContext) -> None:
@@ -214,15 +217,19 @@ class Handler:
         self.loop(engine, tracker, **kwargs).run_forever()
 
 
-def as_handler(obj) -> Handler:
-    """Normalize a handler declared as a Handler instance, a module or a callable.
+# Backward-compatible alias; prefer MartHandler in new code.
+Handler = MartHandler
 
-    A module or a callable is read for the same attributes a Handler declares; a callable without a
-    separate ``handle`` attribute is the handle itself.
+
+def as_handler(obj) -> MartHandler:
+    """Normalize a handler declared as a MartHandler instance, a module or a callable.
+
+    A module or a callable is read for the same attributes a MartHandler declares; a callable
+    without a separate ``handle`` attribute is the handle itself.
     """
-    if isinstance(obj, Handler):
+    if isinstance(obj, MartHandler):
         return obj
-    handler = Handler()
+    handler = MartHandler()
     for attr in ("name", "mart_table", "sources", "setup", "rebuild", "min_interval"):
         if hasattr(obj, attr):
             setattr(handler, attr, getattr(obj, attr))
@@ -231,3 +238,40 @@ def as_handler(obj) -> Handler:
     elif callable(obj):
         handler.handle = obj
     return handler
+
+
+_running_loops: list["MartLoop"] = []
+
+
+def run_mart(mart, engine: Engine, tracker: MergeTracker | None = None, *,
+             poll_interval: float = 2.0, schema: str | None = None,
+             database: Database | None = None, lease: Lease | None = None) -> None:
+    """Run one mart until :func:`request_stop` is called.
+
+    ``mart`` is a ``MartHandler`` instance, a module or a callable (see :func:`as_handler`). The
+    ``MergeTracker`` and the ``Lease`` for the mart's name are created automatically when not
+    given, so two processes never build the same mart; pass them to share one across several
+    ``run_mart`` calls.
+    """
+    handler = as_handler(mart)
+    if tracker is None:
+        tracker = MergeTracker(engine, schema=schema)
+    if lease is None:
+        lease = Lease(engine, tracker.table, _instance_owner("mart"))
+    loop = handler.loop(engine, tracker, poll_interval=poll_interval, lease=lease,
+                        schema=schema, database=database)
+    _running_loops.append(loop)
+    try:
+        loop.run_forever()
+    finally:
+        _running_loops.remove(loop)
+
+
+def request_stop(*_args) -> None:
+    """Ask every loop started by :func:`run_mart` to stop after its current pass.
+
+    Accepts the two arguments a signal handler receives, so it can be passed directly to
+    ``signal.signal``.
+    """
+    for loop in list(_running_loops):
+        loop.request_stop()
