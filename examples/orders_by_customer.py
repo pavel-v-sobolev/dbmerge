@@ -23,6 +23,9 @@ from sqlalchemy import and_, text, tuple_
 from dbmerge import dbmerge
 from dbmerge.mart import MartContext, MartHandler
 
+# The schema where the source and the mart live; tables are declared as (schema, table) tuples.
+SCHEMA = "target"
+
 
 def _as_date(value):
     if isinstance(value, datetime):
@@ -32,25 +35,31 @@ def _as_date(value):
     return date.fromisoformat(str(value)[:10])
 
 
+def _qualified(ref):
+    """'schema.table' for a (schema, table) tuple, or just 'table' when there is no schema."""
+    schema, table = ref
+    return f"{schema}.{table}" if schema else table
+
+
 class OrdersByCustomer(MartHandler):
     name = "orders_by_customer"        # unique mart name (for the lease)
-    mart_table = "orders_by_customer"  # the result table
-    sources = ["orders"]               # read tables: a change in any of them triggers a run
+    mart_table = (SCHEMA, "orders_by_customer")  # the result table: (schema, table)
+    sources = [(SCHEMA, "orders")]   # read tables: (schema, table); a change in any triggers a run
 
     def setup(self, ctx: MartContext) -> None:
         # One-time DDL: the aggregate view and the mart table. Deleted rows are excluded from the
         # sum, so a soft deletion updates the total in place.
-        self.execute(ctx, "DROP VIEW IF EXISTS orders_by_customer_view")
-        self.execute(ctx, """
-            CREATE VIEW orders_by_customer_view AS
+        self.execute(ctx, f"DROP VIEW IF EXISTS {SCHEMA}.orders_by_customer_view")
+        self.execute(ctx, f"""
+            CREATE VIEW {SCHEMA}.orders_by_customer_view AS
             SELECT order_date,
                    customer_id,
                    SUM(CASE WHEN is_deleted THEN 0 ELSE amount END) AS total_amount
-              FROM orders
+              FROM {SCHEMA}.orders
              GROUP BY order_date, customer_id
         """)
-        self.execute(ctx, """
-            CREATE TABLE IF NOT EXISTS orders_by_customer (
+        self.execute(ctx, f"""
+            CREATE TABLE IF NOT EXISTS {SCHEMA}.orders_by_customer (
                 order_date DATE,
                 customer_id INTEGER,
                 total_amount NUMERIC,
@@ -61,9 +70,10 @@ class OrdersByCustomer(MartHandler):
     def _changed_keys(self, ctx: MartContext):
         # The subquery reads the changed composite keys from the raw source table, so the predicate
         # merged_on > :watermark can use the merged_on index.
-        return text("""
+        source = _qualified(next(iter(ctx.sources)))
+        return text(f"""
             SELECT order_date, customer_id
-              FROM orders
+              FROM {source}
              WHERE merged_on > :watermark
         """).bindparams(watermark=ctx.watermark)
 
@@ -71,8 +81,9 @@ class OrdersByCustomer(MartHandler):
         # Incremental work: upsert only the changed (order_date, customer_id) keys. No
         # delete_condition is needed — a deleted order drops out of the sum in place.
         changed = self._changed_keys(ctx)
-        with dbmerge(ctx.engine, table_name=self.mart_table, schema=ctx.schema,
-                     source_table_name="orders_by_customer_view", source_schema=ctx.schema,
+        mart_schema, mart_table = ctx.mart_table
+        with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
+                     source_table_name="orders_by_customer_view", source_schema=mart_schema,
                      key=["order_date", "customer_id"]) as merge:
             source_key = tuple_(merge.source_table.c["order_date"],
                                 merge.source_table.c["customer_id"])
@@ -99,8 +110,9 @@ class OrdersByCustomer(MartHandler):
             next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
             ends = date(next_year, next_month, 1)
             if not (ctx.rebuild_from and label <= ctx.rebuild_from):
-                with dbmerge(ctx.engine, table_name=self.mart_table, schema=ctx.schema,
-                             source_table_name="orders_by_customer_view", source_schema=ctx.schema,
+                mart_schema, mart_table = ctx.mart_table
+                with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
+                             source_table_name="orders_by_customer_view", source_schema=mart_schema,
                              key=["order_date", "customer_id"]) as merge:
                     d = merge.source_table.c["order_date"]
                     merge.exec(source_condition=and_(d >= starts, d < ends))

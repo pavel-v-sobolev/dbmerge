@@ -9,8 +9,7 @@ import pytest
 from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.exc import NoSuchModuleError
 
-from dbmerge import (MergeTracker, dbmerge, IncorrectParameter, Database, database_of,
-                     drop_table_if_exists)
+from dbmerge import (MergeTracker, dbmerge, IncorrectParameter, drop_table_if_exists)
 
 from conftest import engines, make_engine
 
@@ -128,7 +127,7 @@ def test_recover_abandoned_marks_changed(engine, tracker):
     assert tracker.is_changed_since(["orders"], since=datetime(2000, 1, 1)) is True
 
 
-def test_boundary_holds_in_progress_merge(tracker):
+def test_safe_boundary_holds_in_progress_merge(tracker):
     seen = {}
 
     class SlowMerge:
@@ -137,17 +136,17 @@ def test_boundary_holds_in_progress_merge(tracker):
         merge_finished = False
 
         def exec(self, **kwargs):
-            seen["boundary"] = tracker.boundary(["orders"])
+            seen["safe_boundary"] = tracker.safe_boundary(["orders"])
             return None
 
     record, _ = tracker.exec(SlowMerge(), changed=True)
     # While the merge ran, the boundary was held at its start (engine precision may vary).
-    assert seen["boundary"] <= record.started_at
+    assert seen["safe_boundary"] <= record.started_at
     # Once finished, it no longer holds the boundary.
-    assert tracker.boundary(["orders"]) >= record.started_at
+    assert tracker.safe_boundary(["orders"]) >= record.started_at
 
 
-def test_boundary_ignores_abandoned_merge(engine, tracker):
+def test_safe_boundary_ignores_abandoned_merge(engine, tracker):
     class Boom(Exception):
         pass
 
@@ -165,7 +164,7 @@ def test_boundary_ignores_abandoned_merge(engine, tracker):
     with engine.connect() as conn:
         started_at = conn.scalar(
             select(tracker.table.c.started_at).where(tracker.table.c.finished_at.is_(None)))
-    assert tracker.boundary(["orders"]) > started_at
+    assert tracker.safe_boundary(["orders"]) > started_at
 
 
 def test_watermark_and_reset(engine, tracker):
@@ -212,27 +211,24 @@ def test_tracker_rejects_untransactable_engine():
         MergeTracker(eng)
 
 
-def test_database_identity_recorded(engine, tracker):
+def test_schema_identity_recorded(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         record, _ = tracker.exec(merge)
 
-    db = database_of(engine)
-    assert record.database_type == db.type
-    assert record.server == db.server
-    assert record.database_name == db.database
+    assert record.table_name == "orders"
+    assert record.schema == (_schema(engine) or "")
 
     last = tracker.last_merge("orders")
-    assert last.database_type == db.type
+    assert last.schema == (_schema(engine) or "")
 
 
-def test_database_filter(engine, tracker):
+def test_schema_filter(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         tracker.exec(merge)
 
-    db = database_of(engine)
-    other = Database("postgresql", "other:5432", "otherdb")
-    assert tracker.last_merge("orders", database=db) is not None
-    assert tracker.last_merge("orders", database=other) is None
+    schema = _schema(engine) or ""
+    assert tracker.last_merge("orders", schema=schema) is not None
+    assert tracker.last_merge("orders", schema="other") is None
 
 
 def test_exec_with_lease_skips_and_waits(engine):

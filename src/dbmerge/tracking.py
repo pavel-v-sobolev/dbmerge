@@ -9,7 +9,7 @@ tables) asks about a table:
   change.
 * "Is a merge running right now, so the table may be half-written?" — a merge records a row before
   it starts and marks it finished afterwards. While it runs, a background thread refreshes the row's
-  heartbeat, and ``boundary`` returns the earliest start of a live merge.
+  heartbeat, and ``safe_boundary`` returns the earliest start of a live merge.
 
 All of it lives in one table (one row per merge). For every table name the table keeps the last
 finished row and any number of unfinished rows: a finished merge replaces earlier finished rows for
@@ -34,10 +34,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Iterable
 
-from sqlalchemy import (Boolean, Column, DateTime, Engine, MetaData, String, Table, and_,
+from sqlalchemy import (Boolean, Column, DateTime, Engine, MetaData, String, Table,
                         delete, func, inspect, insert, or_, schema, select, update)
 
-from .dbmerge import IncorrectParameter, _is_clickhouse_client, logger, mergeResult
+from .dbmerge import IncorrectParameter, logger, mergeResult
 
 # The default name of the tracking table. Overridable; created lazily on first use.
 TRACKING_TABLE = "dbmerge_tracking"
@@ -84,41 +84,11 @@ class MergeRecord:
     """What the tracking table recorded about one merge."""
 
     table_name: str
-    database_type: str
-    server: str
-    database_name: str
+    schema: str
     started_at: datetime
     finished_at: datetime | None
     changed: bool
     watermark: datetime | None
-
-
-@dataclass(frozen=True)
-class Database:
-    """Where a merged table lives: the dialect, the server and the database name.
-
-    One tracking table can record merges from several databases (e.g. source tables in PostgreSQL
-    and a mart in ClickHouse). These three values keep rows of equal table names apart.
-    """
-
-    type: str
-    server: str
-    database: str
-
-
-def database_of(engine) -> Database:
-    """The identity of the database an engine points at."""
-    if _is_clickhouse_client(engine):
-        host = getattr(engine, "host", "") or ""
-        port = getattr(engine, "port", None)
-        server = f"{host}:{port}" if port else host
-        return Database(type="clickhousedb", server=server,
-                        database=getattr(engine, "database", "") or "")
-    url = engine.url
-    server = url.host or ""
-    if url.port is not None:
-        server = f"{server}:{url.port}"
-    return Database(type=engine.dialect.name, server=server, database=url.database or "")
 
 
 def _matches_column(column, value):
@@ -129,6 +99,16 @@ def _matches_column(column, value):
     return column == value
 
 
+def _as_names(table_names) -> list[str]:
+    """A single table name or an iterable of names, normalized to a list.
+
+    A bare string is one name, not an iterable of characters, so it is wrapped.
+    """
+    if isinstance(table_names, str):
+        return [table_names]
+    return list(table_names)
+
+
 def _tracking_table(metadata: MetaData, name: str, schema: str | None) -> Table:
     return Table(
         name, metadata,
@@ -136,10 +116,9 @@ def _tracking_table(metadata: MetaData, name: str, schema: str | None) -> Table:
         # NULL only for lease rows ("free"); a merge row always names its process owner.
         Column("owner", String(255), nullable=True),
         Column("table_name", String(255), nullable=False),
-        # Where the merged table lives, so equal table names in different databases stay apart.
-        Column("database_type", String(64), nullable=True),
-        Column("server", String(255), nullable=True),
-        Column("database_name", String(255), nullable=True),
+        # The schema of the merged table ("" when there is none). Together with table_name it
+        # is the identity; two databases with a conflicting name need separate tracking tables.
+        Column("schema", String(255), nullable=True),
         # All marks are by the database clock: the one clock the writer and the reader share.
         Column("started_at", DateTime(timezone=True), nullable=False),
         Column("finished_at", DateTime(timezone=True), nullable=True),
@@ -152,9 +131,9 @@ def _tracking_table(metadata: MetaData, name: str, schema: str | None) -> Table:
         schema=schema,
     )
 
-def _lease_name(database: Database, table_name: str) -> str:
-    """A stable per-(database, table) key for the exec lease."""
-    return f"{database.type}|{database.server}|{database.database}|{table_name}"
+def _lease_name(schema: str, table_name: str) -> str:
+    """A stable per-(schema, table) key for the exec lease."""
+    return f"{schema}|{table_name}"
 
 
 class MergeTracker:
@@ -271,12 +250,11 @@ class MergeTracker:
         if wait_interval <= 0:
             raise IncorrectParameter("wait_interval must be positive")
 
-        merge_engine = getattr(merge, "engine", None)
-        database = database_of(merge_engine) if merge_engine is not None else Database("", "", "")
+        schema = getattr(merge, "schema", None) or ""
 
         lease_name = None
         if with_lease:
-            lease_name = _lease_name(database, table_name)
+            lease_name = _lease_name(schema, table_name)
             if not self._acquire_lease(lease_name, wait=wait_lease, timeout=wait_timeout,
                                        interval=wait_interval):
                 logger.info('Skipping merge of "%s": its lease is held by another process',
@@ -284,7 +262,7 @@ class MergeTracker:
                 return (None, None)
 
         try:
-            row_id, started_at = self._begin(table_name, database)
+            row_id, started_at = self._begin(table_name, schema)
             try:
                 merge_result = merge.exec(**exec_kwargs)
             except BaseException:
@@ -296,8 +274,7 @@ class MergeTracker:
                            + getattr(merge, "updated_row_count", 0)
                            + getattr(merge, "deleted_row_count", 0)) > 0
             finished_at = self._finish(row_id, table_name, changed, next_watermark)
-            return (MergeRecord(table_name=table_name, database_type=database.type,
-                                server=database.server, database_name=database.database,
+            return (MergeRecord(table_name=table_name, schema=schema,
                                 started_at=started_at, finished_at=finished_at,
                                 changed=changed, watermark=next_watermark),
                     merge_result)
@@ -305,15 +282,14 @@ class MergeTracker:
             if lease_name is not None:
                 self._release_lease(lease_name)
 
-    def _begin(self, table_name: str, database: Database):
+    def _begin(self, table_name: str, schema: str):
         """Insert the row before the merge and register it for heartbeat. Returns (id, started_at)."""
         row_id = str(uuid.uuid4())
         with self.engine.connect() as conn:
             now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             conn.execute(insert(self.table).values(
                 id=row_id, owner=self.owner, table_name=table_name,
-                database_type=database.type, server=database.server,
-                database_name=database.database,
+                schema=schema,
                 started_at=now, heartbeat_at=now))
             conn.commit()
         with self._lock:
@@ -388,14 +364,16 @@ class MergeTracker:
 
     # ------------------------------------------------------------------ reading
 
-    def boundary(self, table_names: Iterable[str], database: Database | None = None) -> datetime:
+    def safe_boundary(self, table_names: str | Iterable[str],
+                      schema: str | None = None) -> datetime:
         """The upper bound of safe reading: min(now, earliest start of a live merge on these tables.
 
-        An unfinished merge whose heartbeat is stale does not hold the boundary, so a dead process
-        blocks readers for at most heartbeat_ttl. The time and the minimum come from one connection,
-        so "now" for the cutoff and "now" for the bound are the same clock reading.
+        ``table_names`` is a single name or an iterable of names. An unfinished merge whose
+        heartbeat is stale does not hold the boundary, so a dead process blocks readers for at
+        most heartbeat_ttl. The time and the minimum come from one connection, so "now" for the
+        cutoff and "now" for the bound are the same clock reading.
         """
-        names = list(table_names)
+        names = _as_names(table_names)
         if not names:
             return self._db_now()
         t = self.table
@@ -404,54 +382,61 @@ class MergeTracker:
             cutoff = now - timedelta(seconds=self.heartbeat_ttl)
             conds = [t.c.table_name.in_(names), t.c.finished_at.is_(None),
                      t.c.heartbeat_at > cutoff]
-            if database is not None:
-                conds.append(self._database_where(database))
+            if schema is not None:
+                conds.append(_matches_column(t.c.schema, schema))
             earliest = conn.scalar(select(func.min(t.c.started_at)).where(*conds))
         return min(now, earliest) if earliest is not None else now
 
-    def last_merge(self, table_name: str, database: Database | None = None) -> MergeRecord | None:
+    def last_merge(self, table_name: str, schema: str | None = None) -> MergeRecord | None:
         """The last finished merge of a table, or None if it has none."""
         t = self.table
         conds = [t.c.table_name == table_name, t.c.finished_at.is_not(None)]
-        if database is not None:
-            conds.append(self._database_where(database))
+        if schema is not None:
+            conds.append(_matches_column(t.c.schema, schema))
         with self.engine.connect() as conn:
             row = conn.execute(
-                select(t.c.table_name, t.c.database_type, t.c.server, t.c.database_name,
-                       t.c.started_at, t.c.finished_at, t.c.changed, t.c.watermark)
+                select(t.c.table_name, t.c.schema, t.c.started_at, t.c.finished_at,
+                       t.c.changed, t.c.watermark)
                 .where(*conds)
                 .order_by(t.c.finished_at.desc())
                 .limit(1)).first()
         if row is None:
             return None
-        return MergeRecord(table_name=row.table_name, database_type=row.database_type,
-                           server=row.server, database_name=row.database_name,
+        return MergeRecord(table_name=row.table_name, schema=row.schema,
                            started_at=row.started_at, finished_at=row.finished_at,
                            changed=bool(row.changed), watermark=row.watermark)
 
-    def watermark(self, table_name: str, database: Database | None = None) -> datetime | None:
-        """The watermark of the last successful merge of a mart, i.e. where its next update starts.
+    def watermark(self, table_names: str | Iterable[str],
+                  schema: str | None = None) -> datetime | None:
+        """The watermark of the last successful merge over ``table_names`` — where the next update starts.
 
-        Only successful finishes carry a watermark; a recovered (crashed) row has none, so a crash
-        never advances the watermark. Returns None when the mart has no successful run yet.
+        ``table_names`` is a single name or an iterable of names (for a mart, its one table). Only
+        successful finishes carry a watermark; a recovered (crashed) row has none, so a crash never
+        advances the watermark. Returns None when there is no successful run yet.
         """
+        names = _as_names(table_names)
+        if not names:
+            return None
         t = self.table
-        conds = [t.c.table_name == table_name, t.c.watermark.is_not(None)]
-        if database is not None:
-            conds.append(self._database_where(database))
+        conds = [t.c.table_name.in_(names), t.c.watermark.is_not(None)]
+        if schema is not None:
+            conds.append(_matches_column(t.c.schema, schema))
         with self.engine.connect() as conn:
             return conn.scalar(select(func.max(t.c.watermark)).where(*conds))
 
-    def is_changed_since(self, table_names: Iterable[str], since: datetime,
-                         database: Database | None = None) -> bool:
-        """Whether any of the tables really changed (a finished, changed merge) after ``since``."""
-        names = list(table_names)
+    def is_changed_since(self, table_names: str | Iterable[str], since: datetime,
+                         schema: str | None = None) -> bool:
+        """Whether any of the tables really changed (a finished, changed merge) after ``since``.
+
+        ``table_names`` is a single name or an iterable of names.
+        """
+        names = _as_names(table_names)
         if not names:
             return False
         t = self.table
         conds = [t.c.table_name.in_(names), t.c.changed == True, t.c.finished_at > since]
-        if database is not None:
-            conds.append(self._database_where(database))
+        if schema is not None:
+            conds.append(_matches_column(t.c.schema, schema))
         with self.engine.connect() as conn:
             found = conn.scalar(select(t.c.id).where(*conds).limit(1))
         return found is not None
@@ -493,22 +478,19 @@ class MergeTracker:
         return result.rowcount
 
     def mark_watermark(self, table_name: str, watermark: datetime,
-                       database: Database | None = None) -> None:
+                       schema: str | None = None) -> None:
         """Record a finished, unchanged merge carrying a watermark, without running a merge.
 
         MartLoop uses this to seed a mart's watermark when its first rebuild starts, so the next
         pass is not mistaken for another rebuild.
         """
-        if database is None:
-            database = Database("", "", "")
         row_id = str(uuid.uuid4())
         t = self.table
         with self.engine.connect() as conn:
             now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             conn.execute(insert(t).values(
                 id=row_id, owner=self.owner, table_name=table_name,
-                database_type=database.type, server=database.server,
-                database_name=database.database,
+                schema=schema or "",
                 started_at=now, heartbeat_at=now, finished_at=now,
                 changed=False, watermark=watermark))
             conn.execute(delete(t).where(
@@ -560,12 +542,6 @@ class MergeTracker:
         self._get_lease().release(name)
 
     # ------------------------------------------------------------------ internals
-
-    def _database_where(self, database: Database):
-        t = self.table
-        return and_(t.c.database_type == database.type,
-                    _matches_column(t.c.server, database.server),
-                    _matches_column(t.c.database_name, database.database))
 
     def _ensure_schema(self) -> None:
         # The tracking table may live in a schema/database that does not exist yet (MySQL/MariaDB

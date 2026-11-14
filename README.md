@@ -150,7 +150,7 @@ Read [Data Loss Risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCU
 
 Beyond a single merge, DBMerge ships two optional layers that turn merges into a coordinated pipeline:
 
-- **`MergeTracker`** (`dbmerge.tracking`) journals every merge into one table, so a downstream consumer can ask when a table last changed (`is_changed_since`, `last_merge`), up to which moment the data is settled (`boundary`), and whether a merge is running right now.
+- **`MergeTracker`** (`dbmerge.tracking`) journals every merge into one table, so a downstream consumer can ask when a table last changed (`is_changed_since`, `last_merge`), up to which moment the data is settled (`safe_boundary`), and whether a merge is running right now.
 - **`MartLoop`** (`dbmerge.mart`) polls that journal and rebuilds a derived table (a *mart*) only when its declared sources really changed since the mart's watermark.
 
 See [Tracking and Marts](TRACKING_AND_MARTS.md) for the full reference and [examples/runner_marts.py](examples/runner_marts.py) for a ready-to-run template.

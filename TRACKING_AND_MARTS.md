@@ -41,7 +41,7 @@ with dbmerge(clickhouse_engine, table_name="mart",   # the merge itself in Click
     tracker.exec(merge)
 ```
 
-So that equal table names in different databases don't collide, every journal row records where the merged table lives: `database_type`, `server`, `database_name`. `database_of(engine)` returns them; the read methods take a `database=...` filter.
+Every journal row records the schema of the merged table together with its name — `schema` + `table_name` is the identity. The read methods take a `schema=...` filter; two databases with a conflicting name need separate tracking tables.
 
 ### Minimal example
 
@@ -76,41 +76,36 @@ The table name is taken from the merge itself; the `changed` flag comes from its
 
 ### What you can ask
 
+Every read method takes a `schema=` filter — the schema of the merged table. Together with the
+table name it is the identity; omit it (or pass `None`) to read across all schemas.
+
 ```python
 # Up to which moment is the data settled (in-progress merges hold it back)?
-boundary = tracker.boundary(["orders", "order_items"])   # datetime
+safe_boundary = tracker.safe_boundary(["orders", "order_items"], schema="target")   # datetime
 
 # When did the table last change, and did rows actually change?
-last = tracker.last_merge("orders")                       # MergeRecord | None
+last = tracker.last_merge("orders", schema="target")                       # MergeRecord | None
 last.started_at, last.finished_at, last.changed
 
-# The boundary of the mart's last successful update (its watermark)?
-tracker.watermark("orders_by_customer")                   # datetime | None
+# The watermark of the mart's last successful update?
+tracker.watermark("orders_by_customer", schema="target")                   # datetime | None
 
 # Did any of the tables really change after `since`?
-tracker.is_changed_since(["orders", "order_items"], since=watermark)  # bool
+tracker.is_changed_since(["orders", "order_items"], since=watermark, schema="target")  # bool
 ```
 
-- `boundary(...)` — the safe boundary: everything committed up to this moment is visible and settled. It caps the **watermark**, not the read (you may read further).
+- `safe_boundary(...)` — the safe boundary: everything committed up to this moment is visible and settled. It caps the **watermark**, not the read (you may read further).
 - `is_changed_since(...)` — whether there was a real change after `since`. A no-op merge (nothing changed) does not count.
 
 ### How it is stored
 
-One table, `dbmerge_tracking` (the name is configurable):
-
-| column | meaning |
-|---|---|
-| `table_name` | which table was merged |
-| `started_at` / `finished_at` | when the merge started / finished |
-| `heartbeat_at` | "I'm still alive" — refreshed while the merge runs |
-| `changed` | whether rows changed (set on finish) |
-| `watermark` | for marts: the watermark this merge recorded |
-
-Storage rule: **at most one finished row per table (the latest), plus any number of unfinished rows**. History does not grow.
+One table, `dbmerge_tracking` (the name is configurable); its full column list is in
+[Table schema](#table-schema). Storage rule: **at most one finished row per table (the latest), plus
+any number of unfinished rows** — history does not grow.
 
 ### When a merge crashes
 
-A crashed merge leaves a row with an empty `finished_at`; its heartbeat eventually goes stale. Such a row stops holding the `boundary`, and `recover_abandoned()` marks it as changed so that marts which missed it wake up:
+A crashed merge leaves a row with an empty `finished_at`; its heartbeat eventually goes stale. Such a row stops holding the safe boundary, and `recover_abandoned()` marks it as changed so that marts which missed it wake up:
 
 ```python
 tracker.recover_abandoned()   # call it at the start of your loop
@@ -131,8 +126,8 @@ from dbmerge.mart import MartHandler
 
 class OrdersByCustomer(MartHandler):
     name = "orders_by_customer"             # unique mart name (for the lease)
-    mart_table = "orders_by_customer"       # the result table
-    sources = ["orders", "order_items"]     # what it reads
+    mart_table = ("target", "orders_by_customer")          # the result table: (schema, table)
+    sources = [("target", "orders"), ("target", "order_items")]  # what it reads: (schema, table)
     min_interval = 5.0
 
     def setup(self, ctx):
@@ -173,7 +168,7 @@ Each pass (every `poll_interval` seconds):
 1. Recovers abandoned merges (`recover_abandoned`).
 2. Claims the mart name — so two processes never build the same mart.
 3. Reads its watermark: `watermark = tracker.watermark(mart_table)` (the first run starts from the beginning).
-4. Computes the next watermark: `next_watermark = tracker.boundary(sources)`.
+4. Computes the next watermark: `next_watermark = tracker.safe_boundary(sources)`.
 5. Asks: `tracker.is_changed_since(sources, since=watermark)`.
    - no change → skip;
    - a change, but `next_watermark <= watermark` → wait (a source is still being written).
@@ -216,14 +211,18 @@ dbmerge_tracking
     id            String(64)  PK
     owner         String(255) NULL      -- NULL for lease rows ("free")
     table_name    String(255) NOT NULL
-    database_type String(64)  NULL      -- where the merged table lives
-    server        String(255) NULL
-    database_name String(255) NULL
+    schema        String(255) NULL      -- the schema of the merged table ("" when none)
     started_at    DateTime(tz) NOT NULL
     finished_at   DateTime(tz) NULL
     heartbeat_at  DateTime(tz) NOT NULL
     changed       Boolean NULL
-    watermark      DateTime(tz) NULL
+    watermark     DateTime(tz) NULL
+
+dbmerge_marts (per-mart rebuild state, created on first use too)
+    table_name                String(255) PK    -- the mart table name
+    schema                    String(255) PK
+    full_rebuild_is_required  Boolean NOT NULL  -- the rebuild request flag
+    rebuild_cursor            String(255) NULL  -- label of the last completed rebuild block
 ```
 
 ## Reference
@@ -234,15 +233,15 @@ dbmerge_tracking
 |---|---|
 | `MergeTracker(engine, table_name=..., schema=..., ...)` | a long-lived journal; one tracker serves many merges. Optionally `with MergeTracker(engine) as tracker:` stops the heartbeat on exit |
 | `exec(merge, *, next_watermark=None, changed=None, with_lease=False, wait_lease=False, wait_timeout=None, wait_interval=30.0, **exec_kwargs)` | writes a tracking row and runs `merge.exec(**exec_kwargs)`; `with_lease` makes the merge exclusive per table and `wait_lease` waits for the holder; returns `(MergeRecord, mergeResult)`, or `(None, None)` when skipped |
-| `boundary(table_names, database=None)` | the safe upper boundary over these tables |
-| `last_merge(table_name, database=None)` | the last finished row, or `None` |
-| `watermark(table_name, database=None)` | the boundary of the mart's last successful merge, or `None` |
-| `is_changed_since(table_names, since, database=None)` | whether there was a real change after `since` |
+| `safe_boundary(table_names, schema=None)` | the safe upper boundary over these tables (`table_names` is one name or a list) |
+| `last_merge(table_name, schema=None)` | the last finished row of one table, or `None` |
+| `watermark(table_names, schema=None)` | the watermark of the last successful merge over these tables, or `None` (`table_names` is one name or a list) |
+| `is_changed_since(table_names, since, schema=None)` | whether there was a real change after `since` (`table_names` is one name or a list) |
 | `recover_abandoned()` | marks stale unfinished rows as changed |
 | `reset(table_name)` | deletes the finished row (rebuild from scratch) |
-| `mark_watermark(table_name, watermark, database=None)` | records a finished, unchanged merge carrying a watermark — seals a mart's watermark after its first rebuild |
+| `mark_watermark(table_name, watermark, schema=None)` | records a finished, unchanged merge carrying a watermark — seals a mart's watermark after its first rebuild |
 
-`database_of(engine)` returns `Database(type, server, database)` — the identity of the engine's database; pass it as `database=` to the read methods. The mart-name lease is the `Lease` class in the same table (key `lease:<name>`).
+The table name and schema together are the identity; pass the `schema=` to the read methods. Two databases with a conflicting name need separate tracking tables. The mart-name lease is the `Lease` class in the same table (key `lease:<name>`).
 
 ### MartLoop
 
@@ -252,7 +251,7 @@ dbmerge_tracking
 | `run_if_pending()` | one pass (for cron or your own loop) |
 | `request_stop()` / `close()` | stop |
 
-`run_mart(mart, engine, tracker=None, *, poll_interval=2.0, schema=None, database=None, lease=None)`
+`run_mart(mart, engine, tracker=None, *, poll_interval=2.0, schema=None, lease=None)`
 runs one mart until `request_stop()` is called: it wraps the handler into a `MartLoop`, creates the
 `MergeTracker` when none is passed, and runs the loop. `request_stop()` asks every loop started by
 `run_mart` to stop after its current pass — wire it to SIGTERM/SIGINT in a runner (see
@@ -266,6 +265,7 @@ blocks are already done.
 ### MartHandler
 
 The base class of a mart: declare `name`, `mart_table`, `sources` and implement the methods.
+`mart_table` and each source are `(schema, table)` tuples (a bare `"table"` string means no schema).
 
 | member | what it does |
 |---|---|
