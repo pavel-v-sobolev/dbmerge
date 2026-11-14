@@ -11,11 +11,13 @@ tables) asks about a table:
   it starts and marks it finished afterwards. While it runs, a background thread refreshes the row's
   heartbeat, and ``safe_boundary`` returns the earliest start of a live merge.
 
-All of it lives in one table (one row per merge). For every table name the table keeps the last
+Operations live in a journal (one row per merge). For every table name the journal keeps the last
 finished row and any number of unfinished rows: a finished merge replaces earlier finished rows for
 the same table, so history does not grow. A merge that died mid-way is left unfinished with a stale
 heartbeat; it stops holding the boundary once its heartbeat expires, and ``recover_abandoned`` marks
-it changed so marts that missed it wake up.
+it changed so marts that missed it wake up. Dedicated change-state rows in the same journal retain a
+monotonic last-change timestamp per destination and scope. Completion and change publication
+commit together; a later no-op cannot erase an earlier change signal.
 
 The tracking table is created on first use, so a project that never opts into tracking gets no extra
 tables. The feature is built around timezone-aware timestamps and is meant for engines that support
@@ -26,18 +28,22 @@ semantics follow the engine's datetime handling.
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import socket
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Iterable
+from numbers import Number
+from typing import Any, Callable, Iterable
 
 from sqlalchemy import (Boolean, Column, DateTime, Engine, MetaData, String, Table,
-                        delete, func, inspect, insert, or_, schema, select, update)
+                         case, create_engine, delete, func, inspect, insert, or_, schema, select, text, update)
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from .dbmerge import IncorrectParameter, logger, mergeResult
+from .dbmerge import IncorrectParameter, logger
 
 # The default name of the tracking table. Overridable; created lazily on first use.
 TRACKING_TABLE = "dbmerge_tracking"
@@ -55,6 +61,13 @@ HEARTBEAT_JOIN_TIMEOUT = 30.0
 # shared store (DuckDB). A merge into such an engine is tracked through a transactional one
 # (PostgreSQL/CockroachDB), passed as the tracker's engine.
 TRACKING_UNSUPPORTED_DIALECTS = ("clickhousedb", "duckdb")
+
+
+def _heartbeat_engine(engine: Engine) -> Engine:
+    """Independent pool, preserving the original pool's connection creator/configuration."""
+    if engine.dialect.name == "sqlite" and engine.url.database in (None, "", ":memory:"):
+        raise IncorrectParameter("Background tracking requires file-backed SQLite, not :memory:")
+    return create_engine(engine.url, pool=engine.pool.recreate())
 
 
 def _instance_owner(name: str) -> str:
@@ -89,6 +102,7 @@ class MergeRecord:
     finished_at: datetime | None
     changed: bool
     watermark: datetime | None
+    scope: str | None = None
 
 
 def _matches_column(column, value):
@@ -109,16 +123,26 @@ def _as_names(table_names) -> list[str]:
     return list(table_names)
 
 
+def _operation_rows(table):
+    # NULL is a pre-row_kind operation (or legacy lease, excluded by its reserved name).
+    return (or_(table.c.row_kind.is_(None), table.c.row_kind == "operation")
+            & ~table.c.table_name.startswith("lease:", autoescape=True))
+
+
 def _tracking_table(metadata: MetaData, name: str, schema: str | None) -> Table:
     return Table(
         name, metadata,
         Column("id", String(64), primary_key=True),
+        Column("row_kind", String(16), nullable=True),
+        Column("changed_at", DateTime(timezone=True), nullable=True),
         # NULL only for lease rows ("free"); a merge row always names its process owner.
         Column("owner", String(255), nullable=True),
         Column("table_name", String(255), nullable=False),
         # The schema of the merged table ("" when there is none). Together with table_name it
         # is the identity; two databases with a conflicting name need separate tracking tables.
         Column("schema", String(255), nullable=True),
+        # Operation category, independent of the destination's table/schema identity.
+        Column("scope", String(255), nullable=True),
         # All marks are by the database clock: the one clock the writer and the reader share.
         Column("started_at", DateTime(timezone=True), nullable=False),
         Column("finished_at", DateTime(timezone=True), nullable=True),
@@ -144,9 +168,9 @@ class MergeTracker:
 
         with MergeTracker(engine) as tracker:
             with dbmerge(engine, table_name="orders", data=rows, key=["id"]) as merge:
-                record, result = tracker.exec(merge)
+                record, result = tracker.exec_merge(merge)
 
-    ``exec`` inserts a row before the merge, runs ``merge.exec()`` itself, and marks the row
+    ``exec`` inserts a row before the callable, runs it, and marks the row
     finished afterwards. A separate daemon thread keeps the row's heartbeat fresh while the merge
     runs, on its own connection, so a long merge is not mistaken for a dead one.
     """
@@ -154,7 +178,8 @@ class MergeTracker:
     def __init__(self, engine: Engine, table_name: str = TRACKING_TABLE,
                  schema: str | None = None, owner: str | None = None,
                  heartbeat_period: float = HEARTBEAT_PERIOD,
-                 heartbeat_ttl: float = HEARTBEAT_TTL):
+                 heartbeat_ttl: float = HEARTBEAT_TTL,
+                 heartbeat_engine: Engine | None = None):
         """Create a tracker writing its journal to a table of a transactional database.
 
         Args:
@@ -193,14 +218,21 @@ class MergeTracker:
         self.table = _tracking_table(self.metadata, table_name, schema)
         self._ensure_schema()
         self._ensure_table()
+        self._backfill_changes()
 
         self._in_flight: set[str] = set()
         # RLock: _begin holds the lock while _ensure_heartbeat takes it again to check-and-create
         # the thread atomically.
         self._lock = threading.RLock()
+        self._idle = threading.Condition(self._lock)
+        self._active: dict[int, int] = {}
+        self._closing = False
+        self._close_lock = threading.Lock()
         self._closed = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._lease = None
+        self._owns_heartbeat_engine = heartbeat_engine is None
+        self.heartbeat_engine = heartbeat_engine or _heartbeat_engine(engine)
 
     # ------------------------------------------------------------------ context manager
 
@@ -212,84 +244,135 @@ class MergeTracker:
 
     # ------------------------------------------------------------------ tracking
 
-    def exec(self, merge, *, next_watermark: datetime | None = None,
-             changed: bool | None = None, with_lease: bool = False,
-             wait_lease: bool = False, wait_timeout: float | None = None,
-             wait_interval: float = 30.0, **exec_kwargs):
-        """Run ``merge.exec(**exec_kwargs)`` and record it in the tracking table.
+    def exec(self, operation: Callable[[], Any], *, destination,
+             scope: str | None = None,
+             with_lease: bool = False, wait_lease: bool = False,
+             wait_timeout: float | None = None, wait_interval: float = 30.0):
+        """Track a committed zero-argument write; only False/numeric zero means no change.
 
-        ``merge`` is a dbmerge instance (or anything with ``table_name``, ``exec`` and the
-        inserted/updated/deleted row counters). The table name comes from the merge itself, and
-        ``changed`` is derived from its counters unless it is passed explicitly. ``next_watermark``
-        is recorded on success and is the watermark the next mart update starts from.
-
-        ``with_lease`` makes the merge exclusive per table: before starting, the tracker claims the
-        table's name in the journal, so a second process never merges the same table at the same
-        time. ``wait_lease`` decides what happens when the name is already held: without it the
-        merge is skipped, with it the tracker polls until the holder releases it or its heartbeat
-        expires. ``wait_interval`` is the poll period and ``wait_timeout`` the limit (``None`` means
-        no limit).
-
-        Returns ``(MergeRecord, mergeResult)``, or ``(None, None)`` when ``with_lease`` is set, the
-        table's name is held by another process and the merge is skipped. On failure the row is left
-        unfinished with a stale heartbeat: it stops holding the boundary once its heartbeat expires
-        and can be recovered by ``recover_abandoned``.
+        Returns (record, original_result). Consumer watermarks belong to MartLoop, not writes.
+        New operations are rejected once close() starts; close waits for active operations.
         """
-        table_name = getattr(merge, "table_name", None)
-        if not table_name:
-            raise IncorrectParameter("exec() expects a dbmerge instance; its table_name is empty")
-        if not callable(getattr(merge, "exec", None)):
-            raise IncorrectParameter("exec() expects a dbmerge instance with an exec() method")
-        if getattr(merge, "merge_finished", False):
-            raise IncorrectParameter(f"Merge of table \"{table_name}\" is already finished; "
-                                     f"run it via exec() before it runs")
-        if changed is not None and not isinstance(changed, bool):
-            raise IncorrectParameter(f"changed must be True, False or None, got {changed!r}")
-        if next_watermark is not None and not isinstance(next_watermark, datetime):
-            raise IncorrectParameter(f"next_watermark must be a datetime or None, got {next_watermark!r}")
+        with self._idle:
+            if self._closing or self._closed.is_set():
+                raise IncorrectParameter("Cannot execute an operation with a closing tracker")
+            thread_id = threading.get_ident()
+            self._active[thread_id] = self._active.get(thread_id, 0) + 1
+        try:
+            return self._exec(operation, destination=destination, scope=scope,
+                              with_lease=with_lease, wait_lease=wait_lease,
+                              wait_timeout=wait_timeout, wait_interval=wait_interval)
+        finally:
+            with self._idle:
+                self._active[thread_id] -= 1
+                if not self._active[thread_id]:
+                    del self._active[thread_id]
+                self._idle.notify_all()
+
+    def _exec(self, operation, *, destination, scope, with_lease, wait_lease,
+              wait_timeout, wait_interval):
+        """Run a callable and journal the write to ``destination``.
+
+        ``destination`` is a bare/schema-qualified string or a ``(schema, identifier)`` tuple.
+        The callable receives no arguments and must commit its data before returning. Only an
+        explicit ``False`` or numeric zero means no change; None and empty containers mean change.
+        ``scope`` is an optional operation category, not a source table or destination identity.
+        Returns ``(MergeRecord, original_result)`` or ``(None, None)`` if a requested lease is busy.
+        Exceptions propagate and leave an unfinished operation for ``recover_abandoned``.
+        """
+        if not callable(operation):
+            raise IncorrectParameter("exec() expects a callable; use exec_merge() for a dbmerge instance")
+        if isinstance(destination, tuple) and len(destination) == 2:
+            destination_schema, table_name = destination
+        elif isinstance(destination, str):
+            destination_schema, separator, table_name = destination.rpartition(".")
+            if not separator:
+                destination_schema, table_name = None, destination
+        else:
+            raise IncorrectParameter("destination must be a string or a (schema, identifier) tuple")
+        if (destination_schema is not None and not isinstance(destination_schema, str)
+                or not isinstance(table_name, str) or not table_name.strip()
+                or len(table_name) > 255 or len(destination_schema or "") > 255):
+            raise IncorrectParameter("destination requires a non-empty identifier and optional string schema (max 255 characters)")
+        if table_name.startswith("lease:"):
+            raise IncorrectParameter("destination identifiers starting with 'lease:' are reserved")
+        if scope is not None and (not isinstance(scope, str) or not scope.strip() or len(scope) > 255):
+            raise IncorrectParameter("scope must be None or a non-empty string of at most 255 characters")
         if wait_interval <= 0:
             raise IncorrectParameter("wait_interval must be positive")
+        if self._closed.is_set():
+            raise IncorrectParameter("Cannot execute an operation with a closed tracker")
 
-        schema = getattr(merge, "schema", None) or ""
-
+        destination_schema = destination_schema or ""
         lease_name = None
         if with_lease:
-            lease_name = _lease_name(schema, table_name)
+            lease_name = _lease_name(destination_schema, table_name)
             if not self._acquire_lease(lease_name, wait=wait_lease, timeout=wait_timeout,
                                        interval=wait_interval):
-                logger.info('Skipping merge of "%s": its lease is held by another process',
-                            table_name)
+                logger.info('Skipping write to "%s": its lease is held by another process', table_name)
                 return (None, None)
-
         try:
-            row_id, started_at = self._begin(table_name, schema)
+            row_id, started_at = self._begin(table_name, destination_schema, scope)
             try:
-                merge_result = merge.exec(**exec_kwargs)
+                result = operation()
+                if lease_name is not None and not self._get_lease().still_mine(lease_name):
+                    raise RuntimeError("Lease lost while executing tracked operation")
+                changed = not (result is False or isinstance(result, Number) and result == 0)
+                finished_at = self._finish(row_id, table_name, changed, None,
+                                           destination_schema)
             except BaseException:
                 self._abandon(row_id)
                 raise
-
-            if changed is None:
-                changed = (getattr(merge, "inserted_row_count", 0)
-                           + getattr(merge, "updated_row_count", 0)
-                           + getattr(merge, "deleted_row_count", 0)) > 0
-            finished_at = self._finish(row_id, table_name, changed, next_watermark)
-            return (MergeRecord(table_name=table_name, schema=schema,
+            return (MergeRecord(table_name=table_name, schema=destination_schema,
                                 started_at=started_at, finished_at=finished_at,
-                                changed=changed, watermark=next_watermark),
-                    merge_result)
+                                changed=changed, watermark=None, scope=scope), result)
         finally:
             if lease_name is not None:
                 self._release_lease(lease_name)
 
-    def _begin(self, table_name: str, schema: str):
+    def exec_merge(self, merge, *, scope: str | None = None,
+                   with_lease: bool = False,
+                   wait_lease: bool = False, wait_timeout: float | None = None,
+                   wait_interval: float = 30.0, **exec_kwargs):
+        """Run a dbmerge instance through :meth:`exec`, returning its original merge result.
+
+        Destination is inferred from the merge; change detection uses its inserted, updated and
+        deleted row counters, not the truth value of the returned mergeResult. Additional keyword
+        arguments are forwarded to ``merge.exec``. There is no ``changed`` override.
+        """
+        table_name = getattr(merge, "table_name", None)
+        if not table_name or not callable(getattr(merge, "exec", None)):
+            raise IncorrectParameter("exec_merge() expects a dbmerge instance with table_name and exec()")
+        if getattr(merge, "merge_finished", False):
+            raise IncorrectParameter(f'Merge of table "{table_name}" is already finished')
+        if "next_watermark" in exec_kwargs:
+            raise IncorrectParameter("Watermarks belong to MartLoop, not individual writes")
+        if "changed" in exec_kwargs:
+            raise IncorrectParameter("exec_merge() determines changes from merge counters; changed is not supported")
+        merge_result = None
+
+        def execute_merge():
+            nonlocal merge_result
+            merge_result = merge.exec(**exec_kwargs)
+            return (getattr(merge, "inserted_row_count", 0)
+                    + getattr(merge, "updated_row_count", 0)
+                    + getattr(merge, "deleted_row_count", 0)) > 0
+
+        record, _ = self.exec(execute_merge, destination=(getattr(merge, "schema", None), table_name),
+                              scope=scope, with_lease=with_lease,
+                              wait_lease=wait_lease, wait_timeout=wait_timeout,
+                              wait_interval=wait_interval)
+        return record, merge_result
+
+    def _begin(self, table_name: str, schema: str, scope: str | None = None):
         """Insert the row before the merge and register it for heartbeat. Returns (id, started_at)."""
+        self._ensure_change_row(table_name, schema, scope)
         row_id = str(uuid.uuid4())
         with self.engine.connect() as conn:
             now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             conn.execute(insert(self.table).values(
-                id=row_id, owner=self.owner, table_name=table_name,
-                schema=schema,
+                id=row_id, row_kind="operation", owner=self.owner, table_name=table_name,
+                schema=schema, scope=scope,
                 started_at=now, heartbeat_at=now))
             conn.commit()
         with self._lock:
@@ -298,22 +381,89 @@ class MergeTracker:
         return row_id, now
 
     def _finish(self, row_id: str, table_name: str, changed: bool,
-                watermark: datetime | None) -> datetime:
+                watermark: datetime | None, schema: str = "") -> datetime:
         """Mark the row finished, replace earlier finished rows of the table, stop its heartbeat."""
-        with self._lock:
-            self._in_flight.discard(row_id)
         t = self.table
         with self.engine.connect() as conn:
             now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
+            row = conn.execute(select(t.c.schema, t.c.table_name, t.c.scope)
+                               .where(t.c.id == row_id)).one()
             conn.execute(update(t).where(t.c.id == row_id)
                          .values(finished_at=now, changed=changed, watermark=watermark))
+            if changed:
+                self._publish_change(conn, row.table_name, row.schema, row.scope, now)
             # One finished row per table: the just-finished merge replaces every earlier finished
             # row. Unfinished rows are left alone.
             conn.execute(delete(t).where(t.c.table_name == table_name,
+                                         _operation_rows(t),
+                                         _matches_column(t.c.schema, schema),
                                          t.c.finished_at.is_not(None),
                                          t.c.id != row_id))
             conn.commit()
+        with self._lock:
+            self._in_flight.discard(row_id)
         return now
+
+    @staticmethod
+    def _change_key(table_name, schema, scope):
+        identity = json.dumps([schema or "", table_name, scope], ensure_ascii=True)
+        return "change:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:57]
+
+    def _ensure_change_row(self, table_name, schema, scope):
+        """Create a stable update target outside the operation completion transaction."""
+        c = self.table
+        key = self._change_key(table_name, schema, scope)
+        with self.engine.connect() as conn:
+            if conn.scalar(select(c.c.id).where(c.c.id == key)) is not None:
+                return
+            try:
+                conn.execute(insert(c).values(id=key, row_kind="change", table_name=table_name,
+                                              schema=schema or "", scope=scope,
+                                              started_at=func.now(), heartbeat_at=func.now()))
+                conn.commit()
+            except IntegrityError:
+                conn.rollback()
+                if conn.scalar(select(c.c.id).where(c.c.id == key)) is None:
+                    raise
+
+    def _publish_change(self, conn, table_name, schema, scope, changed_at):
+        """Monotonic, row-locked update, in the journal completion transaction.
+
+        CASE is evaluated by the database after acquiring the update lock: competing finishes
+        cannot replace a newer mark with an older timestamp, even when commits arrive out of order.
+        """
+        c = self.table
+        conn.execute(update(c).where(c.c.id == self._change_key(table_name, schema, scope))
+                     .values(changed_at=case(
+                         (or_(c.c.changed_at.is_(None), c.c.changed_at < changed_at), changed_at),
+                         else_=c.c.changed_at)))
+
+    def _backfill_changes(self):
+        """Preserve all change signals still present in a pre-upgrade journal."""
+        t = self.table
+        # Also tolerate the minimal legacy table used by the scope-migration check.
+        columns = {column["name"] for column in inspect(self.engine).get_columns(
+            t.name, schema=t.schema)}
+        if not {"table_name", "schema", "scope", "changed", "finished_at"} <= columns:
+            return
+        with self.engine.connect() as conn:
+            rows = conn.execute(select(t.c.table_name, t.c.schema, t.c.scope,
+                                       func.max(t.c.finished_at).label("changed_at"))
+                                .where(_operation_rows(t), t.c.changed == True,
+                                       t.c.finished_at.is_not(None))
+                                .group_by(t.c.table_name, t.c.schema, t.c.scope)).all()
+        for row in rows:
+            self._ensure_change_row(row.table_name, row.schema, row.scope)
+            with self.engine.begin() as conn:
+                self._publish_change(conn, row.table_name, row.schema, row.scope, row.changed_at)
+        if "watermark" in columns:
+            with self.engine.connect() as conn:
+                progress = conn.execute(select(t.c.table_name, t.c.schema,
+                    func.max(t.c.watermark).label("watermark"))
+                    .where(_operation_rows(t), t.c.watermark.is_not(None))
+                    .group_by(t.c.table_name, t.c.schema)).all()
+            for row in progress:
+                self.mark_watermark(row.table_name, row.watermark, schema=row.schema)
 
     def _abandon(self, row_id: str) -> None:
         """Stop refreshing the row after a failed merge. The row stays, finished_at stays NULL."""
@@ -348,19 +498,32 @@ class MergeTracker:
             in_flight = list(self._in_flight)
         if not in_flight:
             return
-        with self.engine.begin() as conn:
+        with self.heartbeat_engine.begin() as conn:
             conn.execute(update(self.table)
                          .where(self.table.c.id.in_(in_flight))
                          .values(heartbeat_at=func.now()))
 
     def close(self) -> None:
-        """Stop the heartbeat thread and wait up to HEARTBEAT_JOIN_TIMEOUT for it."""
-        self._closed.set()
-        thread = self._heartbeat_thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=HEARTBEAT_JOIN_TIMEOUT)
-        if self._lease is not None:
-            self._lease.close()
+        """Drain active writes with heartbeats alive, then close only owned resources."""
+        with self._idle:
+            if threading.get_ident() in self._active:
+                raise IncorrectParameter("Cannot close tracker from inside its active operation")
+            self._closing = True
+            while self._active:
+                self._idle.wait()
+        with self._close_lock:
+            self._closed.set()
+            thread = self._heartbeat_thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=HEARTBEAT_JOIN_TIMEOUT)
+                if thread.is_alive():
+                    raise RuntimeError("Tracker heartbeat did not stop; heartbeat engine remains open")
+            try:
+                if self._lease is not None:
+                    self._lease.close()
+            finally:
+                if self._owns_heartbeat_engine:
+                    self.heartbeat_engine.dispose()
 
     # ------------------------------------------------------------------ reading
 
@@ -380,7 +543,7 @@ class MergeTracker:
         with self.engine.connect() as conn:
             now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             cutoff = now - timedelta(seconds=self.heartbeat_ttl)
-            conds = [t.c.table_name.in_(names), t.c.finished_at.is_(None),
+            conds = [_operation_rows(t), t.c.table_name.in_(names), t.c.finished_at.is_(None),
                      t.c.heartbeat_at > cutoff]
             if schema is not None:
                 conds.append(_matches_column(t.c.schema, schema))
@@ -390,13 +553,13 @@ class MergeTracker:
     def last_merge(self, table_name: str, schema: str | None = None) -> MergeRecord | None:
         """The last finished merge of a table, or None if it has none."""
         t = self.table
-        conds = [t.c.table_name == table_name, t.c.finished_at.is_not(None)]
+        conds = [_operation_rows(t), t.c.table_name == table_name, t.c.finished_at.is_not(None)]
         if schema is not None:
             conds.append(_matches_column(t.c.schema, schema))
         with self.engine.connect() as conn:
             row = conn.execute(
                 select(t.c.table_name, t.c.schema, t.c.started_at, t.c.finished_at,
-                       t.c.changed, t.c.watermark)
+                       t.c.changed, t.c.watermark, t.c.scope)
                 .where(*conds)
                 .order_by(t.c.finished_at.desc())
                 .limit(1)).first()
@@ -404,7 +567,7 @@ class MergeTracker:
             return None
         return MergeRecord(table_name=row.table_name, schema=row.schema,
                            started_at=row.started_at, finished_at=row.finished_at,
-                           changed=bool(row.changed), watermark=row.watermark)
+                           changed=bool(row.changed), watermark=row.watermark, scope=row.scope)
 
     def watermark(self, table_names: str | Iterable[str],
                   schema: str | None = None) -> datetime | None:
@@ -418,23 +581,27 @@ class MergeTracker:
         if not names:
             return None
         t = self.table
-        conds = [t.c.table_name.in_(names), t.c.watermark.is_not(None)]
+        conds = [t.c.table_name.in_(names), t.c.watermark.is_not(None),
+                 or_(_operation_rows(t), t.c.row_kind == "watermark")]
         if schema is not None:
             conds.append(_matches_column(t.c.schema, schema))
         with self.engine.connect() as conn:
             return conn.scalar(select(func.max(t.c.watermark)).where(*conds))
 
     def is_changed_since(self, table_names: str | Iterable[str], since: datetime,
-                         schema: str | None = None) -> bool:
-        """Whether any of the tables really changed (a finished, changed merge) after ``since``.
+                         schema: str | None = None, *, scope: str | None = None) -> bool:
+        """Whether any durable change mark is after ``since``, including before a later no-op.
 
-        ``table_names`` is a single name or an iterable of names.
+        ``table_names`` is a single name or an iterable of names. ``scope=None`` reads all
+        scopes; a string filters wakeup signals only, never the active-operation boundary.
         """
         names = _as_names(table_names)
         if not names:
             return False
         t = self.table
-        conds = [t.c.table_name.in_(names), t.c.changed == True, t.c.finished_at > since]
+        conds = [t.c.row_kind == "change", t.c.table_name.in_(names), t.c.changed_at > since]
+        if scope is not None:
+            conds.append(t.c.scope == scope)
         if schema is not None:
             conds.append(_matches_column(t.c.schema, schema))
         with self.engine.connect() as conn:
@@ -446,57 +613,79 @@ class MergeTracker:
 
         A merge that died may have committed its data, so marts that missed it are woken
         unconditionally (their own query over the window is idempotent). Recovered rows carry no
-        watermark, so a crashed mart never advances its own watermark. They are left until the next
-        successful merge of the table replaces them.
+        watermark, so a crashed mart never advances its own watermark. Their durable change marks
+        survive subsequent operations even when the recovered journal row is pruned.
         """
         t = self.table
         with self.engine.connect() as conn:
             cutoff = _coerce_datetime(conn.scalar(select(_now_expr(self.engine)))) \
                 - timedelta(seconds=self.heartbeat_ttl)
             ids = conn.execute(
-                select(t.c.id)
-                .where(t.c.finished_at.is_(None), t.c.heartbeat_at <= cutoff)).scalars().all()
+                select(t.c.id, t.c.table_name, t.c.schema, t.c.scope)
+                .where(_operation_rows(t), t.c.finished_at.is_(None), t.c.heartbeat_at <= cutoff,
+                       ~t.c.table_name.startswith("lease:", autoescape=True))).all()
         recovered = 0
-        for row_id in ids:
+        for row in ids:
+            self._ensure_change_row(row.table_name, row.schema, row.scope)
             with self.engine.begin() as conn:
+                now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
                 result = conn.execute(
                     update(t)
-                    .where(t.c.id == row_id, t.c.finished_at.is_(None))
-                    .values(finished_at=func.now(), changed=True))
+                    .where(t.c.id == row.id, t.c.finished_at.is_(None), t.c.heartbeat_at <= cutoff)
+                    .values(finished_at=now, changed=True))
                 if result.rowcount:
+                    self._publish_change(conn, row.table_name, row.schema, row.scope, now)
+                    conn.execute(delete(t).where(_operation_rows(t),
+                        t.c.table_name == row.table_name, _matches_column(t.c.schema, row.schema or ""),
+                        t.c.finished_at.is_not(None), t.c.id != row.id))
                     recovered += 1
         if recovered:
             logger.warning("Recovered %s abandoned merge(s) as changed", recovered)
         return recovered
 
-    def reset(self, table_name: str) -> int:
+    def reset(self, table_name: str, schema: str | None = None) -> int:
         """Drop the finished row(s) of a table, so its next mart update starts from the beginning."""
         t = self.table
         with self.engine.begin() as conn:
-            result = conn.execute(
-                delete(t).where(t.c.table_name == table_name, t.c.finished_at.is_not(None)))
+            conds = [or_(_operation_rows(t), t.c.row_kind == "watermark"),
+                     t.c.table_name == table_name, t.c.finished_at.is_not(None)]
+            if schema is not None:
+                conds.append(_matches_column(t.c.schema, schema))
+            result = conn.execute(delete(t).where(*conds))
+            c = self.table
+            change_conds = [c.c.row_kind == "change", c.c.table_name == table_name]
+            if schema is not None:
+                change_conds.append(_matches_column(c.c.schema, schema))
+            # Keep stable rows: active operations may still need to publish into them.
+            conn.execute(update(c).where(*change_conds).values(changed_at=None))
         return result.rowcount
 
     def mark_watermark(self, table_name: str, watermark: datetime,
-                       schema: str | None = None) -> None:
-        """Record a finished, unchanged merge carrying a watermark, without running a merge.
+                       schema: str | None = None, *, lease=None, lease_name=None) -> None:
+        """Persist consumer progress independently of individual operation rows.
 
-        MartLoop uses this to seed a mart's watermark when its first rebuild starts, so the next
-        pass is not mistaken for another rebuild.
+        When a lease is supplied, lock/check/renew its row in the same transaction. This guards
+        progress publication, not arbitrary destination writes (which still require idempotence).
         """
-        row_id = str(uuid.uuid4())
+        key = "watermark:" + self._change_key(table_name, schema, None)[7:61]
         t = self.table
-        with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
             now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
-            conn.execute(insert(t).values(
-                id=row_id, owner=self.owner, table_name=table_name,
-                schema=schema or "",
-                started_at=now, heartbeat_at=now, finished_at=now,
-                changed=False, watermark=watermark))
-            conn.execute(delete(t).where(
-                t.c.table_name == table_name, t.c.finished_at.is_not(None),
-                t.c.id != row_id))
-            conn.commit()
+            if lease is not None:
+                held = conn.execute(update(t).where(
+                    t.c.table_name == lease.key(lease_name), t.c.owner == lease.owner,
+                    t.c.heartbeat_at >= now - timedelta(seconds=lease.ttl))
+                    .values(heartbeat_at=now))
+                if not held.rowcount:
+                    raise RuntimeError("Lease lost before committing mart progress")
+            previous = conn.scalar(select(t.c.watermark).where(t.c.id == key))
+            if previous is not None:
+                conn.execute(update(t).where(t.c.id == key).values(watermark=case(
+                    (t.c.watermark < watermark, watermark), else_=t.c.watermark)))
+            else:
+                conn.execute(insert(t).values(id=key, row_kind="watermark", owner=self.owner,
+                    table_name=table_name, schema=schema or "", started_at=now,
+                    heartbeat_at=now, finished_at=now, changed=False, watermark=watermark))
 
     # ------------------------------------------------------------------ lease
 
@@ -505,7 +694,8 @@ class MergeTracker:
         if self._lease is None:
             from .lease import Lease
             self._lease = Lease(self.engine, self.table, self.owner,
-                                period=self.heartbeat_period, ttl=self.heartbeat_ttl)
+                                period=self.heartbeat_period, ttl=self.heartbeat_ttl,
+                                heartbeat_engine=self.heartbeat_engine)
         return self._lease
 
     def _acquire_lease(self, name, *, wait, timeout, interval) -> bool:
@@ -520,7 +710,13 @@ class MergeTracker:
                     name, self._lease_owner(name) or "an unknown process", interval)
         started = time.monotonic()
         while True:
-            if self._closed.wait(interval):
+            next_check = time.monotonic() + interval
+            if timeout is not None:
+                next_check = min(next_check, started + timeout)
+            while time.monotonic() < next_check:
+                if self._closing or self._closed.wait(max(0, min(0.1, next_check - time.monotonic()))):
+                    return False
+            if self._closing:
                 return False
             if lease.acquire(name):
                 logger.info('Lease of "%s" acquired after %.1fs', name,
@@ -558,6 +754,23 @@ class MergeTracker:
     def _ensure_table(self) -> None:
         inspector = inspect(self.engine)
         if inspector.has_table(self.table.name, self.table.schema):
+            # Nullable additions preserve existing operation and lease rows.
+            columns = {column["name"] for column in inspector.get_columns(
+                self.table.name, schema=self.table.schema)}
+            for name in ("scope", "row_kind", "changed_at"):
+                if name in columns:
+                    continue
+                compiler = self.engine.dialect.ddl_compiler(self.engine.dialect, None)
+                statement = (f"ALTER TABLE {compiler.preparer.format_table(self.table)} "
+                             f"ADD {compiler.get_column_specification(self.table.c[name])}")
+                try:
+                    with self.engine.begin() as conn:
+                        conn.execute(text(statement))
+                except DBAPIError:
+                    # A concurrent startup may have added it. Never hide an unrelated DDL error.
+                    if name not in {column["name"] for column in inspect(self.engine).get_columns(
+                            self.table.name, schema=self.table.schema)}:
+                        raise
             return
         # The existence check and the CREATE stay in separate transactions: the table is known to be
         # missing, and a CREATE alone in its transaction is what CockroachDB requires.

@@ -42,8 +42,7 @@ def _qualified(ref):
 
 
 class OrdersByCustomer(MartHandler):
-    name = "orders_by_customer"        # unique mart name (for the lease)
-    mart_table = (SCHEMA, "orders_by_customer")  # the result table: (schema, table)
+    destination = (SCHEMA, "orders_by_customer")  # the result table: (schema, table)
     sources = [(SCHEMA, "orders")]   # read tables: (schema, table); a change in any triggers a run
 
     def setup(self, ctx: MartContext) -> None:
@@ -77,27 +76,27 @@ class OrdersByCustomer(MartHandler):
              WHERE merged_on > :watermark
         """).bindparams(watermark=ctx.watermark)
 
-    def handle(self, ctx: MartContext) -> None:
+    def process_changes(self, ctx: MartContext) -> None:
         # Incremental work: upsert only the changed (order_date, customer_id) keys. No
         # delete_condition is needed — a deleted order drops out of the sum in place.
         changed = self._changed_keys(ctx)
-        mart_schema, mart_table = ctx.mart_table
+        mart_schema, mart_table = ctx.destination
         with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
                      source_table_name="orders_by_customer_view", source_schema=mart_schema,
                      key=["order_date", "customer_id"]) as merge:
             source_key = tuple_(merge.source_table.c["order_date"],
                                 merge.source_table.c["customer_id"])
-            ctx.tracker.exec(
+            ctx.tracker.exec_merge(
                 merge,
                 source_condition=source_key.in_(changed),
-                next_watermark=ctx.next_watermark,
+
                 with_lease=True, wait_lease=False,
             )
 
     def rebuild(self, ctx: MartContext):
         # Full rebuild by monthly intervals computed from the source range. An interrupted rebuild
         # resumes from ctx.rebuild_from (the label of the last completed month).
-        row = self.query(ctx, "SELECT MIN(order_date), MAX(order_date) FROM orders")[0]
+        row = self.query(ctx, f"SELECT MIN(order_date), MAX(order_date) FROM {_qualified(next(iter(ctx.sources)))}")[0]
         first, last = row[0], row[1]
         if first is None or last is None:
             return
@@ -110,7 +109,7 @@ class OrdersByCustomer(MartHandler):
             next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
             ends = date(next_year, next_month, 1)
             if not (ctx.rebuild_from and label <= ctx.rebuild_from):
-                mart_schema, mart_table = ctx.mart_table
+                mart_schema, mart_table = ctx.destination
                 with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
                              source_table_name="orders_by_customer_view", source_schema=mart_schema,
                              key=["order_date", "customer_id"]) as merge:
@@ -118,3 +117,11 @@ class OrdersByCustomer(MartHandler):
                     merge.exec(source_condition=and_(d >= starts, d < ends))
                 yield label
             year, month = next_year, next_month
+
+
+if __name__ == "__main__":
+    from sqlalchemy import create_engine
+    from dbmerge.mart import run_mart
+
+    engine = create_engine("postgresql://postgres:postgres@localhost:5432/dbmerge")
+    run_mart(OrdersByCustomer(engine), run_forever=False)

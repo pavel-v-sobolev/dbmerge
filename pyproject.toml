@@ -69,6 +69,8 @@ include = [
     "/COMPATIBILITY.md",
     "/ORACLE.md",
     "/CHANGELOG.md",
+    "/TRACKING_AND_MARTS.md",
+    "/examples",
     "/llms.txt",
     "/user_guide.py",
     "/quick_start.py",

@@ -17,8 +17,7 @@ Wiring:
 
     tracker = MergeTracker(pg)                        # journal in PostgreSQL
 
-    OrdersByCustomerClickHouse().run_forever(
-        engine=ch,          # where the mart table lives
+    OrdersByCustomerClickHouse(ch).run_forever(
         tracker=tracker,    # the journal
         schema=None,        # ClickHouse has no schemas
     )
@@ -52,8 +51,7 @@ def _as_date(value):
 
 
 class OrdersByCustomerClickHouse(MartHandler):
-    name = "orders_by_customer_clickhouse"   # unique mart name (for the lease)
-    mart_table = (None, "orders_by_customer")  # the result table: (schema=None, table) in ClickHouse
+    destination = (None, "orders_by_customer")  # the result table: (schema=None, table) in ClickHouse
     sources = [("target", "orders")]           # read table: (schema, table) in PostgreSQL
 
     def setup(self, ctx: MartContext) -> None:
@@ -85,19 +83,19 @@ class OrdersByCustomerClickHouse(MartHandler):
              WHERE merged_on > :watermark
         """).bindparams(watermark=ctx.watermark)
 
-    def handle(self, ctx: MartContext) -> None:
+    def process_changes(self, ctx: MartContext) -> None:
         # Incremental work: upsert only the changed (order_date, customer_id) keys.
         changed = self._changed_keys(ctx)
-        mart_schema, mart_table = ctx.mart_table
+        mart_schema, mart_table = ctx.destination
         with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
                      source_table_name="orders_by_customer_view", source_schema=mart_schema,
                      key=["order_date", "customer_id"]) as merge:
             source_key = tuple_(merge.source_table.c["order_date"],
                                 merge.source_table.c["customer_id"])
-            ctx.tracker.exec(
+            ctx.tracker.exec_merge(
                 merge,
                 source_condition=source_key.in_(changed),
-                next_watermark=ctx.next_watermark,
+
                 with_lease=True, wait_lease=False,
             )
 
@@ -116,7 +114,7 @@ class OrdersByCustomerClickHouse(MartHandler):
             next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
             ends = date(next_year, next_month, 1)
             if not (ctx.rebuild_from and label <= ctx.rebuild_from):
-                mart_schema, mart_table = ctx.mart_table
+                mart_schema, mart_table = ctx.destination
                 with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
                              source_table_name="orders_by_customer_view", source_schema=mart_schema,
                              key=["order_date", "customer_id"]) as merge:
@@ -124,3 +122,14 @@ class OrdersByCustomerClickHouse(MartHandler):
                     merge.exec(source_condition=and_(d >= starts, d < ends))
                 yield label
             year, month = next_year, next_month
+
+
+if __name__ == "__main__":
+    from sqlalchemy import create_engine
+    from dbmerge.mart import run_mart
+    from dbmerge.tracking import MergeTracker
+
+    engine = create_engine("clickhousedb://default:@localhost:8123/default")
+    tracking_engine = create_engine("postgresql://postgres:postgres@localhost:5432/dbmerge")
+    with MergeTracker(tracking_engine) as tracker:
+        run_mart(OrdersByCustomerClickHouse(engine), tracker=tracker, run_forever=False)

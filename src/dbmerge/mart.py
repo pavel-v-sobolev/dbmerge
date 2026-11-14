@@ -1,18 +1,18 @@
 """A mart loop: re-run a derived table when its sources change.
 
 A mart is a table built from one or more source tables. ``MartLoop`` owns the whole "when to run"
-machinery and leaves only the calculation to a ``handle`` callable:
+machinery and leaves only the calculation to a ``process_changes`` callable:
 
 * it recovers abandoned merges (``recover_abandoned``);
-* it claims the mart name through a lease, so two processes never build the same mart;
+* it claims the destination through a lease to coordinate competing processes;
 * it reads its watermark (the boundary of its last successful run) and the safe upper boundary of
   its sources;
-* it runs ``handle`` only when the sources really changed since the watermark.
+* it runs ``process_changes`` only when the sources really changed since the watermark.
 
-The decision is made from timestamps, not from a signal: a change that was missed (a crash, a mart
-that was switched off) is seen by the next pass through ``is_changed_since``. ``handle`` must therefore
-be idempotent — it may run again. The handler records the new watermark itself by passing
-``next_watermark=ctx.next_watermark`` to ``tracker.exec``.
+The decision is made from durable last-change timestamps, not from an ephemeral signal.
+A later no-op does not erase an earlier change. ``process_changes`` must be
+idempotent — it may run again. The loop saves progress only after the whole handler succeeds,
+with a lease check in the progress transaction.
 
 ``run_mart`` is the convenience entry point for a process that runs several marts: it wraps a handler
 into a ``MartLoop`` with a lease and runs it until :func:`request_stop` is called.
@@ -22,15 +22,20 @@ from __future__ import annotations
 
 import threading
 import time
+import hashlib
+import json
+import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Iterator
 
-from sqlalchemy import (Boolean, Column, MetaData, String, Table, and_, exists, func, inspect,
-                        insert, or_, schema, select, text, update)
+from sqlalchemy import (Boolean, Column, DateTime, MetaData, String, Table, and_, exists, func, inspect,
+                        case, insert, or_, schema, select, text, update)
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from .dbmerge import logger
+from .dbmerge import IncorrectParameter, logger
 from .lease import Lease
 from .tracking import MergeTracker
 
@@ -48,6 +53,8 @@ def _marts_table(metadata: MetaData, schema_name: str | None) -> Table:
         Column("schema", String(255), primary_key=True),
         Column("full_rebuild_is_required", Boolean, nullable=False, server_default=text("false")),
         Column("rebuild_cursor", String(255), nullable=True),
+        Column("rebuild_request", String(36), nullable=True),
+        Column("rebuild_boundary", DateTime(timezone=True), nullable=True),
         schema=schema_name,
     )
 
@@ -56,6 +63,19 @@ def _ensure_marts_table(engine: Engine, schema_name: str | None) -> Table:
     table = _marts_table(MetaData(), schema_name)
     inspector = inspect(engine)
     if inspector.has_table(table.name, table.schema):
+        columns = {column["name"] for column in inspector.get_columns(table.name, schema=table.schema)}
+        compiler = engine.dialect.ddl_compiler(engine.dialect, None)
+        for name in ("rebuild_request", "rebuild_boundary"):
+            if name in columns:
+                continue
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE {compiler.preparer.format_table(table)} "
+                                      f"ADD {compiler.get_column_specification(table.c[name])}"))
+            except DBAPIError:
+                if name not in {column["name"] for column in inspect(engine).get_columns(
+                        table.name, schema=table.schema)}:
+                    raise
         return table
     if schema_name is not None and engine.dialect.name != "sqlite":
         with engine.connect() as conn:
@@ -72,24 +92,28 @@ def _split_name(name) -> tuple[str | None, str]:
     Accepts a ``(schema, table)`` tuple, or a bare ``"table"`` / ``"schema.table"`` string.
     """
     if isinstance(name, tuple):
+        if len(name) != 2:
+            raise IncorrectParameter("A reference must be a (schema, identifier) tuple")
         schema, table = name
-        return (schema or None, table)
-    if "." in name:
+    elif isinstance(name, str) and "." in name:
         schema, _, table = name.rpartition(".")
-        return (schema or None, table)
-    return (None, name)
+    else:
+        schema, table = None, name
+    if (schema is not None and not isinstance(schema, str)) or not isinstance(table, str) or not table.strip():
+        raise IncorrectParameter("A reference requires a non-empty identifier and an optional string schema")
+    return (schema or None, table)
 
 
-def _split_sources(sources: Iterable[str]) -> tuple[str | None, list[str]]:
-    """Split schema-qualified source names; the first source's schema is used for all of them."""
-    schema = None
-    names = []
-    for name in sources:
-        s, t = _split_name(name)
-        if schema is None:
-            schema = s
-        names.append(t)
-    return schema, names
+def _sources(sources) -> frozenset[tuple[str | None, str]]:
+    if sources is None or isinstance(sources, str):
+        raise IncorrectParameter("sources is required and must be a non-empty iterable of references")
+    try:
+        result = frozenset(_split_name(source) for source in sources)
+    except TypeError as exc:
+        raise IncorrectParameter("sources must be an iterable of references") from exc
+    if not result:
+        raise IncorrectParameter("sources must not be empty")
+    return result
 
 
 def _marts_row_where(table, schema: str | None, table_name: str):
@@ -102,8 +126,7 @@ class MartContext:
 
     engine: Engine
     tracker: MergeTracker
-    name: str
-    mart_table: tuple[str | None, str]            # (schema, table) of the mart
+    destination: tuple[str | None, str]          # logical destination identity, not necessarily a table
     sources: frozenset[tuple[str | None, str]]    # (schema, table) of each source
     watermark: datetime        # where to read changes from (EPOCH on the first run)
     next_watermark: datetime   # the watermark to record on success (the sources' safe upper boundary)
@@ -116,44 +139,62 @@ class MartContext:
 class MartLoop:
     """Polls the tracking table and runs a handler when a mart's sources changed."""
 
-    def __init__(self, engine: Engine, tracker: MergeTracker, name: str, mart_table: str,
-                 sources: Iterable[str], handle: Callable[[MartContext], None],
+    def __init__(self, engine: Engine, tracker: MergeTracker, destination: str | tuple[str | None, str],
+                 sources: Iterable[str], process_changes: Callable[[MartContext], None],
                  poll_interval: float = 2.0, lease: Lease | None = None,
                  setup: Callable[[MartContext], None] | None = None,
                  rebuild: Callable[[MartContext], None] | None = None,
-                 min_interval: float = 0.0, schema: str | None = None):
+                 min_interval: float = 0.0, schema: str | None = None,
+                 scope: str | None = None, enabled: bool = True):
+        if not isinstance(engine, Engine):
+            raise IncorrectParameter("MartLoop requires a SQLAlchemy Engine")
+        if poll_interval <= 0 or min_interval < 0:
+            raise IncorrectParameter("poll_interval must be positive and min_interval non-negative")
+        if scope is not None and (not isinstance(scope, str) or not scope.strip()):
+            raise IncorrectParameter("scope must be a non-empty string or None")
+        self.scope = scope
+        self.enabled = enabled
+        self._pass_lock = threading.RLock()
+        self._closed = False
+        self._pass_thread = None
         self.engine = engine
         self.tracker = tracker
-        self.name = name
-        # mart_table and each source are (schema, table) tuples; a bare string means no schema.
-        self.mart_table = _split_name(mart_table)
-        self.sources = frozenset(_split_name(s) for s in sources)
-        self.handle = handle
+        self.destination = _split_name(destination)
+        self.sources = _sources(sources)
+        # A bounded, unambiguous lease key derived solely from the destination identity.
+        self.name = "mart:" + hashlib.sha256(json.dumps(self.destination).encode()).hexdigest()[:48]
+        self.process_changes = process_changes
         self.poll_interval = poll_interval
         # The schema where the dbmerge_marts table lives (a service detail); the business
         # schemas of the mart and each source live in the tuples above.
-        self.schema = schema
+        self.schema = tracker.schema if schema is None else schema
         self.setup = setup
         self.rebuild = rebuild
         self.min_interval = min_interval
 
         # Split once for the tracking reads.
-        self._mart_schema, self._mart_name = self.mart_table
-        self._source_schema, self._source_names = _split_sources(self.sources)
+        self._mart_schema, self._mart_name = self.destination
+        self._source_groups: dict[str, list[str]] = {}
+        for source_schema, source_name in self.sources:
+            self._source_groups.setdefault(source_schema or "", []).append(source_name)
 
-        self._lease = lease
-        if lease is not None:
-            lease.ensure(name)
+        self._owns_lease = lease is None
+        self._lease = lease if lease is not None else Lease(
+            tracker.engine, tracker.table, f"mart:{uuid.uuid4().hex}",
+            heartbeat_engine=tracker.heartbeat_engine)
+        self._lease.ensure(self.name)
 
-        self._stop_signal: threading.Event | None = None
+        self._stop_signal = threading.Event()
+        if _stop_requested.is_set():
+            self._stop_signal.set()
+        _all_loops.add(self)
         self._setup_done = False
         self._next_allowed = 0.0
         self._marts_table: Table | None = None
 
     def run_forever(self) -> None:
         """Blocking poll loop. Stops on request_stop() and then releases the lease."""
-        stop = threading.Event()
-        self._stop_signal = stop
+        stop = self._stop_signal
         try:
             while not stop.is_set():
                 try:
@@ -169,41 +210,58 @@ class MartLoop:
             self._stop_signal.set()
 
     def close(self) -> None:
-        """Release the name so a successor can take it without waiting out the lease TTL."""
-        if self._lease is not None:
+        """Wait for an active pass before releasing its resources."""
+        self.request_stop()
+        if self._pass_thread == threading.get_ident():
+            raise IncorrectParameter("Use request_stop(), not close(), inside a mart handler")
+        with self._pass_lock:
+            if self._closed:
+                return
+            self._closed = True
             self._lease.release(self.name)
-            self._lease.close()
+            if self._owns_lease:
+                self._lease.close()
+            _all_loops.discard(self)
 
     def run_if_pending(self) -> bool:
-        """One pass: run the handler if there is work, otherwise do nothing. Returns whether it ran."""
-        if time.monotonic() < self._next_allowed:
-            return False
+        """One exclusive pass. Disabled/stopped consumers keep their watermark for catch-up."""
+        with self._pass_lock:
+            if self._closed or self._stop_requested() or not self.enabled:
+                return False
+            if time.monotonic() < self._next_allowed or not self._lease.acquire(self.name):
+                return False
+            self._pass_thread = threading.get_ident()
+            try:
+                return self._run_pass()
+            finally:
+                try:
+                    self._lease.release(self.name)
+                finally:
+                    self._pass_thread = None
 
-        if self._lease is not None and not self._lease.acquire(self.name):
-            return False
-
+    def _run_pass(self) -> bool:
         self.tracker.recover_abandoned()
 
         cursor = self._rebuild_cursor()
         rebuild_requested = self._rebuild_requested()
+        self._observed_request = self._request_token()
         explicit_rebuild = rebuild_requested or cursor is not None
 
-        stored_watermark = self.tracker.watermark(self._mart_name, schema=self._mart_schema)
+        stored_watermark = self.tracker.watermark(self._mart_name, schema=self._mart_schema or "")
         full_rebuild = stored_watermark is None or explicit_rebuild
         watermark = stored_watermark if stored_watermark is not None else EPOCH
 
-        next_watermark = self.tracker.safe_boundary(self._source_names, schema=self._source_schema)
+        next_watermark = self._safe_boundary()
         if not explicit_rebuild:
             if not full_rebuild and next_watermark <= watermark:
                 # A merge that started before our watermark is still running: nothing is settled yet.
                 return False
-            if not self.tracker.is_changed_since(self._source_names, since=watermark,
-                                                 schema=self._source_schema):
+            if not self._sources_changed(watermark):
                 return False
 
         context = MartContext(
-            engine=self.engine, tracker=self.tracker, name=self.name,
-            mart_table=self.mart_table, sources=self.sources,
+            engine=self.engine, tracker=self.tracker,
+            destination=self.destination, sources=self.sources,
             watermark=watermark, next_watermark=next_watermark, full_rebuild=full_rebuild,
             lease_is_mine=self._lease_is_mine(),
             rebuild_from=cursor,
@@ -213,10 +271,11 @@ class MartLoop:
             self.setup(context)
             self._setup_done = True
 
-        if full_rebuild and self.rebuild is not None:
+        if full_rebuild:
             self._run_rebuild(context, stored_watermark)
         else:
-            self.handle(context)
+            self.process_changes(context)
+            self._commit_watermark(context.next_watermark)
 
         self._next_allowed = time.monotonic() + self.min_interval
         return True
@@ -226,59 +285,61 @@ class MartLoop:
 
     def _get_marts_table(self):
         if self._marts_table is None:
-            self._marts_table = _ensure_marts_table(self.engine, self.schema)
+            self._marts_table = _ensure_marts_table(self.tracker.engine, self.schema)
         return self._marts_table
 
     def _ensure_marts_row(self) -> None:
         table = self._get_marts_table()
-        with self.engine.begin() as conn:
-            if conn.scalar(select(table.c.table_name)
-                           .where(_marts_row_where(table, self._mart_schema, self._mart_name))) is None:
-                conn.execute(insert(table).values(table_name=self._mart_name, schema=self._mart_schema or ""))
+        _ensure_state_row(self.tracker.engine, table, self._mart_schema, self._mart_name)
 
     def _rebuild_cursor(self):
         table = self._get_marts_table()
-        with self.engine.connect() as conn:
+        with self.tracker.engine.connect() as conn:
             return conn.scalar(select(table.c.rebuild_cursor)
                                .where(_marts_row_where(table, self._mart_schema, self._mart_name)))
 
     def _write_rebuild_cursor(self, cursor) -> None:
         self._ensure_marts_row()
         table = self._marts_table
-        with self.engine.begin() as conn:
+        with self.tracker.engine.begin() as conn:
+            self._guard_progress(conn)
             conn.execute(update(table)
                          .where(_marts_row_where(table, self._mart_schema, self._mart_name))
                          .values(rebuild_cursor=cursor))
 
     def _rebuild_requested(self) -> bool:
         table = self._get_marts_table()
-        with self.engine.connect() as conn:
+        with self.tracker.engine.connect() as conn:
             return bool(conn.scalar(select(table.c.full_rebuild_is_required)
                                     .where(_marts_row_where(table, self._mart_schema, self._mart_name))))
 
     def _clear_rebuild_request(self) -> None:
         self._ensure_marts_row()
         table = self._marts_table
-        with self.engine.begin() as conn:
+        with self.tracker.engine.begin() as conn:
             conn.execute(update(table)
                          .where(_marts_row_where(table, self._mart_schema, self._mart_name))
+                         .where(table.c.rebuild_request == getattr(self, "_observed_request", None))
                          .values(full_rebuild_is_required=False))
 
     def _run_rebuild(self, context: MartContext, watermark: datetime | None) -> None:
         """Drive a resumable, block-by-block rebuild; apply increments between blocks."""
         cursor = context.rebuild_from
-        if not cursor:  # None or "" — a fresh rebuild, or restarted before any block was done
+        if cursor is None:  # An empty cursor is already an active rebuild, not a new request.
             cursor = ""
-            self._write_rebuild_cursor(cursor)
-            self._clear_rebuild_request()
-            if watermark is None:
-                # First rebuild: seed the watermark so increments between blocks start from the
-                # current boundary instead of re-reading the whole history.
-                self.tracker.mark_watermark(self._mart_name, context.next_watermark,
-                                            schema=self._mart_schema)
+            self._ensure_marts_row()
+            table = self._get_marts_table()
+            with self.tracker.engine.begin() as conn:
+                self._guard_progress(conn)
+                conn.execute(update(table).where(_marts_row_where(
+                    table, self._mart_schema, self._mart_name))
+                    .values(rebuild_boundary=context.next_watermark, rebuild_cursor="",
+                            full_rebuild_is_required=case(
+                                (table.c.rebuild_request == self._observed_request, False),
+                                else_=table.c.full_rebuild_is_required)))
 
         started = time.monotonic()
-        blocks = self.rebuild(context)
+        blocks = self.rebuild(context) if self.rebuild is not None else self.process_changes(context)
         if blocks is None:
             blocks = ()
         try:
@@ -299,27 +360,67 @@ class MartLoop:
             if close is not None:
                 close()
 
+        self._commit_watermark(self._rebuild_boundary() or context.next_watermark)
         self._write_rebuild_cursor(None)
         logger.info("Mart %s: rebuild finished in %.1fs", self.name, time.monotonic() - started)
 
     def _run_increment(self) -> None:
         """Apply changes that arrived since the mart's watermark (between rebuild blocks)."""
-        watermark = self.tracker.watermark(self._mart_name, schema=self._mart_schema)
+        watermark = self.tracker.watermark(self._mart_name, schema=self._mart_schema or "")
+        boundary = self._rebuild_boundary()
+        if boundary is not None:
+            watermark = max(watermark, boundary) if watermark is not None else boundary
         if watermark is None:
             watermark = EPOCH
-        next_watermark = self.tracker.safe_boundary(self._source_names, schema=self._source_schema)
+        next_watermark = self._safe_boundary()
         if next_watermark <= watermark:
             return
-        if not self.tracker.is_changed_since(self._source_names, since=watermark,
-                                             schema=self._source_schema):
+        if not self._sources_changed(watermark):
             return
         context = MartContext(
-            engine=self.engine, tracker=self.tracker, name=self.name,
-            mart_table=self.mart_table, sources=self.sources,
+            engine=self.engine, tracker=self.tracker,
+            destination=self.destination, sources=self.sources,
             watermark=watermark, next_watermark=next_watermark, full_rebuild=False,
             lease_is_mine=self._lease_is_mine(),
         )
-        self.handle(context)
+        self.process_changes(context)
+        self._commit_watermark(context.next_watermark)
+
+    def _request_token(self):
+        table = self._get_marts_table()
+        with self.tracker.engine.connect() as conn:
+            return conn.scalar(select(table.c.rebuild_request).where(
+                _marts_row_where(table, self._mart_schema, self._mart_name)))
+
+    def _rebuild_boundary(self):
+        table = self._get_marts_table()
+        with self.tracker.engine.connect() as conn:
+            return conn.scalar(select(table.c.rebuild_boundary).where(
+                _marts_row_where(table, self._mart_schema, self._mart_name)))
+
+    def _commit_watermark(self, value):
+        self.tracker.mark_watermark(self._mart_name, value, schema=self._mart_schema,
+                                   lease=self._lease, lease_name=self.name)
+
+    def _guard_progress(self, conn):
+        from .tracking import _coerce_datetime, _now_expr
+        t = self.tracker.table
+        now = _coerce_datetime(conn.scalar(select(_now_expr(self.tracker.engine))))
+        result = conn.execute(update(t).where(
+            t.c.table_name == self._lease.key(self.name), t.c.owner == self._lease.owner,
+            t.c.heartbeat_at >= now - timedelta(seconds=self._lease.ttl))
+            .values(heartbeat_at=now))
+        if not result.rowcount:
+            raise RuntimeError("Lease lost before committing rebuild progress")
+
+    def _safe_boundary(self) -> datetime:
+        return min(self.tracker.safe_boundary(names, schema=schema)
+                   for schema, names in self._source_groups.items())
+
+    def _sources_changed(self, watermark: datetime) -> bool:
+        kwargs = {} if self.scope is None else {"scope": self.scope}
+        return any(self.tracker.is_changed_since(names, since=watermark, schema=schema, **kwargs)
+                   for schema, names in self._source_groups.items())
 
     def _lease_is_mine(self):
         """A SQL condition "the mart name is still ours", for guards inside the handler's merge.
@@ -339,31 +440,40 @@ class MartLoop:
 class MartHandler:
     """Base class for a mart: declare sources and the work, and let MartLoop drive the rest.
 
-    Subclass and set ``name``, ``mart_table`` and ``sources``, then implement ``handle`` (and
+    Subclass and set the required ``destination`` and ``sources``, then implement ``process_changes`` (and
     optionally ``setup`` for one-time DDL and ``rebuild`` for a full rebuild; the default rebuild is
-    ``handle`` with ``full_rebuild=True``). ``loop()`` builds a MartLoop; ``run_forever`` runs it.
+    ``process_changes`` with ``full_rebuild=True``). ``loop()`` builds a MartLoop; ``run_forever`` runs it.
     """
 
-    name: str = ""
-    mart_table: str = ""
-    sources: list[str] = []
+    destination: str | tuple[str | None, str]
+    sources: Iterable[str | tuple[str | None, str]]
     min_interval: float = 0.0
+    scope: str | None = None
+    enabled: bool = True
+
+    def __init__(self, engine: Engine, *, destination=None, sources=None):
+        if not isinstance(engine, Engine):
+            raise IncorrectParameter("MartHandler requires a SQLAlchemy Engine")
+        self.engine = engine
+        self.destination = _split_name(
+            destination if destination is not None else getattr(self, "destination", None))
+        self.sources = _sources(sources if sources is not None else getattr(self, "sources", None))
 
     def setup(self, ctx: MartContext) -> None:
         """One-time preparation before the first run (e.g. create the mart table)."""
 
-    def handle(self, ctx: MartContext) -> None:
-        """The incremental work. Records the watermark via tracker.exec(..., next_watermark=ctx.next_watermark)."""
-        raise NotImplementedError(f"{type(self).__name__}.handle(ctx) is not implemented")
+    def process_changes(self, ctx: MartContext) -> None:
+        """Perform committed, idempotent work; the loop saves progress after successful return."""
+        raise NotImplementedError(f"{type(self).__name__}.process_changes(ctx) is not implemented")
 
     def rebuild(self, ctx: MartContext) -> Iterator[str]:
         """A full rebuild, block by block: commit a block, then yield its label.
 
-        The default is a single block: it runs handle() and yields "all". Subclasses that rebuild
+        The default is a single block: it runs process_changes() and yields "all". Subclasses that rebuild
         in chunks yield one label per committed block; MartLoop saves the label so an interrupted
         rebuild resumes from the next block.
         """
-        self.handle(ctx)
+        self.process_changes(ctx)
         yield "all"
 
     def changed_since(self, ctx: MartContext, *columns) -> Any:
@@ -380,62 +490,83 @@ class MartHandler:
         with ctx.engine.connect() as conn:
             return conn.execute(text(sql), params).all()
 
-    def loop(self, engine: Engine, tracker: MergeTracker, *, poll_interval: float = 2.0,
+    def loop(self, tracker: MergeTracker, *, poll_interval: float = 2.0,
              lease: Lease | None = None, schema: str | None = None) -> MartLoop:
-        return MartLoop(engine, tracker, self.name, self.mart_table, self.sources,
-                        self.handle, poll_interval=poll_interval, lease=lease,
+        return MartLoop(self.engine, tracker, self.destination, self.sources,
+                        self.process_changes, poll_interval=poll_interval, lease=lease,
                         setup=self.setup, rebuild=self.rebuild,
-                        min_interval=self.min_interval, schema=schema)
+                        min_interval=self.min_interval, schema=schema,
+                        scope=self.scope, enabled=self.enabled)
 
-    def run_forever(self, engine: Engine, tracker: MergeTracker, **kwargs) -> None:
-        self.loop(engine, tracker, **kwargs).run_forever()
+    def run_forever(self, tracker: MergeTracker | None = None, **kwargs) -> None:
+        run_mart(self, tracker=tracker, **kwargs)
 
 
 # Backward-compatible alias; prefer MartHandler in new code.
 Handler = MartHandler
 
 
-def as_handler(obj) -> MartHandler:
+def as_handler(obj, engine: Engine | None = None) -> MartHandler:
     """Normalize a handler declared as a MartHandler instance, a module or a callable.
 
     A module or a callable is read for the same attributes a MartHandler declares; a callable
-    without a separate ``handle`` attribute is the handle itself.
+    without a separate ``process_changes`` attribute is the process_changes itself.
     """
     if isinstance(obj, MartHandler):
+        if engine is not None and engine is not obj.engine:
+            raise IncorrectParameter("engine differs from the handler's constructor engine")
         return obj
-    handler = MartHandler()
-    for attr in ("name", "mart_table", "sources", "setup", "rebuild", "min_interval"):
+    handler = MartHandler(engine if engine is not None else getattr(obj, "engine", None),
+                          destination=getattr(obj, "destination", None),
+                          sources=getattr(obj, "sources", None))
+    for attr in ("setup", "rebuild", "min_interval", "scope", "enabled"):
         if hasattr(obj, attr):
             setattr(handler, attr, getattr(obj, attr))
-    if hasattr(obj, "handle"):
-        handler.handle = obj.handle
+    if hasattr(obj, "process_changes"):
+        handler.process_changes = obj.process_changes
     elif callable(obj):
-        handler.handle = obj
+        handler.process_changes = obj
+    else:
+        raise IncorrectParameter("A mart requires a callable process_changes(ctx)")
     return handler
 
 
 _running_loops: list["MartLoop"] = []
+_all_loops = weakref.WeakSet()
+_stop_requested = threading.Event()
 
 
-def run_mart(mart, engine: Engine, tracker: MergeTracker | None = None, *,
+def run_mart(mart, engine: Engine | None = None, tracker: MergeTracker | None = None, *,
              poll_interval: float = 2.0, schema: str | None = None,
-             lease: Lease | None = None) -> None:
-    """Run one mart until :func:`request_stop` is called.
+             lease: Lease | None = None, run_forever: bool = True) -> bool | None:
+    """Poll a mart, or perform one pending pass with ``run_forever=False``.
 
     ``mart`` is a ``MartHandler`` instance, a module or a callable (see :func:`as_handler`). The
-    ``MergeTracker`` is created automatically when not given. Pass a shared ``Lease`` to enforce
-    one process per mart; without one the mart may run in two processes if this is started twice.
+    ``MergeTracker`` is created automatically when not given and closed on exit. Each loop gets
+    a destination-derived lease by default. ``engine`` is only needed for modules/callables.
+    A single pass returns whether work ran and propagates errors to the caller; continuous mode
+    runs until :func:`request_stop` and logs pass errors. Both modes close their owned resources.
     """
-    handler = as_handler(mart)
+    handler = as_handler(mart, engine)
+    owns_tracker = tracker is None
     if tracker is None:
-        tracker = MergeTracker(engine, schema=schema)
-    loop = handler.loop(engine, tracker, poll_interval=poll_interval, lease=lease,
-                        schema=schema)
-    _running_loops.append(loop)
+        tracker = MergeTracker(handler.engine, schema=schema)
     try:
-        loop.run_forever()
+        loop = handler.loop(tracker, poll_interval=poll_interval, lease=lease, schema=schema)
+        _running_loops.append(loop)
+        try:
+            if run_forever:
+                loop.run_forever()
+            else:
+                return loop.run_if_pending()
+        finally:
+            try:
+                loop.close()
+            finally:
+                _running_loops.remove(loop)
     finally:
-        _running_loops.remove(loop)
+        if owns_tracker:
+            tracker.close()
 
 
 def request_stop(*_args) -> None:
@@ -444,27 +575,44 @@ def request_stop(*_args) -> None:
     Accepts the two arguments a signal handler receives, so it can be passed directly to
     ``signal.signal``.
     """
-    for loop in list(_running_loops):
+    _stop_requested.set()
+    for loop in list(_all_loops):
         loop.request_stop()
 
 
-def rebuild_requested(engine: Engine, schema: str | None, table_name: str) -> bool:
+def reset_stop() -> None:
+    """Allow new loops to start after a process-wide stop; existing stopped loops stay stopped."""
+    _stop_requested.clear()
+
+
+def rebuild_requested(engine: Engine, destination, *, schema: str | None = None) -> bool:
     """Whether a full rebuild was requested for a mart; its next pass will perform it."""
     table = _ensure_marts_table(engine, schema)
-    identity = _mart_identity(engine, schema)
+    destination_schema, table_name = _split_name(destination)
     with engine.connect() as conn:
         return bool(conn.scalar(select(table.c.full_rebuild_is_required)
-                                .where(_marts_row_where(table, identity, table_name))))
+                                .where(_marts_row_where(table, destination_schema, table_name))))
 
 
-def request_rebuild(engine: Engine, schema: str | None, table_name: str) -> None:
+def request_rebuild(engine: Engine, destination, *, schema: str | None = None) -> None:
     """Request a full rebuild of a mart; the next pass of its MartLoop performs it."""
     table = _ensure_marts_table(engine, schema)
-    identity = _mart_identity(engine, schema)
+    destination_schema, table_name = _split_name(destination)
+    _ensure_state_row(engine, table, destination_schema, table_name)
     with engine.begin() as conn:
-        conn.execute(update(table).where(_marts_row_where(table, identity, table_name))
-                     .values(full_rebuild_is_required=True))
-        if conn.scalar(select(table.c.table_name)
-                       .where(_marts_row_where(table, identity, table_name))) is None:
-            conn.execute(insert(table).values(table_name=table_name, full_rebuild_is_required=True,
-                                              **_identity_values(identity)))
+        conn.execute(update(table).where(_marts_row_where(table, destination_schema, table_name))
+                     .values(full_rebuild_is_required=True, rebuild_request=str(uuid.uuid4())))
+
+
+def _ensure_state_row(engine, table, destination_schema, table_name):
+    condition = _marts_row_where(table, destination_schema, table_name)
+    with engine.connect() as conn:
+        if conn.scalar(select(table.c.table_name).where(condition)) is not None:
+            return
+        try:
+            conn.execute(insert(table).values(table_name=table_name, schema=destination_schema or ""))
+            conn.commit()
+        except IntegrityError:
+            conn.rollback()
+            if conn.scalar(select(table.c.table_name).where(condition)) is None:
+                raise

@@ -35,6 +35,13 @@ DBMerge automates data update process by comparing your source data against the 
 
 To ensure optimal performance, the library loads your data into a temporary table first, and then executes bulk synchronization queries.
 
+## Tracking and marts (beta)
+
+Optional change tracking, leases and resumable derived-table processing are **beta**:
+their APIs may change as the functionality matures. See
+[Tracking and Marts](TRACKING_AND_MARTS.md) for usage and examples.
+The core merge API is unchanged and is not part of this beta designation.
+
 ## Supported Databases
 Tested and verified with:
 - PostgreSQL

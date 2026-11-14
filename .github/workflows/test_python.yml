@@ -8,7 +8,8 @@ on:
 
 jobs:
   test_python:
-    name: Python ${{ matrix.python }}, ${{ matrix.pyarrow && 'with' || 'without' }} pyarrow
+    name: ${{ matrix.suite }} — Python ${{ matrix.python }}, ${{ matrix.pyarrow && 'with' || 'without' }} pyarrow
+    timeout-minutes: 30
     runs-on: ubuntu-latest
 
     strategy:
@@ -16,11 +17,14 @@ jobs:
       matrix:
         include:
           # The oldest Python: without pyarrow and before 3.12 COPY is not used, the staging table loads row by row.
-          - {python: '3.10', pyarrow: false, engines: 'sqlite,postgres'}
+          - {python: '3.10', pyarrow: false, engines: 'sqlite,postgres', suite: 'merge'}
+          - {python: '3.10', pyarrow: false, engines: 'sqlite,postgres', suite: 'tracking'}
           # Without pyarrow on 3.12+: COPY writes its CSV with the csv module, DuckDB loads row by row.
-          - {python: '3.12', pyarrow: false, engines: 'sqlite,duckdb,postgres,postgres-psycopg,postgres-pg8000'}
+          - {python: '3.12', pyarrow: false, engines: 'sqlite,duckdb,postgres,postgres-psycopg,postgres-pg8000', suite: 'merge'}
+          - {python: '3.12', pyarrow: false, engines: 'sqlite,duckdb,postgres,postgres-psycopg,postgres-pg8000', suite: 'tracking'}
           # The newest Python.
-          - {python: '3.15', pyarrow: true, engines: 'sqlite,duckdb,postgres'}
+          - {python: '3.15', pyarrow: true, engines: 'sqlite,duckdb,postgres', suite: 'merge'}
+          - {python: '3.15', pyarrow: true, engines: 'sqlite,duckdb,postgres', suite: 'tracking'}
 
     services:
       postgres:
@@ -70,4 +74,4 @@ jobs:
         env:
           DBMERGE_TEST_ENGINES: ${{ matrix.engines }}
         run: |
-          uv run --no-sync pytest tests/test_all.py tests/test_tracking.py tests/test_mart.py -v --tb=short
+          uv run --no-sync pytest ${{ matrix.suite == 'tracking' && 'tests/test_tracking.py tests/test_mart.py' || 'tests/test_all.py' }} -v --tb=short

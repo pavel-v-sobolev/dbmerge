@@ -10,12 +10,14 @@ on:
 # the PostgreSQL database engine, and ClickHouse reads it itself.
 jobs:
   test_clickhouse_postgres:
-    name: ClickHouse ${{ matrix.clickhouse }} from PostgreSQL, SQLAlchemy ${{ matrix.sqlalchemy }}
+    name: ${{ matrix.suite }} — ClickHouse ${{ matrix.clickhouse }} from PostgreSQL, SQLAlchemy ${{ matrix.sqlalchemy }}
+    timeout-minutes: 30
     runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
+        suite: [merge, tracking]
         # 23.8 is the oldest server dbmerge accepts.
         clickhouse: ['23.8', 'latest']
         sqlalchemy: ['2.0', '2.1']
@@ -83,4 +85,4 @@ jobs:
           DBMERGE_TEST_ENGINES: clickhouse
           DBMERGE_TEST_CLICKHOUSE_POSTGRES: postgres:5432
         run: |
-          uv run --no-sync pytest tests/test_all.py -v --tb=short -k linked_postgresql
+          uv run --no-sync pytest ${{ matrix.suite == 'tracking' && 'tests/test_mart_clickhouse.py' || 'tests/test_all.py -k linked_postgresql' }} -v --tb=short

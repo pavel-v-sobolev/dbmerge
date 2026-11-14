@@ -8,12 +8,14 @@ on:
 
 jobs:
   test_mariadb:
-    name: mariadb, SQLAlchemy ${{ matrix.sqlalchemy }}
+    name: ${{ matrix.suite }} — mariadb, SQLAlchemy ${{ matrix.sqlalchemy }}
+    timeout-minutes: 30
     runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
+        suite: [merge, tracking]
         sqlalchemy: ['2.0', '2.1']
 
     services:
@@ -64,4 +66,4 @@ jobs:
         env:
           DBMERGE_TEST_ENGINES: mariadb
         run: |
-          uv run --no-sync pytest tests/test_all.py tests/test_tracking.py tests/test_mart.py -v --tb=short
+          uv run --no-sync pytest ${{ matrix.suite == 'tracking' && 'tests/test_tracking.py tests/test_mart.py' || 'tests/test_all.py' }} -v --tb=short

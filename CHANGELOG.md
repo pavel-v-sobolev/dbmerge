@@ -2,11 +2,38 @@
 
 All notable changes to DBMerge. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/). Releases before 2.0.0 are described in [GitHub Releases](https://github.com/pavel-v-sobolev/dbmerge/releases).
 
-## [2.4.0] - 2026-11-13
+## [Unreleased]
+
+## [2.4.0] - 2026-11-14
+
+Tracking, leases and marts are **beta**; their APIs may change. The core `dbmerge` merge API is unchanged.
+
+### Changed
+
+- **Breaking mart callback rename:** `MartHandler.process_changes(ctx)` and `MartLoop(..., process_changes=...)` replace `handle`; module/callable adapters and examples use the new name, with no `handle` alias.
+- **Consumer progress:** `exec`/`exec_merge` no longer accept `next_watermark`. MartLoop commits a stable `row_kind="watermark"` in the same journal after the whole handler succeeds, guarded by its live lease in the progress transaction. Rebuilds retain a start boundary instead of publishing progress before work.
+- **Lease/lifecycle:** lease acquisition is nonreentrant; `still_mine` checks only and `renew` explicitly extends a fresh hold. Tracker/lease heartbeats use an independent pool (or caller-supplied `heartbeat_engine`). Each mart pass releases its lease in `finally`; tracker close drains active writes before stopping heartbeats. Process-wide `request_stop` reaches direct and future loops; `reset_stop` permits new loops after a stop.
+- **Breaking tracker API:** use `exec_merge(merge, scope=...)` for merges and `exec(operation, destination=..., scope=...)` for other committed writes. The common executor treats only `False` or numeric zero as no change, preserves original results, and removes the `changed` override. Journals gain a nullable `scope` column; MartLoop can filter wakeups by scope without filtering safe boundaries.
+- **Breaking mart API:** `MartHandler(engine, ...)` now requires an explicit engine; `destination` replaces `mart_table`, and `destination` plus non-empty `sources` are validated at construction (class declarations or constructor overrides). The separate mart `name` is removed; a destination-derived lease is created automatically. Use `handler.loop(tracker)` / `handler.run_forever(tracker)` and `ctx.destination`.
+- Rebuild helpers now take `(tracking_engine, destination, *, schema=None)`; service-table schema and destination identity are separate. Rebuild state lives in the transactional tracking engine, including for ClickHouse destinations.
+
+### Fixed
+
+- Retain rebuild requests received during an active rebuild, including before its first block; add scope-filtered mart wakeups and disabled-consumer catch-up without filtering safe boundaries. Recovery now prunes previous finished operation rows too.
+- Preserve durable last-change timestamps per destination/schema/scope in dedicated `row_kind="change"` rows of `dbmerge_tracking`, without a second tracking table; no-ops and watermark writes no longer erase prior change signals. Completion/recovery publish atomically with journal updates, using monotonic timestamps for out-of-order finishes. Backfill surviving legacy change rows at startup; `is_changed_since(..., scope=...)` can filter change categories without filtering safe boundaries.
+- Preserve finished tracking rows and watermarks of same-named tables in different schemas; allow schema-scoped `reset`.
+- Watch sources from different schemas independently; match no-schema references exactly.
+- Repair rebuild helpers referencing removed identity functions; do not recover expired lease rows as abandoned merges, and recheck heartbeat expiration before recovery writes.
+- Close automatically created trackers on runner exit; retain caller-owned shared leases; retain stop requests made before entering the poll loop.
 
 ### Added
 
-- **Resumable rebuilds** (`dbmerge.mart`): `MartHandler.rebuild` is now a generator that yields one label per committed block; `MartLoop` saves the label in a new per-mart `dbmerge_marts` table (`full_rebuild_is_required` + `rebuild_cursor`) so an interrupted rebuild resumes from the next block, and it applies incremental changes between blocks. `request_rebuild(engine, schema, table_name)` / `rebuild_requested(...)` manage the flag; `MergeTracker.mark_watermark(...)` seals the watermark of a first rebuild.
+- Independent, time-bounded tracking/marts CI jobs across the transactional engine and Python matrices; a dedicated ClickHouse/PostgreSQL mart job. Regression coverage includes process crashes/restarts, heartbeat failure/retry and shutdown timeout, rebuild-start request races, and legacy mart-state migration.
+- `run_mart(..., run_forever=False)` for one pending pass with error propagation and automatic tracker/lease cleanup; both mart examples call it directly under `if __name__ == "__main__"`, without a main function, arguments, or signals.
+- Tracking/marts audit with prioritized reliability recommendations and usage documentation in `TRACKING_AND_MARTS.md`.
+- Include the tracking/marts guide and runnable examples in the source distribution.
+
+- **Resumable rebuilds** (`dbmerge.mart`): `MartHandler.rebuild` yields one label per committed block; `MartLoop` saves the label in a per-mart `dbmerge_marts` table so an interrupted rebuild resumes from the next block, and it applies incremental changes between blocks. `request_rebuild(tracking_engine, destination, schema=...)` / `rebuild_requested(...)` manage requests; MartLoop publishes the stored rebuild boundary only after successful completion.
 - **Simplified table identity in the service tables** (`dbmerge.tracking`, `dbmerge.mart`): the journal and `dbmerge_marts` identify a table by `schema` + `table_name` only (the `database_type`/`instance_name`/`database_name` columns are gone, and `Database`/`database_of` are removed). Read methods take `schema=`; two databases with a conflicting name need separate tracking tables.
 
 ## [2.3.1] - 2026-11-13

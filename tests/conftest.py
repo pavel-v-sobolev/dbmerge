@@ -3,7 +3,7 @@
 A test that needs a live database is parametrized with ``engine_name`` (a key of ``engines``) and
 calls ``make_engine(engine_name)``. The matrix is narrowed by the ``DBMERGE_TEST_ENGINES``
 environment variable, and individual URLs by ``DBMERGE_TEST_URL_<NAME>``; the CI workflows set
-these and run ``pytest tests/test_all.py tests/test_tracking.py tests/test_mart.py``.
+these and run merge and tracking/marts suites in independent, time-bounded jobs.
 """
 
 import os

@@ -9,7 +9,7 @@ it runs one MartLoop per mart, and the "should I run" decision is made from the 
 full story.
 
 Key requirement: the loads that write the source tables must go through the same MergeTracker
-(tracker.exec(merge)), otherwise the marts never see a change. This runner only wires the mart
+(tracker.exec_merge(merge)), otherwise the marts never see a change. This runner only wires the mart
 side.
 
 Each mart runs in its own thread. The order is undefined: if one mart depends on another,
@@ -34,17 +34,25 @@ from orders_by_customer import OrdersByCustomer
 DB_URL = "postgresql://user:password@host:5432/db"  # replace with your connection string
 POLL_INTERVAL = 60          # seconds between checks
 
-# The main pool: tune pool_size/max_overflow to at least one connection per mart below. The
-# MergeTracker and Lease heartbeats use the same engine briefly, so leave a little headroom.
-engine = create_engine(DB_URL, pool_pre_ping=True)
+def main() -> None:
+    # Allow headroom in the pool for merge and lease heartbeat connections.
+    engine = create_engine(DB_URL, pool_pre_ping=True)
+    try:
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+        # One line per mart; each runs with its own automatically closed tracker.
+        with ThreadPoolExecutor(thread_name_prefix='mart') as executor:
+            futures = [executor.submit(run_mart, OrdersByCustomer(engine),
+                                       poll_interval=POLL_INTERVAL)]
+            for future in futures:
+                try:
+                    future.result()
+                except BaseException:
+                    request_stop()
+                    raise
+    finally:
+        engine.dispose()
 
-# --- Run -----------------------------------------------------------------------------------------
 
-signal.signal(signal.SIGTERM, request_stop)
-signal.signal(signal.SIGINT, request_stop)
-
-# One line per mart; each runs in its own thread with its own tracker.
-with ThreadPoolExecutor(thread_name_prefix='mart') as executor:
-    executor.submit(run_mart, OrdersByCustomer(), engine,
-                    poll_interval=POLL_INTERVAL)
-    # executor.submit(run_mart, AnotherMart(), engine, poll_interval=POLL_INTERVAL)
+if __name__ == "__main__":
+    main()
