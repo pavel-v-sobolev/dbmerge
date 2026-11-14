@@ -254,7 +254,11 @@ class MartContext:
 ## Reliability tests and CI
 
 Transactional-engine workflows and the Python matrix run merge and tracking/marts as
-independent jobs (`suite: merge` / `tracking`), each with a 30-minute job timeout.
+independent jobs (`suite: merge` / `tracking`). Tracking jobs have a 30-minute
+timeout; merge jobs use 30 minutes except the CockroachDB and Python-version
+workflows, which allow 90 minutes for their larger/slower merge matrix. These two
+workflows report the 20 slowest tests and dump a traceback after 180 seconds in a
+test (diagnostic only, not a per-test cancellation).
 A stalled merge suite cannot prevent the tracking/marts suite from starting.
 Tracking/marts retain the workflow's existing engine, driver and SQLAlchemy matrix.
 

@@ -9,7 +9,9 @@ on:
 jobs:
   test_cockroach:
     name: ${{ matrix.suite }} — ${{ matrix.engine }}, SQLAlchemy ${{ matrix.sqlalchemy }}
-    timeout-minutes: 30
+    # Merge scenarios over the sample dataset exceed 30 minutes on hosted runners.
+    # Keep the independent tracking suite on its shorter budget.
+    timeout-minutes: ${{ matrix.suite == 'merge' && 90 || 30 }}
     runs-on: ubuntu-latest
 
     strategy:
@@ -73,4 +75,4 @@ jobs:
         env:
           DBMERGE_TEST_ENGINES: ${{ matrix.engine }}
         run: |
-          uv run --no-sync pytest ${{ matrix.suite == 'tracking' && 'tests/test_tracking.py tests/test_mart.py' || 'tests/test_all.py' }} -v --tb=short
+          uv run --no-sync pytest ${{ matrix.suite == 'tracking' && 'tests/test_tracking.py tests/test_mart.py' || 'tests/test_all.py' }} -v --tb=short --durations=20 -o faulthandler_timeout=180

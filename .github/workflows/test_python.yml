@@ -9,7 +9,8 @@ on:
 jobs:
   test_python:
     name: ${{ matrix.suite }} — Python ${{ matrix.python }}, ${{ matrix.pyarrow && 'with' || 'without' }} pyarrow
-    timeout-minutes: 30
+    # The multi-engine, no-pyarrow merge job uses slow row-by-row staging loads.
+    timeout-minutes: ${{ matrix.suite == 'merge' && 90 || 30 }}
     runs-on: ubuntu-latest
 
     strategy:
@@ -74,4 +75,4 @@ jobs:
         env:
           DBMERGE_TEST_ENGINES: ${{ matrix.engines }}
         run: |
-          uv run --no-sync pytest ${{ matrix.suite == 'tracking' && 'tests/test_tracking.py tests/test_mart.py' || 'tests/test_all.py' }} -v --tb=short
+          uv run --no-sync pytest ${{ matrix.suite == 'tracking' && 'tests/test_tracking.py tests/test_mart.py' || 'tests/test_all.py' }} -v --tb=short --durations=20 -o faulthandler_timeout=180
