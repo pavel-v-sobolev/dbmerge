@@ -21,6 +21,19 @@ def reset_process_stop():
     reset_stop()
 
 
+@pytest.mark.parametrize("dialect_name", ["mssql", "oracle"])
+def test_marts_boolean_default_uses_dialect_literal(dialect_name):
+    import importlib
+    from sqlalchemy import MetaData
+    from sqlalchemy.schema import CreateTable
+    from dbmerge.mart import _marts_table
+
+    dialect = importlib.import_module(f"sqlalchemy.dialects.{dialect_name}").dialect()
+    ddl = str(CreateTable(_marts_table(MetaData(), None)).compile(dialect=dialect))
+    assert "DEFAULT 0" in ddl
+    assert "DEFAULT false" not in ddl
+
+
 def test_whole_handler_owns_watermark(engine, tracker):
     from datetime import datetime
     destination = (None, f"progress_{uuid.uuid4().hex[:8]}")
@@ -112,7 +125,8 @@ def test_legacy_marts_table_migration_preserves_rebuild_state(engine, tracker, m
         request_rebuild(engine, ("business", "mart"), schema=tracker.schema)
         assert rebuild_requested(engine, ("business", "mart"), schema=tracker.schema)
     finally:
-        legacy.drop(engine, checkfirst=True)
+        # Keep reflection (checkfirst's SELECT) outside the DDL transaction on CockroachDB.
+        legacy.drop(engine, checkfirst=False)
 
 
 def test_rebuild_resumes_in_new_process_after_crash(engine, tracker):
@@ -255,9 +269,16 @@ def test_process_stop_reaches_direct_and_future_loops(engine, tracker):
 
 def test_scope_filter_does_not_exclude_full_load_from_boundary(engine, tracker):
     from datetime import datetime
+    # This tests scope, not expiry. SQLite's second-resolution clock can make a
+    # one-second test TTL expire across a second boundary before its next heartbeat.
+    tracker.heartbeat_ttl = 60.0
     destination = (None, f"boundary_{uuid.uuid4().hex[:8]}")
     tracker.mark_watermark(destination[1], datetime(2000, 1, 1))
     active, started = tracker._begin("source", "", "full_load")
+    # Compare against the stored value: Oracle DATE rounds away fractional seconds.
+    from sqlalchemy import select
+    with engine.connect() as conn:
+        started = conn.scalar(select(tracker.table.c.started_at).where(tracker.table.c.id == active))
     tracker.exec(lambda: 1, destination="source", scope="changes")
     seen = []
     loop = MartLoop(engine, tracker, destination, ["source"], seen.append, scope="changes")

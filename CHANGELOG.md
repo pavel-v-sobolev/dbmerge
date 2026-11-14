@@ -4,6 +4,17 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-11-14
+
+Tracking, leases and marts remain **beta**. The core merge API is unchanged.
+
+### Fixed
+
+- **MSSQL / Oracle:** compile the mart-state boolean default with the database dialect instead of emitting unsupported `DEFAULT false` SQL.
+- **Oracle:** retain no-schema mart identities and the active rebuild cursor before its first block; empty strings are stored with nonempty internal markers because Oracle treats them as NULL.
+- **CockroachDB:** explicitly type the monotonic change-timestamp and watermark `CASE` updates so naive datetime parameters do not cause TIMESTAMP/TIMESTAMPTZ conflicts.
+- **Regression tests:** keep CockroachDB cleanup DDL separate from reflection, avoid unintended heartbeat expiry in the scope/boundary test, and compare boundary timestamps at the database's stored precision. Add MSSQL/Oracle boolean-default compilation checks.
+
 ## [2.4.0] - 2026-11-14
 
 Tracking, leases and marts are **beta**; their APIs may change. The core `dbmerge` merge API is unchanged.

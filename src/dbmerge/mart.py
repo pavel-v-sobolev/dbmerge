@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Iterator
 
 from sqlalchemy import (Boolean, Column, DateTime, MetaData, String, Table, and_, exists, func, inspect,
-                        case, insert, or_, schema, select, text, update)
+                        case, false, insert, or_, schema, select, text, update)
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
@@ -51,7 +51,7 @@ def _marts_table(metadata: MetaData, schema_name: str | None) -> Table:
         MARTS_TABLE, metadata,
         Column("table_name", String(255), primary_key=True),
         Column("schema", String(255), primary_key=True),
-        Column("full_rebuild_is_required", Boolean, nullable=False, server_default=text("false")),
+        Column("full_rebuild_is_required", Boolean, nullable=False, server_default=false()),
         Column("rebuild_cursor", String(255), nullable=True),
         Column("rebuild_request", String(36), nullable=True),
         Column("rebuild_boundary", DateTime(timezone=True), nullable=True),
@@ -117,7 +117,11 @@ def _sources(sources) -> frozenset[tuple[str | None, str]]:
 
 
 def _marts_row_where(table, schema: str | None, table_name: str):
-    return and_(table.c.table_name == table_name, table.c.schema == (schema or ""))
+    # Oracle treats '' as NULL, which cannot be part of this composite primary key.
+    # Accept the old empty-string representation as well as the nonempty sentinel.
+    schema_condition = (table.c.schema == schema if schema else
+                        or_(table.c.schema == " ", table.c.schema == "", table.c.schema.is_(None)))
+    return and_(table.c.table_name == table_name, schema_condition)
 
 
 @dataclass(frozen=True)
@@ -295,8 +299,9 @@ class MartLoop:
     def _rebuild_cursor(self):
         table = self._get_marts_table()
         with self.tracker.engine.connect() as conn:
-            return conn.scalar(select(table.c.rebuild_cursor)
-                               .where(_marts_row_where(table, self._mart_schema, self._mart_name)))
+            cursor = conn.scalar(select(table.c.rebuild_cursor)
+                                 .where(_marts_row_where(table, self._mart_schema, self._mart_name)))
+        return "" if cursor == " " and self.tracker.engine.dialect.name == "oracle" else cursor
 
     def _write_rebuild_cursor(self, cursor) -> None:
         self._ensure_marts_row()
@@ -333,7 +338,8 @@ class MartLoop:
                 self._guard_progress(conn)
                 conn.execute(update(table).where(_marts_row_where(
                     table, self._mart_schema, self._mart_name))
-                    .values(rebuild_boundary=context.next_watermark, rebuild_cursor="",
+                    .values(rebuild_boundary=context.next_watermark,
+                            rebuild_cursor=" " if self.tracker.engine.dialect.name == "oracle" else "",
                             full_rebuild_is_required=case(
                                 (table.c.rebuild_request == self._observed_request, False),
                                 else_=table.c.full_rebuild_is_required)))
@@ -610,7 +616,7 @@ def _ensure_state_row(engine, table, destination_schema, table_name):
         if conn.scalar(select(table.c.table_name).where(condition)) is not None:
             return
         try:
-            conn.execute(insert(table).values(table_name=table_name, schema=destination_schema or ""))
+            conn.execute(insert(table).values(table_name=table_name, schema=destination_schema or " "))
             conn.commit()
         except IntegrityError:
             conn.rollback()

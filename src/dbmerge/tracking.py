@@ -40,7 +40,8 @@ from numbers import Number
 from typing import Any, Callable, Iterable
 
 from sqlalchemy import (Boolean, Column, DateTime, Engine, MetaData, String, Table,
-                         case, create_engine, delete, func, inspect, insert, or_, schema, select, text, update)
+                         case, cast, create_engine, delete, func, inspect, insert, literal, or_, schema,
+                         select, text, update)
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from .dbmerge import IncorrectParameter, logger
@@ -433,9 +434,14 @@ class MergeTracker:
         cannot replace a newer mark with an older timestamp, even when commits arrive out of order.
         """
         c = self.table
+        # CASE arms need the column's SQL type even when a caller supplies a naive datetime.
+        # CockroachDB does not implicitly unify TIMESTAMP and TIMESTAMPTZ here.
+        stamp = literal(changed_at, type_=c.c.changed_at.type)
+        if self.engine.dialect.name == "cockroachdb":
+            stamp = cast(stamp, c.c.changed_at.type)
         conn.execute(update(c).where(c.c.id == self._change_key(table_name, schema, scope))
                      .values(changed_at=case(
-                         (or_(c.c.changed_at.is_(None), c.c.changed_at < changed_at), changed_at),
+                         (or_(c.c.changed_at.is_(None), c.c.changed_at < stamp), stamp),
                          else_=c.c.changed_at)))
 
     def _backfill_changes(self):
@@ -680,8 +686,11 @@ class MergeTracker:
                     raise RuntimeError("Lease lost before committing mart progress")
             previous = conn.scalar(select(t.c.watermark).where(t.c.id == key))
             if previous is not None:
+                stamp = literal(watermark, type_=t.c.watermark.type)
+                if self.engine.dialect.name == "cockroachdb":
+                    stamp = cast(stamp, t.c.watermark.type)
                 conn.execute(update(t).where(t.c.id == key).values(watermark=case(
-                    (t.c.watermark < watermark, watermark), else_=t.c.watermark)))
+                    (t.c.watermark < stamp, stamp), else_=t.c.watermark)))
             else:
                 conn.execute(insert(t).values(id=key, row_kind="watermark", owner=self.owner,
                     table_name=table_name, schema=schema or "", started_at=now,
