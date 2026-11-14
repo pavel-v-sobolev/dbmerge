@@ -551,6 +551,10 @@ def test_exec_merge_preserves_exact_result_and_detects_updated_deleted_counts(tr
 
 
 def test_safe_boundary_includes_active_operations_of_every_scope(tracker):
+    # This tests scope selection, not heartbeat expiry. Oracle stores heartbeat
+    # timestamps at second precision; a one-second TTL can expire at a boundary
+    # before the first background heartbeat runs on a busy CI runner.
+    tracker.heartbeat_ttl = 60.0
     for scope in ("full_load", "changes"):
         def operation():
             with tracker.engine.connect() as conn:
