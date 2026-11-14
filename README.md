@@ -146,7 +146,7 @@ DBMerge modifies your target table in bulk, and three deliberate design trade-of
 
 Read [Data Loss Risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#data-loss-risks) for the full list and the pre-merge checklist.
 
-## Change Tracking & Marts
+## Change Tracking & Marts (beta)
 
 Beyond a single merge, DBMerge ships two optional layers that turn merges into a coordinated pipeline:
 

@@ -49,7 +49,7 @@ def test_mart_runs_when_source_changed(engine, tracker):
         seen.append(ctx)
         with _dbmerge(ctx.engine, table_name=ctx.mart_table,
                      data=[{"id": 1}], key=["id"]) as merge:
-            ctx.tracker.exec(merge, boundary=ctx.boundary)
+            ctx.tracker.exec(merge, next_watermark=ctx.next_watermark)
 
     mart = MartLoop(engine, tracker, name="m", mart_table="mart",
                     sources=["orders"], handle=handle)
@@ -114,7 +114,7 @@ class RecordingHandler(MartHandler):
         self.handle_calls += 1
         with _dbmerge(ctx.engine, table_name=ctx.mart_table,
                      data=[{"id": 1}], key=["id"]) as merge:
-            ctx.tracker.exec(merge, boundary=ctx.boundary)
+            ctx.tracker.exec(merge, next_watermark=ctx.next_watermark)
 
     def rebuild(self, ctx):
         self.rebuild_calls += 1
@@ -199,7 +199,7 @@ def test_run_mart_and_request_stop(engine, tracker):
         def handle(self, ctx):
             with _dbmerge(ctx.engine, table_name=ctx.mart_table,
                          data=[{"id": 1}], key=["id"]) as merge:
-                ctx.tracker.exec(merge, boundary=ctx.boundary)
+                ctx.tracker.exec(merge, next_watermark=ctx.next_watermark)
 
     thread = threading.Thread(target=run_mart, args=(M(), engine, tracker),
                               kwargs={"poll_interval": 0.05}, daemon=True)
@@ -209,3 +209,52 @@ def test_run_mart_and_request_stop(engine, tracker):
     thread.join(timeout=5)
     assert not thread.is_alive()
 
+
+def test_rebuild_blocks_seal_and_resume(engine, tracker):
+    seen = []
+
+    class M(MartHandler):
+        name = "m"
+        mart_table = "mart"
+        sources = ["orders"]
+        crash = True
+
+        def handle(self, ctx):
+            seen.append(("handle", ctx.rebuild_from))
+            with _dbmerge(ctx.engine, table_name=ctx.mart_table,
+                         data=[{"id": 1}], key=["id"]) as merge:
+                ctx.tracker.exec(merge, next_watermark=ctx.next_watermark)
+
+        def rebuild(self, ctx):
+            seen.append(("rebuild", ctx.rebuild_from))
+            if not ctx.rebuild_from:
+                with _dbmerge(ctx.engine, table_name=ctx.mart_table,
+                             data=[{"id": 1}], key=["id"]) as merge:
+                    merge.exec()
+                yield "b1"
+                if self.crash:
+                    self.crash = False
+                    raise RuntimeError("simulated crash")
+            with _dbmerge(ctx.engine, table_name=ctx.mart_table,
+                         data=[{"id": 2}], key=["id"]) as merge:
+                merge.exec()
+            yield "b2"
+
+    with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
+        tracker.exec(merge)
+
+    mart = M().loop(engine, tracker, poll_interval=0.05)
+    with pytest.raises(RuntimeError):
+        mart.run_if_pending()
+
+    # The watermark was sealed and the cursor survived the crash.
+    assert tracker.watermark("mart") is not None
+
+    # Resume: the already-done "b1" block is skipped, then the rebuild finishes.
+    seen.clear()
+    assert mart.run_if_pending() is True
+    assert ("rebuild", "b1") in seen
+
+    # A finished rebuild leaves nothing pending.
+    assert mart.run_if_pending() is False
+    mart.close()

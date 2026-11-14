@@ -170,7 +170,7 @@ def test_boundary_ignores_abandoned_merge(engine, tracker):
 
 def test_watermark_and_reset(engine, tracker):
     with _dbmerge(engine, table_name="mart", data=_rows(), key=["id"]) as merge:
-        tracker.exec(merge, boundary=datetime(2026, 1, 1, 12, 0, 0))
+        tracker.exec(merge, next_watermark=datetime(2026, 1, 1, 12, 0, 0))
 
     assert tracker.watermark("mart") is not None
     tracker.reset("mart")

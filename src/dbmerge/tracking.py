@@ -90,7 +90,7 @@ class MergeRecord:
     started_at: datetime
     finished_at: datetime | None
     changed: bool
-    boundary: datetime | None
+    watermark: datetime | None
 
 
 @dataclass(frozen=True)
@@ -146,9 +146,9 @@ def _tracking_table(metadata: MetaData, name: str, schema: str | None) -> Table:
         Column("heartbeat_at", DateTime(timezone=True), nullable=False),
         # Whether the merge actually wrote rows (inserted + updated + deleted > 0). Set on finish.
         Column("changed", Boolean, nullable=True),
-        # For a mart merge: the upper bound of the window it processed, recorded on success. It is
-        # the watermark the next mart update starts from. A recovered row never has one.
-        Column("boundary", DateTime(timezone=True), nullable=True),
+        # For a mart merge: the watermark recorded on success — the upper bound of the window it
+        # processed, and where the next mart update starts from. A recovered row never has one.
+        Column("watermark", DateTime(timezone=True), nullable=True),
         schema=schema,
     )
 
@@ -233,7 +233,7 @@ class MergeTracker:
 
     # ------------------------------------------------------------------ tracking
 
-    def exec(self, merge, *, boundary: datetime | None = None,
+    def exec(self, merge, *, next_watermark: datetime | None = None,
              changed: bool | None = None, with_lease: bool = False,
              wait_lease: bool = False, wait_timeout: float | None = None,
              wait_interval: float = 30.0, **exec_kwargs):
@@ -241,8 +241,8 @@ class MergeTracker:
 
         ``merge`` is a dbmerge instance (or anything with ``table_name``, ``exec`` and the
         inserted/updated/deleted row counters). The table name comes from the merge itself, and
-        ``changed`` is derived from its counters unless it is passed explicitly. ``boundary`` is
-        recorded on success and is the watermark the next mart update starts from.
+        ``changed`` is derived from its counters unless it is passed explicitly. ``next_watermark``
+        is recorded on success and is the watermark the next mart update starts from.
 
         ``with_lease`` makes the merge exclusive per table: before starting, the tracker claims the
         table's name in the journal, so a second process never merges the same table at the same
@@ -266,8 +266,8 @@ class MergeTracker:
                                      f"run it via exec() before it runs")
         if changed is not None and not isinstance(changed, bool):
             raise IncorrectParameter(f"changed must be True, False or None, got {changed!r}")
-        if boundary is not None and not isinstance(boundary, datetime):
-            raise IncorrectParameter(f"boundary must be a datetime or None, got {boundary!r}")
+        if next_watermark is not None and not isinstance(next_watermark, datetime):
+            raise IncorrectParameter(f"next_watermark must be a datetime or None, got {next_watermark!r}")
         if wait_interval <= 0:
             raise IncorrectParameter("wait_interval must be positive")
 
@@ -295,11 +295,11 @@ class MergeTracker:
                 changed = (getattr(merge, "inserted_row_count", 0)
                            + getattr(merge, "updated_row_count", 0)
                            + getattr(merge, "deleted_row_count", 0)) > 0
-            finished_at = self._finish(row_id, table_name, changed, boundary)
+            finished_at = self._finish(row_id, table_name, changed, next_watermark)
             return (MergeRecord(table_name=table_name, database_type=database.type,
                                 server=database.server, database_name=database.database,
                                 started_at=started_at, finished_at=finished_at,
-                                changed=changed, boundary=boundary),
+                                changed=changed, watermark=next_watermark),
                     merge_result)
         finally:
             if lease_name is not None:
@@ -322,7 +322,7 @@ class MergeTracker:
         return row_id, now
 
     def _finish(self, row_id: str, table_name: str, changed: bool,
-                boundary: datetime | None) -> datetime:
+                watermark: datetime | None) -> datetime:
         """Mark the row finished, replace earlier finished rows of the table, stop its heartbeat."""
         with self._lock:
             self._in_flight.discard(row_id)
@@ -330,7 +330,7 @@ class MergeTracker:
         with self.engine.connect() as conn:
             now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             conn.execute(update(t).where(t.c.id == row_id)
-                         .values(finished_at=now, changed=changed, boundary=boundary))
+                         .values(finished_at=now, changed=changed, watermark=watermark))
             # One finished row per table: the just-finished merge replaces every earlier finished
             # row. Unfinished rows are left alone.
             conn.execute(delete(t).where(t.c.table_name == table_name,
@@ -418,7 +418,7 @@ class MergeTracker:
         with self.engine.connect() as conn:
             row = conn.execute(
                 select(t.c.table_name, t.c.database_type, t.c.server, t.c.database_name,
-                       t.c.started_at, t.c.finished_at, t.c.changed, t.c.boundary)
+                       t.c.started_at, t.c.finished_at, t.c.changed, t.c.watermark)
                 .where(*conds)
                 .order_by(t.c.finished_at.desc())
                 .limit(1)).first()
@@ -427,20 +427,20 @@ class MergeTracker:
         return MergeRecord(table_name=row.table_name, database_type=row.database_type,
                            server=row.server, database_name=row.database_name,
                            started_at=row.started_at, finished_at=row.finished_at,
-                           changed=bool(row.changed), boundary=row.boundary)
+                           changed=bool(row.changed), watermark=row.watermark)
 
     def watermark(self, table_name: str, database: Database | None = None) -> datetime | None:
-        """The boundary of the last successful merge of a mart, i.e. where its next update starts.
+        """The watermark of the last successful merge of a mart, i.e. where its next update starts.
 
-        Only successful finishes carry a boundary; a recovered (crashed) row has none, so a crash
+        Only successful finishes carry a watermark; a recovered (crashed) row has none, so a crash
         never advances the watermark. Returns None when the mart has no successful run yet.
         """
         t = self.table
-        conds = [t.c.table_name == table_name, t.c.boundary.is_not(None)]
+        conds = [t.c.table_name == table_name, t.c.watermark.is_not(None)]
         if database is not None:
             conds.append(self._database_where(database))
         with self.engine.connect() as conn:
-            return conn.scalar(select(func.max(t.c.boundary)).where(*conds))
+            return conn.scalar(select(func.max(t.c.watermark)).where(*conds))
 
     def is_changed_since(self, table_names: Iterable[str], since: datetime,
                          database: Database | None = None) -> bool:
@@ -461,7 +461,7 @@ class MergeTracker:
 
         A merge that died may have committed its data, so marts that missed it are woken
         unconditionally (their own query over the window is idempotent). Recovered rows carry no
-        boundary, so a crashed mart never advances its own watermark. They are left until the next
+        watermark, so a crashed mart never advances its own watermark. They are left until the next
         successful merge of the table replaces them.
         """
         t = self.table
@@ -491,6 +491,30 @@ class MergeTracker:
             result = conn.execute(
                 delete(t).where(t.c.table_name == table_name, t.c.finished_at.is_not(None)))
         return result.rowcount
+
+    def mark_watermark(self, table_name: str, watermark: datetime,
+                       database: Database | None = None) -> None:
+        """Record a finished, unchanged merge carrying a watermark, without running a merge.
+
+        MartLoop uses this to seed a mart's watermark when its first rebuild starts, so the next
+        pass is not mistaken for another rebuild.
+        """
+        if database is None:
+            database = Database("", "", "")
+        row_id = str(uuid.uuid4())
+        t = self.table
+        with self.engine.connect() as conn:
+            now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
+            conn.execute(insert(t).values(
+                id=row_id, owner=self.owner, table_name=table_name,
+                database_type=database.type, server=database.server,
+                database_name=database.database,
+                started_at=now, heartbeat_at=now, finished_at=now,
+                changed=False, watermark=watermark))
+            conn.execute(delete(t).where(
+                t.c.table_name == table_name, t.c.finished_at.is_not(None),
+                t.c.id != row_id))
+            conn.commit()
 
     # ------------------------------------------------------------------ lease
 

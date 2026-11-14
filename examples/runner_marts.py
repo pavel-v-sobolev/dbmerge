@@ -33,7 +33,6 @@ from orders_by_customer import OrdersByCustomer
 
 DB_URL = "postgresql://user:password@host:5432/db"  # replace with your connection string
 POLL_INTERVAL = 60          # seconds between checks
-DB_SCHEMA = None            # schema for the tracking table and marts; None = engine default
 
 # The main pool: tune pool_size/max_overflow to at least one connection per mart below. The
 # MergeTracker and Lease heartbeats use the same engine briefly, so leave a little headroom.
@@ -47,6 +46,5 @@ signal.signal(signal.SIGINT, request_stop)
 # One line per mart; each runs in its own thread with its own tracker.
 with ThreadPoolExecutor(thread_name_prefix='mart') as executor:
     executor.submit(run_mart, OrdersByCustomer(), engine,
-                    poll_interval=POLL_INTERVAL, schema=DB_SCHEMA)
-    # executor.submit(run_mart, AnotherMart(), engine,
-    #                 poll_interval=POLL_INTERVAL, schema=DB_SCHEMA)
+                    poll_interval=POLL_INTERVAL)
+    # executor.submit(run_mart, AnotherMart(), engine, poll_interval=POLL_INTERVAL)

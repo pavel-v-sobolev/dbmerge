@@ -11,7 +11,7 @@ If you don't need them, dbmerge works exactly as before — both are opt-in.
 
 ```
 a merge ──► a row in the tracking table ──► MartLoop sees the change ──► rebuilds the mart
-             (started/finished/changed/boundary)
+             (started/finished/changed/watermark)
 ```
 
 - Every merge wrapped in `tracker.exec(...)` leaves a row in the tracking table.
@@ -88,7 +88,7 @@ last.started_at, last.finished_at, last.changed
 tracker.watermark("orders_by_customer")                   # datetime | None
 
 # Did any of the tables really change after `since`?
-tracker.is_changed_since(["orders", "order_items"], since=last_run_at)  # bool
+tracker.is_changed_since(["orders", "order_items"], since=watermark)  # bool
 ```
 
 - `boundary(...)` — the safe boundary: everything committed up to this moment is visible and settled. It caps the **watermark**, not the read (you may read further).
@@ -104,7 +104,7 @@ One table, `dbmerge_tracking` (the name is configurable):
 | `started_at` / `finished_at` | when the merge started / finished |
 | `heartbeat_at` | "I'm still alive" — refreshed while the merge runs |
 | `changed` | whether rows changed (set on finish) |
-| `boundary` | for marts: the window this merge processed |
+| `watermark` | for marts: the watermark this merge recorded |
 
 Storage rule: **at most one finished row per table (the latest), plus any number of unfinished rows**. History does not grow.
 
@@ -148,11 +148,11 @@ class OrdersByCustomer(MartHandler):
 
     def handle(self, ctx):
         # Read everything changed since the watermark; the read is unbounded — rows to the right of
-        # ctx.boundary are processed now and again in the next window.
-        rows = build_rows(since=ctx.last_run_at)   # your SELECT, e.g. ... WHERE merged_on > :last_run_at
+        # ctx.next_watermark are processed now and again in the next window.
+        rows = build_rows(since=ctx.watermark)   # your SELECT, e.g. ... WHERE merged_on > :watermark
         with dbmerge(ctx.engine, table_name=self.mart_table,
                      data=rows, key=["customer_id"]) as merge:
-            ctx.tracker.exec(merge, boundary=ctx.boundary)
+            ctx.tracker.exec(merge, next_watermark=ctx.next_watermark)
 
     def rebuild(self, ctx):
         # a full rebuild; by default the same as handle with full_rebuild=True
@@ -172,20 +172,20 @@ Each pass (every `poll_interval` seconds):
 
 1. Recovers abandoned merges (`recover_abandoned`).
 2. Claims the mart name — so two processes never build the same mart.
-3. Reads its watermark: `last_run_at = tracker.watermark(mart_table)` (the first run starts from the beginning).
-4. Computes the boundary: `boundary = tracker.boundary(sources)`.
-5. Asks: `tracker.is_changed_since(sources, since=last_run_at)`.
+3. Reads its watermark: `watermark = tracker.watermark(mart_table)` (the first run starts from the beginning).
+4. Computes the next watermark: `next_watermark = tracker.boundary(sources)`.
+5. Asks: `tracker.is_changed_since(sources, since=watermark)`.
    - no change → skip;
-   - a change, but `boundary <= last_run_at` → wait (a source is still being written).
+   - a change, but `next_watermark <= watermark` → wait (a source is still being written).
 6. Otherwise calls `handle(ctx)`.
 
 The key point: **"should I update" is decided from timestamps, not from a signal**. An event that was "lost" (a crash, a switched-off mart) is not lost — the next pass sees it through `is_changed_since`. Therefore `handle` must be **idempotent**: it may run again.
 
 ### The watermark
 
-You don't store `last_run_at` separately. When `handle` finishes the mart merge with `boundary=ctx.boundary`, that boundary is written to the mart's tracking row — the next run starts exactly from it.
+You don't store the watermark separately. When `handle` finishes the mart merge with `next_watermark=ctx.next_watermark`, that value is written to the mart's tracking row as its new watermark — the next run starts exactly from it.
 
-The read in the handler is **unbounded**: select rows by `> ctx.last_run_at`. Rows to the right of `ctx.boundary` are processed now and again in the next window (at-least-once). Only the **watermark** is capped: it always equals `ctx.boundary`, otherwise the cursor would jump over rows of an unfinished merge that aren't committed yet.
+The read in the handler is **unbounded**: select rows by `> ctx.watermark`. Rows to the right of `ctx.next_watermark` are processed now and again in the next window (at-least-once). Only the **watermark** is capped: it always equals `ctx.next_watermark`, otherwise the cursor would jump over rows of an unfinished merge that aren't committed yet.
 
 "Rebuild the mart from scratch" = delete its finished row:
 
@@ -203,8 +203,8 @@ class MartContext:
     name: str
     mart_table: str
     sources: frozenset[str]
-    last_run_at: datetime      # where to read changes from
-    boundary: datetime         # where to move the watermark (not a read cap)
+    watermark: datetime        # where to read changes from
+    next_watermark: datetime   # where to move the watermark on success (not a read cap)
     full_rebuild: bool         # True on the first run / after reset
     lease_is_mine: Any         # SQL condition "the mart name is still ours"
 ```
@@ -223,7 +223,7 @@ dbmerge_tracking
     finished_at   DateTime(tz) NULL
     heartbeat_at  DateTime(tz) NOT NULL
     changed       Boolean NULL
-    boundary      DateTime(tz) NULL
+    watermark      DateTime(tz) NULL
 ```
 
 ## Reference
@@ -233,13 +233,14 @@ dbmerge_tracking
 | member | what it does |
 |---|---|
 | `MergeTracker(engine, table_name=..., schema=..., ...)` | a long-lived journal; one tracker serves many merges. Optionally `with MergeTracker(engine) as tracker:` stops the heartbeat on exit |
-| `exec(merge, *, boundary=None, changed=None, with_lease=False, wait_lease=False, wait_timeout=None, wait_interval=30.0, **exec_kwargs)` | writes a tracking row and runs `merge.exec(**exec_kwargs)`; `with_lease` makes the merge exclusive per table and `wait_lease` waits for the holder; returns `(MergeRecord, mergeResult)`, or `(None, None)` when skipped |
+| `exec(merge, *, next_watermark=None, changed=None, with_lease=False, wait_lease=False, wait_timeout=None, wait_interval=30.0, **exec_kwargs)` | writes a tracking row and runs `merge.exec(**exec_kwargs)`; `with_lease` makes the merge exclusive per table and `wait_lease` waits for the holder; returns `(MergeRecord, mergeResult)`, or `(None, None)` when skipped |
 | `boundary(table_names, database=None)` | the safe upper boundary over these tables |
 | `last_merge(table_name, database=None)` | the last finished row, or `None` |
 | `watermark(table_name, database=None)` | the boundary of the mart's last successful merge, or `None` |
 | `is_changed_since(table_names, since, database=None)` | whether there was a real change after `since` |
 | `recover_abandoned()` | marks stale unfinished rows as changed |
 | `reset(table_name)` | deletes the finished row (rebuild from scratch) |
+| `mark_watermark(table_name, watermark, database=None)` | records a finished, unchanged merge carrying a watermark — seals a mart's watermark after its first rebuild |
 
 `database_of(engine)` returns `Database(type, server, database)` — the identity of the engine's database; pass it as `database=` to the read methods. The mart-name lease is the `Lease` class in the same table (key `lease:<name>`).
 
@@ -257,6 +258,11 @@ runs one mart until `request_stop()` is called: it wraps the handler into a `Mar
 `run_mart` to stop after its current pass — wire it to SIGTERM/SIGINT in a runner (see
 [examples/runner_marts.py](examples/runner_marts.py)).
 
+`request_rebuild(engine, schema, table_name)` sets the rebuild flag in the per-mart `dbmerge_marts`
+table (`full_rebuild_is_required` + `rebuild_cursor`); the next pass performs the rebuild. An
+interrupted rebuild resumes from the saved cursor — `ctx.rebuild_from` tells the handler which
+blocks are already done.
+
 ### MartHandler
 
 The base class of a mart: declare `name`, `mart_table`, `sources` and implement the methods.
@@ -264,9 +270,9 @@ The base class of a mart: declare `name`, `mart_table`, `sources` and implement 
 | member | what it does |
 |---|---|
 | `setup(ctx)` | one-time preparation before the first run (DDL) |
-| `handle(ctx)` | the incremental work; records the watermark via `tracker.exec(..., boundary=ctx.boundary)` |
-| `rebuild(ctx)` | a full rebuild; by default `handle` with `full_rebuild=True` |
-| `changed_since(ctx, *columns)` | an OR of `column > ctx.last_run_at` |
+| `handle(ctx)` | the incremental work; records the watermark via `tracker.exec(..., next_watermark=ctx.next_watermark)` |
+| `rebuild(ctx)` | a full rebuild, block by block — a generator that yields a label per committed block; by default `handle` + `yield "all"` |
+| `changed_since(ctx, *columns)` | an OR of `column > ctx.watermark` |
 | `execute(ctx, sql, **params)` / `query(ctx, sql, **params)` | run SQL in its own transaction / return rows |
 | `loop(engine, tracker, ...)` | build a `MartLoop` |
 | `run_forever(engine, tracker, ...)` | run the loop |
@@ -277,7 +283,7 @@ The base class of a mart: declare `name`, `mart_table`, `sources` and implement 
 
 - **Idempotency.** `handle` may run again — don't double-count.
 - **Latency.** The mart updates with a delay of up to `poll_interval` (this is polling, not push).
-- **`merged_on_field`.** Source tables are merged with a change-timestamp column, and the handler selects rows by `> ctx.last_run_at` — otherwise there is nothing to "catch up" over the window.
+- **`merged_on_field`.** Source tables are merged with a change-timestamp column, and the handler selects rows by `> ctx.watermark` — otherwise there is nothing to "catch up" over the window.
 - **One process per mart.** The mart name is claimed by a lease; a second process skips the pass.
 
 
