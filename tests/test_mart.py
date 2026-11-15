@@ -722,6 +722,10 @@ def test_shared_tracker_parallel_marts_keep_scopes_and_ownership(engine, tracker
     barrier = Barrier(2)
     seen = []
 
+    # This checks shared ownership/scope isolation, not lease expiry. SQL Server
+    # deadlock detection alone can outlast the fixture's one-second test TTL.
+    tracker.heartbeat_ttl = 30.0
+
     class M(MartHandler):
         sources = ['shared_source']
 
