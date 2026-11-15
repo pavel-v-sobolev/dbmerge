@@ -406,6 +406,26 @@ class MergeTracker:
 
     def _finish(self, row_id: str, table_name: str, changed: bool,
                 watermark: datetime | None, schema: str = "") -> datetime:
+        # On SQL Server/MySQL pruning scans can deadlock with another destination's finish
+        # even though the operation rows differ. Only retry this rolled-back journal
+        # transaction: the user's write has already committed and must not run again.
+        for attempt in range(5):
+            try:
+                return self._finish_transaction(row_id, table_name, changed, watermark, schema)
+            except DBAPIError as exc:
+                message = str(exc.orig).lower()
+                deadlock = (self.engine.dialect.name == "mssql"
+                            and ("deadlock victim" in message or "was deadlocked" in message)
+                            or self.engine.dialect.name in ("mysql", "mariadb")
+                            and "deadlock found when trying to get lock" in message)
+                if not deadlock or attempt == 4:
+                    raise
+                logger.warning('Retrying journal completion after %s deadlock (attempt %s)',
+                               self.engine.dialect.name, attempt + 1)
+                time.sleep(0.05 * 2 ** attempt)
+
+    def _finish_transaction(self, row_id: str, table_name: str, changed: bool,
+                            watermark: datetime | None, schema: str = "") -> datetime:
         """Mark the row finished, replace earlier finished rows of the table, stop its heartbeat."""
         t = self.table
         with self.engine.connect() as conn:

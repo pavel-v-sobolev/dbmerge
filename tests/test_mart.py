@@ -192,7 +192,7 @@ def test_disabled_scoped_consumer_catches_up(engine, tracker):
         assert loop.run_if_pending()
         calls.clear()
         loop.enabled = False
-        if engine.dialect.name == "sqlite":
+        if engine.dialect.name in ("sqlite", "mysql", "mariadb", "oracle"):
             time.sleep(1.1)
         tracker.exec(lambda: 1, destination="scoped_source", scope="changes")
         tracker.exec(lambda: False, destination="scoped_source", scope="changes")
@@ -547,8 +547,8 @@ def test_handler_constructor_no_lease(engine, tracker):
         assert loop.run_if_pending()
         assert seen == [True]
         assert not loop.run_if_pending()
-        if engine.dialect.name == 'sqlite':
-            time.sleep(1.1)  # SQLite timestamps have second precision.
+        if engine.dialect.name in ('sqlite', 'mysql', 'mariadb', 'oracle'):
+            time.sleep(1.1)  # These tracking clocks/columns have second precision.
         tracker.exec(lambda: 1, destination='source_without_lease', scope='changes')
         assert loop.run_if_pending()
         assert seen == [True, False]
@@ -571,7 +571,7 @@ def test_operation_scopes_follow_callbacks_and_restore_on_failure(engine, tracke
             record, _ = ctx.tracker.exec(lambda: 1, destination='auto_scope_output')
             records.append(record.scope)
             self.process_changes(ctx)  # Direct helper call remains part of this rebuild.
-            if engine.dialect.name == 'sqlite':
+            if engine.dialect.name in ('sqlite', 'mysql', 'mariadb', 'oracle'):
                 time.sleep(1.1)
             ctx.tracker.exec(lambda: 1, destination='auto_scope_source')
             yield 'first'
@@ -605,7 +605,7 @@ def test_rebuild_and_changes_use_separate_leases(engine, tracker):
 
         def rebuild(self, ctx):
             names.append(loop.name)
-            if engine.dialect.name == 'sqlite':
+            if engine.dialect.name in ('sqlite', 'mysql', 'mariadb', 'oracle'):
                 time.sleep(1.1)
             tracker.exec(lambda: 1, destination='operation_source', scope='changes')
             yield 'block'
@@ -616,7 +616,7 @@ def test_rebuild_and_changes_use_separate_leases(engine, tracker):
         tracker.exec(lambda: 1, destination='operation_source', scope='changes')
         assert loop.run_if_pending()
         # An explicit incremental pass uses a different key than the rebuild.
-        if engine.dialect.name == 'sqlite':
+        if engine.dialect.name in ('sqlite', 'mysql', 'mariadb', 'oracle'):
             time.sleep(1.1)
         tracker.exec(lambda: 1, destination='operation_source', scope='changes')
         assert loop.run_if_pending()

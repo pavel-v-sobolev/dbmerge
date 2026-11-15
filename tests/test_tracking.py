@@ -49,6 +49,78 @@ def _rows(name="a"):
     return [{"id": 1, "name": name}, {"id": 2, "name": name}]
 
 
+@pytest.mark.parametrize('dialect,message,retries', [
+    ('mssql', 'Transaction was deadlocked and chosen as the deadlock victim', True),
+    ('mariadb', 'Deadlock found when trying to get lock; try restarting transaction', True),
+    ('mysql', 'Deadlock found when trying to get lock; try restarting transaction', True),
+    ('mysql', 'Lock wait timeout exceeded', False),
+    ('mssql', 'Connection lost', False),
+    ('postgresql', 'Transaction was deadlocked and chosen as the deadlock victim', False),
+])
+def test_journal_completion_retries_only_known_deadlocks(dialect, message, retries):
+    from unittest.mock import Mock, patch
+    from sqlalchemy.exc import OperationalError
+
+    tracker = object.__new__(MergeTracker)
+    tracker.engine = Mock()
+    tracker.engine.dialect.name = dialect
+    failure = OperationalError('UPDATE journal', {}, Exception(message))
+    stamp = datetime(2026, 1, 1)
+    tracker._finish_transaction = Mock(side_effect=[failure, stamp])
+    with patch('dbmerge.tracking.time.sleep') as sleep:
+        if retries:
+            assert tracker._finish('id', 'orders', True, None) == stamp
+            assert tracker._finish_transaction.call_count == 2
+            sleep.assert_called_once_with(0.05)
+        else:
+            with pytest.raises(OperationalError):
+                tracker._finish('id', 'orders', True, None)
+            tracker._finish_transaction.assert_called_once()
+            sleep.assert_not_called()
+
+
+def test_journal_completion_deadlock_retries_are_bounded():
+    from unittest.mock import Mock, patch
+    from sqlalchemy.exc import OperationalError
+
+    tracker = object.__new__(MergeTracker)
+    tracker.engine = Mock()
+    tracker.engine.dialect.name = 'mssql'
+    tracker._finish_transaction = Mock(side_effect=OperationalError(
+        'UPDATE journal', {}, Exception('Transaction was deadlocked')))
+    with patch('dbmerge.tracking.time.sleep') as sleep:
+        with pytest.raises(OperationalError):
+            tracker._finish('id', 'orders', True, None)
+    assert tracker._finish_transaction.call_count == 5
+    assert sleep.call_count == 4
+
+
+def test_journal_deadlock_does_not_repeat_committed_write(engine, tracker):
+    from unittest.mock import Mock, patch
+    from sqlalchemy.exc import OperationalError
+
+    if engine.dialect.name not in ('mssql', 'mysql', 'mariadb'):
+        pytest.skip('Deadlock retry is specific to SQL Server and MySQL/MariaDB')
+    finish = tracker._finish_transaction
+    attempts = []
+
+    def finish_after_deadlock(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            message = ('Transaction was deadlocked' if engine.dialect.name == 'mssql'
+                       else 'Deadlock found when trying to get lock')
+            raise OperationalError('UPDATE journal', {}, Exception(message))
+        return finish(*args, **kwargs)
+
+    write = Mock(return_value=1)
+    with patch.object(tracker, '_finish_transaction', side_effect=finish_after_deadlock):
+        record, result = tracker.exec(write, destination='deadlock_write')
+    write.assert_called_once_with()
+    assert result == 1 and record.changed
+    assert len(attempts) == 2
+    assert not tracker._in_flight
+
+
 def test_process_crash_after_commit_recovers_durable_change(engine, tracker):
     import subprocess
     import sys
