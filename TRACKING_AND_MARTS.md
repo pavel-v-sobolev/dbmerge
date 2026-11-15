@@ -433,6 +433,57 @@ The loop releases its lease on exit. Engines remain caller-owned. A pass without
 does nothing; sources and ClickHouse's external PostgreSQL mapping must already exist.
 Continuous operation remains the default (`run_forever=True`).
 
+## Concurrent full and changes example (PostgreSQL, experimental)
+
+`examples/orders_by_customer_concurrent.py` keeps the original example's composite
+key `(order_date, customer_id)` and monthly rebuild blocks. Run both handlers with
+`python examples/runner_marts_concurrent.py` after configuring the connection and
+creating the source/business/service schemas. The source is the same `orders`
+table as in `orders_by_customer.py`; this example creates a separate physical table
+`orders_by_customer_concurrent` without changing the original mart.
+
+* `OrdersByCustomerChanges` watches `scope="changes"` and owns destination
+  `orders_by_customer_concurrent__changes`.
+* `OrdersByCustomerFull` watches `scope="full_load"` and owns destination
+  `orders_by_customer_concurrent__full`.
+
+These logical destinations have independent leases, watermarks and rebuild cursors;
+both writers journal writes to the same **physical** table. The loader must use
+the same tracking table/service schema and pass the appropriate scope to
+`tracker.exec_merge`. Scope selects signals, not rows: both handlers read current
+source values. For pre-existing data without journal signals, call
+`request_rebuild(engine, full.destination, schema=TRACKING_SCHEMA)` explicitly.
+
+Before reading each monthly snapshot, full takes `tracker.safe_boundary` over
+**writes to the physical mart**. It reads amounts outside the write lock, then
+applies `INSERT ... ON CONFLICT DO UPDATE ... WHERE target.touched_at <= boundary`.
+Changes writes unconditionally and renews `touched_at` even when totals are equal,
+protecting against an intermediate full snapshot after an A→B→A change. The timestamp
+uses `clock_timestamp()` after acquiring the write lock, not transaction-start time.
+Tracked operations finish only after their data commits.
+
+Both writers use the same short transaction-scoped advisory lock for applying data.
+Full does not hold it during its aggregate SELECT, so changes need not wait for the
+entire rebuild. Full publishes the block's keys as empty tombstones before reading
+amounts: if changes deletes the last order before the first full write, it can still
+find that old group and protect it from resurrection. Query results with
+`WHERE NOT is_deleted`; do not physically clean up tombstones without a separate
+safe retention protocol. Old groups are also retained when a date/customer changes.
+
+Limits: this is a PostgreSQL algorithm example, not a portable or ClickHouse recipe.
+Changes currently reconciles **all** groups under the write lock; finding only
+affected old/new keys is a future optimization. A monthly full block can also be
+large, so tune partition size for your data. Readers see blockwise progress, not
+an atomic table replacement; newly published placeholder keys temporarily appear
+deleted. All writers must follow this protocol and share a live journal/heartbeat.
+Lease loss and heartbeat expiry retain the beta reliability limits below. Do not
+run the original handler against this example's physical table.
+
+Regression tests pause a full snapshot in another thread while changes completes
+updates, soft/hard deletions, customer/date moves and inserts. They also cover
+equal-total protection and restart after a committed month. PostgreSQL tracking CI
+runs `tests/test_mart_concurrent.py` for each supported PostgreSQL driver.
+
 ## Reliability limits
 
 The current implementation is at-least-once scheduling, not an atomic snapshot or exactly-once
