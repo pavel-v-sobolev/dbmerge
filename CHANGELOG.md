@@ -4,6 +4,34 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-15
+
+Tracking, leases and marts remain **beta**. Existing untracked merge calls retain their behavior.
+
+### Added
+
+- Optional `dbmerge(..., tracker=tracker)`: normal `merge.exec()` journals the operation and still returns `mergeResult`. The journal record is available as `merge.tracking_record`; omitting the tracker preserves untracked behavior.
+- `mart.run_once(rebuild=True)` requests a full rebuild and executes one pass through its remaining blocks, resuming a saved cursor. A busy lease returns `False` and leaves the request pending.
+- One-off full rebuild example in `examples/rebuild_mart.py` and a continuous runner with signal handling and ordered worker/tracker/engine shutdown.
+
+### Changed
+
+- **Beta mart API:** require an explicit SQLAlchemy data engine and an open, caller-owned `tracker=` in `MartHandler`. Use `mart.run_forever(poll_interval=...)`, `mart.run_once()` or `mart.loop()`; the separate `run_mart` entry point and module/function adapters are removed.
+- Assign mart operation scopes internally: `rebuild` and `changes`. Remove the public mart scope filter; source notifications include all categories.
+- Coordinate setup, rebuild and changes with separate parent-managed leases. `with_lease=False` disables coordination and supplies a SQL TRUE write guard. Stop old workers before deploying the changed lease-key format.
+- Consolidate mart implementations into PostgreSQL and ClickHouse examples using rows/aggregate views, retained order IDs, tombstones and monthly rebuild blocks. ClickHouse uses `ReplacingMergeTree(version)`; concurrency and fencing limitations are documented.
+
+### Fixed
+
+- Permit a tracker to be shared by mart threads without mixing operation scopes or closing another worker's resources; protect lazy internal lease creation with a lock.
+- Avoid double journaling when the compatibility `tracker.exec_merge` adapter receives a merge already bound to the same tracker; reject a conflicting tracker.
+
+### Migration notes
+
+- Construct and configure `MergeTracker` externally, then pass `tracker=tracker` to both marts and tracked merges. A missing, invalid or closed mart tracker is rejected. Close shared trackers only after all worker threads have stopped.
+- The compatibility `tracker.exec_merge(...)` adapter remains available. New code should prefer `dbmerge(..., tracker=tracker)` and `merge.exec(...)`.
+- One worker applies changes **between** rebuild blocks, not in an automatically created background thread. Separate leases do not create parallel execution or fence all concurrent writes; see `TRACKING_AND_MARTS.md`.
+
 ## [2.4.1] - 2026-11-14
 
 Tracking, leases and marts remain **beta**. The core merge API is unchanged.

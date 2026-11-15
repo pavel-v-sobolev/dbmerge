@@ -520,6 +520,53 @@ def test_exec_merge_delegates_and_preserves_result(engine, tracker):
         assert not record.changed and result.inserted_row_count == 0
 
 
+def test_dbmerge_optional_tracker_and_noop(engine, tracker):
+    from unittest.mock import patch
+
+    for expected_changed in (True, False):
+        with _dbmerge(engine, tracker=tracker, table_name='orders', data=_rows(), key=['id']) as merge:
+            with patch.object(tracker, 'exec', wraps=tracker.exec) as execute, \
+                    patch.object(tracker, 'close') as close:
+                result = merge.exec(chunk_size=1)
+                execute.assert_called_once()
+                close.assert_not_called()
+            assert merge.tracking_record.changed is expected_changed
+            assert result.inserted_row_count == (2 if expected_changed else 0)
+            assert merge.chunk_size == 1
+            with pytest.raises(IncorrectParameter, match='already finished'):
+                merge.exec()
+    with _dbmerge(engine, table_name='orders', data=_rows(), key=['id']) as merge:
+        merge.exec()
+        assert merge.tracker is None and merge.tracking_record is None
+
+
+def test_dbmerge_tracker_failure_and_validation(engine, tracker):
+    from unittest.mock import patch
+
+    with pytest.raises(IncorrectParameter, match='tracker'):
+        _dbmerge(engine, tracker=object(), table_name='orders', data=_rows(), key=['id'])
+    with _dbmerge(engine, tracker=tracker, table_name='orders', data=_rows(), key=['id']) as merge:
+        with patch.object(merge, '_execute_steps', side_effect=RuntimeError('write failed')):
+            with pytest.raises(RuntimeError, match='write failed'):
+                merge.exec()
+        assert merge.merge_finished
+        assert not tracker._in_flight
+        assert not tracker._closed.is_set()
+    tracker.close()
+    with pytest.raises(IncorrectParameter, match='open'):
+        _dbmerge(engine, tracker=tracker, table_name='orders', data=_rows(), key=['id'])
+
+
+def test_bound_tracker_legacy_adapter_does_not_track_twice(engine, tracker):
+    from unittest.mock import patch
+
+    with _dbmerge(engine, tracker=tracker, table_name='orders', data=_rows(), key=['id']) as merge:
+        with patch.object(tracker, 'exec', wraps=tracker.exec) as execute:
+            record, result = tracker.exec_merge(merge)
+        execute.assert_called_once()
+        assert record.changed and result.inserted_row_count == 2
+
+
 def test_existing_tracking_table_gets_scope_column(engine):
     from sqlalchemy import Column, MetaData, String, Table, inspect
 
@@ -909,3 +956,18 @@ def test_legacy_tracking_columns_are_extended_without_another_table(engine):
             assert not inspect(engine).has_table(f"{name}_changes", schema=legacy.schema)
     finally:
         legacy.drop(engine)
+
+
+def test_shared_tracker_initializes_one_lease(engine, tracker):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    barrier = Barrier(8)
+
+    def get_lease():
+        barrier.wait(timeout=10)
+        return tracker._get_lease()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        leases = list(executor.map(lambda _: get_lease(), range(8)))
+    assert all(lease is leases[0] for lease in leases)

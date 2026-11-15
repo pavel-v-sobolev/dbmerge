@@ -7,8 +7,8 @@ import uuid
 import pytest
 
 from dbmerge import (IncorrectParameter, Lease, MartLoop, MartHandler, MergeTracker, dbmerge,
-                     as_handler, drop_table_if_exists, rebuild_requested, request_rebuild,
-                     request_stop, run_mart)
+                     drop_table_if_exists, rebuild_requested, request_rebuild,
+                     request_stop)
 
 from conftest import engines, make_engine
 
@@ -184,17 +184,19 @@ def test_disabled_scoped_consumer_catches_up(engine, tracker):
     tracker.mark_watermark(destination[1], datetime(2000, 1, 1))
     calls = []
     loop = MartLoop(engine, tracker, destination, ["scoped_source"], calls.append,
-                    scope="changes", enabled=False)
+                    enabled=False)
     try:
         tracker.exec(lambda: 1, destination="scoped_source", scope="full_load")
         assert not loop.run_if_pending()
         loop.enabled = True
-        assert not loop.run_if_pending()
+        assert loop.run_if_pending()
+        calls.clear()
         loop.enabled = False
+        if engine.dialect.name == "sqlite":
+            time.sleep(1.1)
         tracker.exec(lambda: 1, destination="scoped_source", scope="changes")
         tracker.exec(lambda: False, destination="scoped_source", scope="changes")
         assert not loop.run_if_pending()
-        assert tracker.watermark(destination[1]).year == 2000
         loop.enabled = True
         assert loop.run_if_pending()
         assert len(calls) == 1
@@ -254,9 +256,9 @@ def test_lease_loss_does_not_commit_watermark(engine, tracker):
 
 def test_process_stop_reaches_direct_and_future_loops(engine, tracker):
     from dbmerge import reset_stop
-    loop = RecordingHandler(engine).loop(tracker)
+    loop = RecordingHandler(engine, tracker=tracker).loop()
     request_stop()
-    future = RecordingHandler(engine).loop(tracker)
+    future = RecordingHandler(engine, tracker=tracker).loop()
     try:
         assert not loop.run_if_pending()
         assert not future.run_if_pending()
@@ -281,7 +283,7 @@ def test_scope_filter_does_not_exclude_full_load_from_boundary(engine, tracker):
         started = conn.scalar(select(tracker.table.c.started_at).where(tracker.table.c.id == active))
     tracker.exec(lambda: 1, destination="source", scope="changes")
     seen = []
-    loop = MartLoop(engine, tracker, destination, ["source"], seen.append, scope="changes")
+    loop = MartLoop(engine, tracker, destination, ["source"], seen.append)
     try:
         assert loop.run_if_pending()
         assert seen[0].next_watermark == started
@@ -433,8 +435,8 @@ class RecordingHandler(MartHandler):
     destination = "mart"
     sources = ["orders"]
 
-    def __init__(self, engine):
-        super().__init__(engine, destination=(_schema(engine), "mart"),
+    def __init__(self, engine, *, tracker):
+        super().__init__(engine, tracker=tracker, destination=(_schema(engine), "mart"),
                          sources=[(_schema(engine), "orders")])
         self.setup_calls = 0
         self.process_changes_calls = 0
@@ -455,8 +457,8 @@ class RecordingHandler(MartHandler):
 
 
 def test_handler_setup_and_rebuild(engine, tracker):
-    h = RecordingHandler(engine)
-    mart = h.loop(tracker)
+    h = RecordingHandler(engine, tracker=tracker)
+    mart = h.loop()
 
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         tracker.exec_merge(merge)
@@ -486,21 +488,21 @@ def test_handler_setup_and_rebuild(engine, tracker):
     {"destination": "mart", "sources": "orders"},
     {"destination": ("invalid",), "sources": ["orders"]},
 ])
-def test_handler_requires_destination_and_sources(engine, kwargs):
+def test_handler_requires_destination_and_sources(engine, tracker, kwargs):
     with pytest.raises(IncorrectParameter):
-        MartHandler(engine, **kwargs)
+        MartHandler(engine, tracker=tracker, **kwargs)
 
 
 def test_handler_requires_engine():
     with pytest.raises(TypeError):
         MartHandler()
     with pytest.raises(IncorrectParameter):
-        MartHandler(None, destination="mart", sources=["orders"])
+        MartHandler(None, tracker=None, destination="mart", sources=["orders"])
 
 
-def test_sources_are_isolated_per_instance(engine):
-    first = RecordingHandler(engine)
-    second = RecordingHandler(engine)
+def test_sources_are_isolated_per_instance(engine, tracker):
+    first = RecordingHandler(engine, tracker=tracker)
+    second = RecordingHandler(engine, tracker=tracker)
     assert first.sources == second.sources == frozenset({(_schema(engine), "orders")})
     assert first.destination == (_schema(engine), "mart")
     assert not hasattr(first, "name")
@@ -518,6 +520,128 @@ def test_default_lease_is_destination_scoped(engine, tracker):
         first.close()
         second.close()
         other.close()
+
+
+def test_handler_constructor_no_lease(engine, tracker):
+    from sqlalchemy import select, true
+
+    seen = []
+
+    class M(MartHandler):
+        destination = 'without_lease'
+        sources = ['source_without_lease']
+
+        def process_changes(self, ctx):
+            with ctx.engine.connect() as conn:
+                assert conn.scalar(select(ctx.lease_is_mine))
+            assert str(ctx.lease_is_mine) == str(true())
+            seen.append(ctx.full_rebuild)
+
+    handler = M(engine, tracker=tracker, with_lease=False)
+    loop = handler.loop()
+    try:
+        assert not hasattr(handler, 'scope')
+        assert not hasattr(loop, 'scope')
+        assert loop._lease is None
+        tracker.exec(lambda: 1, destination='source_without_lease', scope='changes')
+        assert loop.run_if_pending()
+        assert seen == [True]
+        assert not loop.run_if_pending()
+        if engine.dialect.name == 'sqlite':
+            time.sleep(1.1)  # SQLite timestamps have second precision.
+        tracker.exec(lambda: 1, destination='source_without_lease', scope='changes')
+        assert loop.run_if_pending()
+        assert seen == [True, False]
+    finally:
+        loop.close()
+
+
+def test_operation_scopes_follow_callbacks_and_restore_on_failure(engine, tracker):
+    records = []
+
+    class M(MartHandler):
+        destination = f'auto_scope_{uuid.uuid4().hex[:8]}'
+        sources = ['auto_scope_source']
+
+        def process_changes(self, ctx):
+            record, _ = ctx.tracker.exec(lambda: 1, destination='auto_scope_output', scope='ignored')
+            records.append(record.scope)
+
+        def rebuild(self, ctx):
+            record, _ = ctx.tracker.exec(lambda: 1, destination='auto_scope_output')
+            records.append(record.scope)
+            self.process_changes(ctx)  # Direct helper call remains part of this rebuild.
+            if engine.dialect.name == 'sqlite':
+                time.sleep(1.1)
+            ctx.tracker.exec(lambda: 1, destination='auto_scope_source')
+            yield 'first'
+            record, _ = ctx.tracker.exec(lambda: 1, destination='auto_scope_output')
+            records.append(record.scope)
+            raise RuntimeError('scope failure')
+
+    loop = M(engine, tracker=tracker).loop()
+    try:
+        request_rebuild(tracker.engine, loop.destination, schema=tracker.schema)
+        with pytest.raises(RuntimeError, match='scope failure'):
+            loop.run_if_pending()
+        assert records == ['rebuild', 'rebuild', 'changes', 'rebuild']
+        record, _ = tracker.exec(lambda: 1, destination='outside', scope='custom')
+        assert record.scope == 'custom'
+        assert tracker._mart_scope.get() is None
+    finally:
+        loop.close()
+
+
+def test_rebuild_and_changes_use_separate_leases(engine, tracker):
+    names = []
+
+    class M(MartHandler):
+        destination = 'operation_leases'
+        sources = ['operation_source']
+
+        def process_changes(self, ctx):
+            names.append(loop.name)
+            assert loop._lease.still_mine(loop.name)
+
+        def rebuild(self, ctx):
+            names.append(loop.name)
+            if engine.dialect.name == 'sqlite':
+                time.sleep(1.1)
+            tracker.exec(lambda: 1, destination='operation_source', scope='changes')
+            yield 'block'
+
+    handler = M(engine, tracker=tracker)
+    loop = handler.loop()
+    try:
+        tracker.exec(lambda: 1, destination='operation_source', scope='changes')
+        assert loop.run_if_pending()
+        # An explicit incremental pass uses a different key than the rebuild.
+        if engine.dialect.name == 'sqlite':
+            time.sleep(1.1)
+        tracker.exec(lambda: 1, destination='operation_source', scope='changes')
+        assert loop.run_if_pending()
+        assert names[0].endswith(':rebuild')
+        assert names[1].endswith(':changes')  # Increment between rebuild blocks.
+        assert names[-1].endswith(':changes')
+        assert names[0] != names[-1]
+        assert not loop._lease.still_mine(names[0])
+        assert not loop._lease.still_mine(names[-1])
+    finally:
+        loop.close()
+
+
+def test_handler_rejects_invalid_lease_configuration(engine, tracker):
+    with pytest.raises(IncorrectParameter, match='with_lease'):
+        MartHandler(engine, tracker=tracker, destination='mart', sources=['source'], with_lease='yes')
+    with pytest.raises(TypeError, match='scope'):
+        MartHandler(engine, tracker=tracker, destination='mart', sources=['source'], scope=' ')
+    lease = Lease(engine, tracker.table, 'invalid_combination')
+    try:
+        with pytest.raises(IncorrectParameter, match='with_lease=False'):
+            MartLoop(engine, tracker, 'mart', ['source'], lambda ctx: None,
+                     lease=lease, with_lease=False)
+    finally:
+        lease.close()
 
 
 def test_sources_in_multiple_schemas(engine, tracker):
@@ -564,28 +688,153 @@ def test_rebuild_state_uses_tracking_engine(engine, tracker, tmp_path):
 def test_stop_requested_before_run_is_not_lost(engine, tracker):
     from unittest.mock import patch
 
-    loop = RecordingHandler(engine).loop(tracker)
+    loop = RecordingHandler(engine, tracker=tracker).loop()
     loop.request_stop()
     with patch.object(loop, "run_if_pending") as run:
         loop.run_forever()
         run.assert_not_called()
 
 
-def test_run_mart_closes_only_owned_tracker(engine, tracker):
+def test_handler_uses_caller_tracker(engine, tracker):
     from unittest.mock import patch
 
-    mart = RecordingHandler(engine)
-    with patch("dbmerge.mart.MergeTracker", return_value=tracker), \
-            patch("dbmerge.mart.MartLoop.run_forever"), patch.object(tracker, "close") as close:
-        run_mart(mart)
-        close.assert_called_once()
-    with patch("dbmerge.mart.MartLoop.run_forever"), patch.object(tracker, "close") as close:
-        run_mart(mart, tracker=tracker)
+    handler = RecordingHandler(engine, tracker=tracker)
+    with patch('dbmerge.mart.MergeTracker') as create, \
+            patch('dbmerge.mart.MartLoop.run_forever'), patch.object(tracker, 'close') as close:
+        handler.run_forever(poll_interval=0.5)
+        create.assert_not_called()
+        close.assert_not_called()
+    assert handler.tracker is tracker
+    loop = handler.loop()
+    try:
+        assert loop._lease.period == tracker.heartbeat_period
+        assert loop._lease.ttl == tracker.heartbeat_ttl
+    finally:
+        loop.close()
+
+
+def test_shared_tracker_parallel_marts_keep_scopes_and_ownership(engine, tracker):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from datetime import datetime
+    from unittest.mock import patch
+
+    barrier = Barrier(2)
+    seen = []
+
+    class M(MartHandler):
+        sources = ['shared_source']
+
+        def process_changes(self, ctx):
+            barrier.wait(timeout=10)
+            record, _ = ctx.tracker.exec(lambda: 1, destination=self.destination)
+            seen.append(record.scope)
+
+        def rebuild(self, ctx):
+            barrier.wait(timeout=10)
+            record, _ = ctx.tracker.exec(lambda: 1, destination=self.destination)
+            seen.append(record.scope)
+            yield 'all'
+
+    rebuild = M(engine, tracker=tracker, destination=f'parallel_rebuild_{uuid.uuid4().hex[:8]}')
+    changes = M(engine, tracker=tracker, destination=f'parallel_changes_{uuid.uuid4().hex[:8]}')
+    tracker.mark_watermark(changes.destination[1], datetime(2000, 1, 1))
+    tracker.exec(lambda: 1, destination='shared_source')
+    with patch.object(tracker, 'close', wraps=tracker.close) as close:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(rebuild.run_once, rebuild=True), executor.submit(changes.run_once)]
+            assert all(future.result(timeout=15) for future in futures)
+        close.assert_not_called()
+    assert sorted(seen) == ['changes', 'rebuild']
+    assert tracker._mart_scope.get() is None
+    assert tracker.exec(lambda: 1, destination='after_parallel')[0].scope is None
+
+
+def test_handler_requires_open_tracker(engine, tracker):
+    with pytest.raises(TypeError, match='tracker'):
+        MartHandler(engine, destination='mart', sources=['orders'])
+    for value in (None, object()):
+        with pytest.raises(IncorrectParameter, match='tracker='):
+            MartHandler(engine, tracker=value, destination='mart', sources=['orders'])
+    tracker.close()
+    with pytest.raises(IncorrectParameter, match='open tracker'):
+        RecordingHandler(engine, tracker=tracker)
+
+
+def test_handler_run_methods(engine, tracker):
+    from unittest.mock import patch
+
+    handler = RecordingHandler(engine, tracker=tracker)
+    with patch.object(handler, '_run', return_value=True) as run:
+        handler.run_forever(poll_interval=0.5)
+        run.assert_called_once_with(0.5, continuous=True)
+        run.reset_mock()
+        assert handler.run_once(rebuild=True)
+        run.assert_called_once_with(continuous=False, rebuild=True)
+
+
+def test_handler_keeps_tracker_when_loop_creation_fails(engine, tracker):
+    from unittest.mock import patch
+
+    handler = RecordingHandler(engine, tracker=tracker)
+    with patch.object(handler, 'loop', side_effect=RuntimeError('cannot create loop')), \
+            patch.object(tracker, 'close') as close:
+        with pytest.raises(RuntimeError, match='cannot create loop'):
+            handler.run_once()
         close.assert_not_called()
 
 
-@pytest.mark.parametrize("example", ["orders_by_customer", "orders_by_customer_clickhouse"])
-def test_example_entry_point_one_pass(example, tmp_path):
+@pytest.mark.parametrize('separate_tracking', [False, True])
+def test_handler_run_once_rebuild_without_source_changes(engine, tracker, separate_tracking, tmp_path):
+    from sqlalchemy import create_engine
+
+    seen = []
+
+    class RebuildMart(MartHandler):
+        destination = f"manual_{uuid.uuid4().hex[:8]}"
+        sources = ['unchanged_source']
+
+        def rebuild(self, ctx):
+            assert ctx.full_rebuild
+            assert ctx.engine is engine
+            seen.append('first')
+            yield 'first'
+            seen.append('second')
+            yield 'second'
+
+    tracking_engine = create_engine(f"sqlite:///{tmp_path / 'rebuild.sqlite'}") if separate_tracking else engine
+    tracking_schema = None if separate_tracking else tracker.schema
+    tracking = MergeTracker(tracking_engine, schema=tracking_schema)
+    try:
+        mart = RebuildMart(engine, tracker=tracking, with_lease=False)
+        assert mart.run_once(rebuild=True)
+        assert seen == ['first', 'second']
+        assert not rebuild_requested(tracking_engine, mart.destination, schema=tracking_schema)
+        assert not mart.run_once()
+    finally:
+        tracking.close()
+        if separate_tracking:
+            tracking_engine.dispose()
+
+
+def test_handler_rebuild_busy_lease_keeps_request(engine, tracker):
+    from unittest.mock import patch
+
+    handler = RecordingHandler(engine, tracker=tracker)
+    loop = handler.loop()
+    name = loop._lease_prefix + ':rebuild'
+    try:
+        assert loop._lease.acquire(name)
+        with patch('dbmerge.mart.MergeTracker', return_value=tracker):
+            assert handler.run_once(rebuild=True) is False
+        assert rebuild_requested(tracker.engine, handler.destination, schema=tracker.schema)
+    finally:
+        loop._lease.release(name)
+        loop.close()
+
+
+@pytest.mark.parametrize("example", ["orders_by_customer", "orders_by_customer_clickhouse", "rebuild_mart"])
+def test_example_entry_point_one_pass(example, tmp_path, monkeypatch):
     import runpy
     from pathlib import Path
     from unittest.mock import patch
@@ -593,6 +842,7 @@ def test_example_entry_point_one_pass(example, tmp_path):
     from sqlalchemy import create_engine
 
     path = Path(__file__).resolve().parents[1] / "examples" / f"{example}.py"
+    monkeypatch.syspath_prepend(str(path.parent))
     destination_engine = create_engine(f"sqlite:///{tmp_path / 'destination.sqlite'}")
     example_engines = [destination_engine]
     if example.endswith("clickhouse"):
@@ -604,20 +854,20 @@ def test_example_entry_point_one_pass(example, tmp_path):
             assert create.call_count == len(example_engines)
             run.assert_called_once()
             assert run.call_args.args[0].engine is destination_engine
+            if example == 'rebuild_mart':
+                assert rebuild_requested(destination_engine, ('target', 'orders_by_customer'))
     finally:
         for engine in example_engines:
             engine.dispose()
 
 
 @pytest.mark.parametrize("outcome", [False, True, RuntimeError("debug failure")])
-@pytest.mark.parametrize("owns_tracker", [False, True])
-def test_run_mart_single_pass_cleanup(engine, tracker, outcome, owns_tracker):
+def test_handler_single_pass_cleanup(engine, tracker, outcome):
     from unittest.mock import patch
     from dbmerge import mart as mart_module
 
-    handler = RecordingHandler(engine)
-    loop = handler.loop(tracker)
-    kwargs = {} if owns_tracker else {"tracker": tracker}
+    handler = RecordingHandler(engine, tracker=tracker)
+    loop = handler.loop()
     with patch("dbmerge.mart.MergeTracker", return_value=tracker), \
             patch.object(handler, "loop", return_value=loop), \
             patch.object(loop, "run_if_pending", side_effect=(
@@ -627,21 +877,21 @@ def test_run_mart_single_pass_cleanup(engine, tracker, outcome, owns_tracker):
             patch.object(tracker, "close", wraps=tracker.close) as close_tracker:
         if isinstance(outcome, Exception):
             with pytest.raises(RuntimeError, match="debug failure"):
-                run_mart(handler, run_forever=False, **kwargs)
+                handler.run_once()
         else:
-            assert run_mart(handler, run_forever=False, **kwargs) is outcome
+            assert handler.run_once() is outcome
         run.assert_called_once()
         forever.assert_not_called()
         close_loop.assert_called_once()
-        assert close_tracker.call_count == int(owns_tracker)
+        close_tracker.assert_not_called()
         assert loop not in mart_module._running_loops
         assert not loop._lease.still_mine(loop.name)
 
 
 def test_handler_min_interval_throttles(engine, tracker):
-    h = RecordingHandler(engine)
+    h = RecordingHandler(engine, tracker=tracker)
     h.min_interval = 10.0
-    mart = h.loop(tracker)
+    mart = h.loop()
 
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         tracker.exec_merge(merge)
@@ -657,44 +907,14 @@ def test_handler_min_interval_throttles(engine, tracker):
     mart.close()
 
 
-def test_as_handler_normalizes(engine):
-    h = RecordingHandler(engine)
-    assert as_handler(h) is h
-
-    class Mod:
-        destination = "mart"
-        sources = ["orders"]
-
-        def process_changes(self, ctx):
-            pass
-
-    norm = as_handler(Mod(), engine)
-    assert norm.destination == (None, "mart") and norm.sources == frozenset({(None, "orders")}) and callable(norm.process_changes)
-
-    def fn(ctx):
-        pass
-
-    fn.destination = "mart"
-    fn.sources = ["orders"]
-    norm2 = as_handler(fn, engine)
-    assert norm2.process_changes is fn
-
 
 def test_process_changes_api_has_no_handle_alias(engine, tracker):
     from inspect import signature
-    from types import SimpleNamespace
 
     assert "process_changes" in signature(MartLoop).parameters
     assert "handle" not in signature(MartLoop).parameters
     assert not hasattr(MartHandler, "handle")
     calls = []
-    module = SimpleNamespace(destination="renamed", sources=["source"],
-                             process_changes=calls.append)
-    normalized = as_handler(module, engine)
-    normalized.process_changes("context")
-    assert calls == ["context"]
-    with pytest.raises(IncorrectParameter, match="process_changes"):
-        as_handler(SimpleNamespace(destination="old", sources=["source"], handle=calls.append), engine)
     loop = MartLoop(engine, tracker, destination="renamed", sources=["source"],
                     process_changes=calls.append)
     try:
@@ -705,7 +925,7 @@ def test_process_changes_api_has_no_handle_alias(engine, tracker):
         loop.close()
 
 
-def test_run_mart_and_request_stop(engine, tracker):
+def test_handler_and_request_stop(engine, tracker):
     class M(MartHandler):
         destination = "mart"
         sources = ["orders"]
@@ -715,10 +935,10 @@ def test_run_mart_and_request_stop(engine, tracker):
                          data=[{"id": 1}], key=["id"]) as merge:
                 ctx.tracker.exec_merge(merge)
 
-    thread = threading.Thread(target=run_mart, args=(M(engine), engine, tracker),
+    thread = threading.Thread(target=M(engine, tracker=tracker).run_forever,
                               kwargs={"poll_interval": 0.05}, daemon=True)
     thread.start()
-    time.sleep(0.2)          # let run_mart register its loop before stopping it
+    time.sleep(0.2)          # let the handler register its loop before stopping it
     request_stop()
     thread.join(timeout=5)
     assert not thread.is_alive()
@@ -756,8 +976,8 @@ def test_rebuild_blocks_seal_and_resume(engine, tracker):
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         tracker.exec_merge(merge)
 
-    mart = M(engine, destination=(_schema(engine), "mart"),
-             sources=[(_schema(engine), "orders")]).loop(tracker, poll_interval=0.05)
+    mart = M(engine, tracker=tracker, destination=(_schema(engine), "mart"),
+             sources=[(_schema(engine), "orders")]).loop(poll_interval=0.05)
     with pytest.raises(RuntimeError):
         mart.run_if_pending()
 

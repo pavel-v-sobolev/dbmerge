@@ -14,7 +14,7 @@ a merge ──► a row in the tracking table ──► MartLoop sees the change
              (started/finished/changed/watermark)
 ```
 
-- Every merge wrapped in `tracker.exec_merge(...)` leaves a row in the tracking table.
+- Every merge configured with `tracker=tracker` leaves a row in the tracking table.
 - While the merge runs, the row is "alive" (its heartbeat is refreshed) and holds the safe boundary.
 - When the merge finishes, the row gets `finished_at` and a `changed` flag ("did rows actually change").
 - `MartLoop` polls this table and rebuilds the mart only when the sources really changed.
@@ -36,9 +36,9 @@ The journal lives in a **transactional** database. `MergeTracker` refuses ClickH
 
 ```python
 tracker = MergeTracker(postgres_engine)              # the journal in PostgreSQL
-with dbmerge(clickhouse_engine, table_name="mart",   # the merge itself in ClickHouse
+with dbmerge(clickhouse_engine, tracker=tracker, table_name="mart",   # the merge itself in ClickHouse
              data=rows, key=["id"]) as merge:
-    tracker.exec_merge(merge)
+    merge.exec()
 ```
 
 Every journal row records the schema of the merged table together with its name — `schema` + `table_name` is the identity. The read methods take a `schema=...` filter; two databases with a conflicting name need separate tracking tables.
@@ -50,27 +50,32 @@ from dbmerge import dbmerge
 from dbmerge.tracking import MergeTracker
 
 tracker = MergeTracker(engine)          # the dbmerge_tracking table is created lazily; the tracker is long-lived
-with dbmerge(engine, table_name="orders", data=orders_rows,
+with dbmerge(engine, tracker=tracker, table_name="orders", data=orders_rows,
              key=["id"], merged_on_field="merged_on") as merge:
-    record, result = tracker.exec_merge(merge)
+    result = merge.exec()
+    record = merge.tracking_record
 ```
 
-`tracker.exec_merge(merge)` runs `merge.exec()` itself and returns `(record, result)`:
+`merge.exec()` returns the usual `mergeResult`; `merge.tracking_record` holds the
+`MergeRecord`. With `tracker=None` (the default), no tracking tables are used and
+`tracking_record` remains `None`. The tracker is caller-owned and is never closed
+by the merge. Construct it once and share it with loaders and marts as needed.
+A closed or invalid tracker is rejected. Journaling starts at `exec()`, not during
+constructor DDL/preparation, and data commits and journal commits remain separate.
 
-- `record` — what the journal recorded about this merge (`MergeRecord`);
-- `result` — the usual `exec()` result (`mergeResult`).
-
-Conditions built on the merge's own tables (`source_condition`, `delete_condition`, `update_condition`, `insert_condition`) are passed through `tracker.exec_merge`:
+Pass conditions and execution options directly to `merge.exec()`:
 
 ```python
-with dbmerge(engine, table_name="orders",
+with dbmerge(engine, tracker=tracker, table_name="orders",
              source_table_name="orders_source", source_schema="source",
              key=["id"], merged_on_field="merged_on") as merge:
-    record, result = tracker.exec_merge(
-        merge,
-        source_condition=merge.source_table.c["Period"] == period,
-    )
+    result = merge.exec(source_condition=merge.source_table.c["Period"] == period)
 ```
+
+The older `tracker.exec_merge(merge, ...)` adapter remains available for compatibility
+and advanced per-operation lease/category options. Do not wrap a merge bound to a
+different tracker; this is rejected. Using the same adapter and bound tracker journals
+only once, not recursively. Prefer `dbmerge(..., tracker=tracker)` in new code.
 
 The table name is taken from the merge itself; the `changed` flag comes from its result.
 
@@ -101,7 +106,7 @@ to `tracker.exec_merge(merge)`.
 `scope` is an optional operation category, persisted in the journal and returned record.
 It is not a source table reference. Existing journals gain a nullable `scope` column on
 startup. `is_changed_since(..., scope="changes")` filters durable change marks;
-omitting scope reads all scopes. MartLoop accepts the same optional `scope` filter. Safe boundaries always
+omitting scope reads all scopes. Marts consume all source scopes. Safe boundaries always
 include active operations regardless of scope. Watermarks are committed by `MartLoop` after the whole handler succeeds.
 
 ### What you can ask
@@ -192,22 +197,22 @@ class OrdersByCustomer(MartHandler):
         # Read everything changed since the watermark; the read is unbounded — rows to the right of
         # ctx.next_watermark are processed now and again in the next window.
         rows = build_rows(since=ctx.watermark)   # your SELECT, e.g. ... WHERE merged_on > :watermark
-        with dbmerge(ctx.engine, schema=ctx.destination[0], table_name=ctx.destination[1],
+        with dbmerge(ctx.engine, tracker=ctx.tracker, schema=ctx.destination[0], table_name=ctx.destination[1],
                      data=rows, key=["customer_id"]) as merge:
-            ctx.tracker.exec_merge(merge)
+            merge.exec()
 
     def rebuild(self, ctx):
         # a full rebuild; by default the same as process_changes with full_rebuild=True
         self.process_changes(ctx)
         yield "all"
 
-tracker = MergeTracker(engine)             # one tracker per process
-OrdersByCustomer(engine).run_forever(tracker)
+tracker = MergeTracker(engine)
+OrdersByCustomer(engine, tracker=tracker).run_forever(poll_interval=60)
 ```
 
 The low-level alternative without a class is `MartLoop(engine, tracker, destination=..., sources=..., process_changes=process_changes)`, where `process_changes` is a plain function. `MartHandler` is a convenience wrapper over it.
 
-Important: for `MartLoop` to see source changes, the source merges must also be wrapped in `tracker.exec_merge(...)` — as in the Tracking section.
+Important: for `MartLoop` to see source changes, the source merges must also receive `tracker=tracker` — as in the Tracking section.
 
 ### What MartLoop does
 
@@ -346,11 +351,23 @@ The table name and schema together are the identity; pass the `schema=` to the r
 | `run_if_pending()` | one pass (for cron or your own loop) |
 | `request_stop()` / `close()` | stop |
 
-`run_mart(mart, engine=None, tracker=None, *, poll_interval=2.0, schema=None, lease=None, run_forever=True)`
-runs one mart until `request_stop()` is called: it wraps the handler into a `MartLoop`, creates the
-`MergeTracker` when none is passed, and runs the loop. `request_stop()` asks every loop started by
-`run_mart` to stop after its current pass — wire it to SIGTERM/SIGINT in a runner (see
-[examples/runner_marts.py](examples/runner_marts.py)).
+`mart = MyMart(engine, tracker=tracker)` requires an explicit, open `MergeTracker`.
+Omitting it raises `TypeError`; passing `None` or a non-tracker raises `IncorrectParameter`.
+Configure the journal engine, table, schema, heartbeat and other options on the tracker itself.
+`mart.run_forever(poll_interval=2.0)` creates a loop and polls until `request_stop()`.
+`mart.run_once(*, rebuild=False)` performs one pending pass and propagates errors.
+With `rebuild=True`, it records a request even without source changes and runs all
+remaining blocks. An interrupted rebuild resumes its saved cursor. A busy lease
+returns `False` and leaves the request pending; another worker can claim it.
+
+One tracker may be shared by multiple mart threads. Each run closes only its loop
+and its owned lease, never the tracker or engines. Stop and join all workers before
+calling `tracker.close()` (or exiting its context manager), then dispose the engines.
+Use separate handler instances per concurrent worker and sufficient connection-pool
+headroom for writes and lease heartbeats. Do not share SQLAlchemy Connection objects.
+Scopes are context-local; heartbeat state and lazy lease creation are lock-protected.
+A tracker is not a global lock: distinct destinations may run in parallel, while
+workers for the same destination coordinate through operation leases.
 
 `request_rebuild(tracker.engine, destination, schema=tracker.schema)` sets the rebuild flag in the per-mart `dbmerge_marts`
 table in the transactional tracking engine (`full_rebuild_is_required` + `rebuild_cursor`); the next pass performs the rebuild. An
@@ -369,10 +386,11 @@ The base class of a mart: declare the required `destination` and non-empty `sour
 | `rebuild(ctx)` | a full rebuild, block by block — a generator that yields a label per committed block; by default `process_changes` + `yield "all"` |
 | `changed_since(ctx, *columns)` | an OR of `column > ctx.watermark` |
 | `execute(ctx, sql, **params)` / `query(ctx, sql, **params)` | run SQL in its own transaction / return rows |
-| `loop(tracker, ...)` | build a `MartLoop` |
-| `run_forever(tracker=None, ...)` | run the loop |
+| `loop(...)` | build a `MartLoop` |
+| `run_forever(poll_interval=2.0)` | run the loop |
 
-`as_handler(obj, engine=None)` normalizes a `MartHandler` instance, a module, or a callable with attributes into a `MartHandler`.
+`run_once(..., rebuild=True)` requests a full rebuild; `rebuild(ctx)` is the handler hook,
+not a standalone entry point. The separate `run_mart` function has been removed.
 
 ## Things to remember
 
@@ -385,7 +403,8 @@ The base class of a mart: declare the required `destination` and non-empty `sour
 
 ## Required configuration and migration
 
-`MartHandler(engine, *, destination=None, sources=None)` requires an explicit SQLAlchemy engine.
+`MartHandler(engine, *, tracker, destination=None, sources=None)` requires an explicit SQLAlchemy engine
+and an open, caller-owned MergeTracker.
 `destination` and a non-empty iterable `sources` must be provided either as class attributes or as
 constructor arguments. Constructor arguments override the class declarations. Invalid or missing
 references raise `IncorrectParameter` immediately. Sources are normalized to an immutable frozenset;
@@ -401,23 +420,23 @@ Destination identities must be unique within a journal; server/database identity
 This is a breaking API change:
 
 - Remove `name`; replace `mart_table` / `ctx.mart_table` with `destination` / `ctx.destination`.
-- Replace `MyMart().loop(engine, tracker)` with `MyMart(engine).loop(tracker)`.
-- Replace `MyMart().run_forever(engine, tracker)` with `MyMart(engine).run_forever(tracker)`.
+- Replace `MyMart().loop(engine, tracker)` with `MyMart(engine, tracker=tracker).loop()`.
+- Replace `MyMart().run_forever(engine, tracker)` with `MyMart(engine, tracker=tracker).run_forever()`.
 - Low-level construction: `MartLoop(engine, tracker, destination, sources, process_changes, ...)`.
-- Module/function handlers require `as_handler(obj, engine)` or `run_mart(obj, engine=engine)`.
+- Module/function handler adapters are not supported; define a `MartHandler` subclass.
 - Rebuild helpers now accept `(tracking_engine, destination, *, schema=None)`; `schema` selects
   the service-table schema, while the destination tuple carries its business schema.
 - Stop old workers before deployment: the lease key is now derived from destination, not old name.
   Existing watermark and cursor identities remain `(schema, identifier)`.
 
 Every loop creates its own lease by default. A supplied lease remains caller-owned; closing one loop
-releases only its own key and does not stop a shared lease's heartbeat. `run_mart` closes trackers it
-creates, but not a caller-supplied tracker. For a separate destination engine (e.g. ClickHouse),
-pass a transactional tracker explicitly. Rebuild state is always stored through `tracker.engine`.
+releases only its own key and does not stop a shared lease's heartbeat. The handler run methods close their loop, not the supplied tracker. For a ClickHouse
+destination, construct the tracker on PostgreSQL. To supply a lease, use
+`handler.loop(lease=lease)`. Rebuild state is stored through `handler.tracker.engine`.
 
 ## Debugging examples
 
-Both example files call `run_mart(..., run_forever=False)` directly under
+Both example files call `mart.run_once()` directly under
 `if __name__ == "__main__"`: no separate main function, arguments, signals, or polling.
 Edit the connection strings there and run the file or place a breakpoint in the handler:
 
@@ -426,63 +445,46 @@ python examples/orders_by_customer.py
 python examples/orders_by_customer_clickhouse.py
 ```
 
-`run_mart` creates and closes a tracker automatically when none is passed. The ClickHouse example
-passes a PostgreSQL tracker explicitly because ClickHouse cannot store the journal.
+For a one-off full rebuild, configure and run `python examples/rebuild_mart.py`.
+It calls `mart.run_once(rebuild=True)` without source-change checks. A busy lease
+leaves the request pending; an interrupted rebuild resumes its cursor rather than
+starting again from the first block. Like the other short scripts, it relies on
+process exit for tracker/engine resource cleanup.
+
+Both one-shot examples construct their tracker explicitly and rely on process exit
+for resource cleanup. The continuous `examples/runner_marts.py` stops and joins workers,
+closes the tracker, then disposes the engine. The ClickHouse example
+uses a PostgreSQL tracker because ClickHouse cannot store the journal.
 A single pass returns `True` if work ran, otherwise `False`, and propagates errors to the debugger.
 The loop releases its lease on exit. Engines remain caller-owned. A pass without source changes
 does nothing; sources and ClickHouse's external PostgreSQL mapping must already exist.
-Continuous operation remains the default (`run_forever=True`).
+Use `mart.run_forever()` for continuous operation.
 
 ## Concurrent full and changes example (PostgreSQL, experimental)
 
-`examples/orders_by_customer_concurrent.py` keeps the original example's composite
-key `(order_date, customer_id)` and monthly rebuild blocks. Run both handlers with
-`python examples/runner_marts_concurrent.py` after configuring the connection and
-creating the source/business/service schemas. The source is the same `orders`
-table as in `orders_by_customer.py`; this example creates a separate physical table
-`orders_by_customer_concurrent` without changing the original mart.
+The two examples are `examples/orders_by_customer.py` (PostgreSQL) and
+`examples/orders_by_customer_clickhouse.py` (ClickHouse with PostgreSQL tracking). One `OrdersByCustomer`
+class declares one logical destination and implements `process_changes(ctx)` and
+`rebuild(ctx)`. No constructor scope or separate full/changes destinations are needed.
+The parent assigns `scope="changes"` while processing changes and `scope="rebuild"`
+while iterating rebuild blocks, including merges constructed with `tracker=ctx.tracker`.
+Between rebuild blocks, incremental writes are labelled `changes`, then the scope
+returns to `rebuild`. Scopes are execution-context-local even with a shared tracker.
 
-* `OrdersByCustomerChanges` watches `scope="changes"` and owns destination
-  `orders_by_customer_concurrent__changes`.
-* `OrdersByCustomerFull` watches `scope="full_load"` and owns destination
-  `orders_by_customer_concurrent__full`.
+The example uses literal table names, raw SQL DDL, a rows view and an aggregate view.
+It stores retained order IDs in a `BIGINT[]` column with a GIN index to find previous
+and current groups after updates, moves and deletions. Both methods merge directly
+from the aggregate view using `source_table_name`; no Python records, external snapshot
+tables, placeholder INSERTs, example-owned connections or advisory locks are needed.
+Rebuild iterates monthly blocks; changes selects only affected composite keys.
 
-These logical destinations have independent leases, watermarks and rebuild cursors;
-both writers journal writes to the same **physical** table. The loader must use
-the same tracking table/service schema and pass the appropriate scope to
-`tracker.exec_merge`. Scope selects signals, not rows: both handlers read current
-source values. For pre-existing data without journal signals, call
-`request_rebuild(engine, full.destination, schema=TRACKING_SCHEMA)` explicitly.
-
-Before reading each monthly snapshot, full takes `tracker.safe_boundary` over
-**writes to the physical mart**. It reads amounts outside the write lock, then
-applies `INSERT ... ON CONFLICT DO UPDATE ... WHERE target.touched_at <= boundary`.
-Changes writes unconditionally and renews `touched_at` even when totals are equal,
-protecting against an intermediate full snapshot after an A→B→A change. The timestamp
-uses `clock_timestamp()` after acquiring the write lock, not transaction-start time.
-Tracked operations finish only after their data commits.
-
-Both writers use the same short transaction-scoped advisory lock for applying data.
-Full does not hold it during its aggregate SELECT, so changes need not wait for the
-entire rebuild. Full publishes the block's keys as empty tombstones before reading
-amounts: if changes deletes the last order before the first full write, it can still
-find that old group and protect it from resurrection. Query results with
-`WHERE NOT is_deleted`; do not physically clean up tombstones without a separate
-safe retention protocol. Old groups are also retained when a date/customer changes.
-
-Limits: this is a PostgreSQL algorithm example, not a portable or ClickHouse recipe.
-Changes currently reconciles **all** groups under the write lock; finding only
-affected old/new keys is a future optimization. A monthly full block can also be
-large, so tune partition size for your data. Readers see blockwise progress, not
-an atomic table replacement; newly published placeholder keys temporarily appear
-deleted. All writers must follow this protocol and share a live journal/heartbeat.
-Lease loss and heartbeat expiry retain the beta reliability limits below. Do not
-run the original handler against this example's physical table.
-
-Regression tests pause a full snapshot in another thread while changes completes
-updates, soft/hard deletions, customer/date moves and inserts. They also cover
-equal-total protection and restart after a committed month. PostgreSQL tracking CI
-runs `tests/test_mart_concurrent.py` for each supported PostgreSQL driver.
+The aggregate view retains tombstones and the merge uses `delete_mode="no"`.
+Rebuild guards existing rows by timestamps and lease ownership; changes uses the
+lease guard. These guards do not fence concurrent missing-row insertion races.
+Hard deletion before a group's first publication leaves no retained ID; use soft
+deletes for durable evidence. A single worker processes changes between rebuild
+blocks, not in a separate background thread. Separate operation leases do not by
+themselves create parallel execution.
 
 ## Reliability limits
 
@@ -494,11 +496,12 @@ Lease expiration alone cannot stop a stalled writer; rebuilds do not automatical
 
 ## Consumer, lease and shutdown contracts
 
-- Set `scope = "changes"` on a handler (or pass it to `MartLoop`) to filter wakeup signals.
-  Safe boundaries still include **all** operations on the sources, regardless of scope.
+- Scope is assigned internally by the callback: `rebuild` or `changes`. Neither
+  `MartHandler` nor `MartLoop` accepts a scope parameter. Source notifications and safe
+  boundaries include all scopes; the standalone tracker API still supports custom categories.
 - Set `loop.enabled = False` to pause a consumer without advancing its durable watermark.
   Re-enabling or recreating it with the same destination catches up from that watermark; later
-  no-ops cannot erase pending changes. `None` scope reads all categories.
+  no-ops cannot erase pending changes.
 - Rebuild requests carry a token. Starting a rebuild consumes only the observed request;
   a request arriving while it runs remains pending for the next rebuild. An empty cursor means
   an active rebuild before its first block. A durable start boundary replaces early watermark
@@ -520,3 +523,14 @@ Lease expiration alone cannot stop a stalled writer; rebuilds do not automatical
   heartbeat and closes owned resources only. Do not close a tracker from inside its operation.
   Lease close stops renewal and releases held keys. Shared caller engines are never disposed.
   A heartbeat join timeout raises rather than silently declaring shutdown complete.
+
+### ClickHouse example concurrency limits
+
+The ClickHouse example follows the same rows-view/aggregate-view, retained-ID,
+tombstone and monthly-block pattern, with `ReplacingMergeTree(version)` and `FINAL`
+reads instead of PostgreSQL updates. Staging captures a microsecond wall-clock version;
+a later insertion of an older staged version does not replace a newer one. Equal
+versions can tie; synchronize clocks. This is not an atomic source snapshot.
+PostgreSQL lease predicates cannot be evaluated inside ClickHouse SQL; parent-loop
+leases coordinate workers but do not fence ClickHouse writes after lease loss.
+A single worker still processes changes between rebuild blocks, not in parallel.

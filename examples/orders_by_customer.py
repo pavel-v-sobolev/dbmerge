@@ -1,127 +1,145 @@
-"""
-An example mart: order totals per customer per day, with soft deletion.
+"""PostgreSQL-only concurrent totals by (order_date, customer_id).
 
-The source table `orders` is keyed by a GUID `id`; the mart groups it by the composite key
-(order_date, customer_id). Deleted source rows are not removed — they carry `is_deleted` and are
-excluded from the sum, so the deletion reaches the mart as a zero (or reduced) total without any
-delete_condition.
-
-Change detection reads the changed composite keys with a subquery over merged_on > ctx.watermark
-(which uses the merged_on index on the source) and passes them as source_condition.
-
-The full rebuild walks monthly intervals computed from the source range; an interrupted rebuild
-resumes from ctx.rebuild_from.
-
-The source table `orders` (id, order_date, customer_id, amount, is_deleted, merged_on) is assumed
-to exist and to be filled by the loader through the same MergeTracker.
+orders.id must fit BIGINT; the loader renews orders.merged_on on every write.
+The loop assigns operation scopes internally. Tombstones protect against stale rebuild writes.
 """
 
-from datetime import date, datetime
+from datetime import date
 
-from sqlalchemy import and_, text, tuple_
+from sqlalchemy import DateTime, and_, or_, text, tuple_
 
-from dbmerge import dbmerge
-from dbmerge.mart import MartContext, MartHandler
-
-# The schema where the source and the mart live; tables are declared as (schema, table) tuples.
-SCHEMA = "target"
-
-
-def _as_date(value):
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    return date.fromisoformat(str(value)[:10])
-
-
-def _qualified(ref):
-    """'schema.table' for a (schema, table) tuple, or just 'table' when there is no schema."""
-    schema, table = ref
-    return f"{schema}.{table}" if schema else table
+from dbmerge import MartHandler, MergeTracker, dbmerge
 
 
 class OrdersByCustomer(MartHandler):
-    destination = (SCHEMA, "orders_by_customer")  # the result table: (schema, table)
-    sources = [(SCHEMA, "orders")]   # read tables: (schema, table); a change in any triggers a run
+    destination = ('target', 'orders_by_customer')
+    sources = [('target', 'orders')]
 
-    def setup(self, ctx: MartContext) -> None:
-        # One-time DDL: the aggregate view and the mart table. Deleted rows are excluded from the
-        # sum, so a soft deletion updates the total in place.
-        self.execute(ctx, f"DROP VIEW IF EXISTS {SCHEMA}.orders_by_customer_view")
-        self.execute(ctx, f"""
-            CREATE VIEW {SCHEMA}.orders_by_customer_view AS
-            SELECT order_date,
-                   customer_id,
-                   SUM(CASE WHEN is_deleted THEN 0 ELSE amount END) AS total_amount
-              FROM {SCHEMA}.orders
-             GROUP BY order_date, customer_id
-        """)
-        self.execute(ctx, f"""
-            CREATE TABLE IF NOT EXISTS {SCHEMA}.orders_by_customer (
-                order_date DATE,
-                customer_id INTEGER,
-                total_amount NUMERIC,
+    def ddl(self, ctx):
+        schema = ctx.engine.dialect.identifier_preparer.quote_identifier(next(iter(self.sources))[0])
+        return f"""
+            CREATE TABLE IF NOT EXISTS {schema}.orders_by_customer (
+                order_date DATE NOT NULL,
+                customer_id INTEGER NOT NULL,
+                total_amount NUMERIC NOT NULL,
+                is_deleted BOOLEAN NOT NULL,
+                merged_on TIMESTAMPTZ,
+                inserted_on TIMESTAMPTZ,
+                write_token VARCHAR(32),
+                order_ids BIGINT[] NOT NULL DEFAULT ARRAY[]::bigint[],
                 PRIMARY KEY (order_date, customer_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_orders_by_customer_order_ids
+                ON {schema}.orders_by_customer USING gin (order_ids);
+            CREATE INDEX IF NOT EXISTS ix_orders_by_customer_merged_on
+                ON {schema}.orders_by_customer (merged_on);
+            CREATE INDEX IF NOT EXISTS ix_orders_merged_on ON {schema}.orders (merged_on);
+
+            CREATE OR REPLACE VIEW {schema}.orders_by_customer_rows_view AS
+            SELECT id, order_date, customer_id, amount, is_deleted, merged_on
+              FROM {schema}.orders;
+
+            CREATE OR REPLACE VIEW {schema}.orders_by_customer_view AS
+            WITH groups AS (
+                SELECT order_date, customer_id FROM {schema}.orders_by_customer_rows_view
+                UNION
+                SELECT order_date, customer_id FROM {schema}.orders_by_customer
+            ), totals AS (
+                SELECT order_date, customer_id,
+                       SUM(amount) FILTER (WHERE NOT is_deleted) AS total_amount,
+                       COUNT(*) FILTER (WHERE NOT is_deleted) AS active_count,
+                       array_agg(DISTINCT id::bigint ORDER BY id::bigint) AS order_ids
+                  FROM {schema}.orders_by_customer_rows_view
+                 GROUP BY order_date, customer_id
             )
-        """)
+            SELECT g.order_date, g.customer_id,
+                   COALESCE(t.total_amount, 0) AS total_amount,
+                   COALESCE(t.active_count, 0) = 0 AS is_deleted,
+                   COALESCE(t.order_ids, ARRAY[]::bigint[]) AS order_ids,
+                   -- Renew protection even if the selected group's total is unchanged.
+                   md5(random()::text || clock_timestamp()::text)::varchar(32) AS write_token
+              FROM groups g LEFT JOIN totals t USING (order_date, customer_id);
+        """
 
-    def _changed_keys(self, ctx: MartContext):
-        # The subquery reads the changed composite keys from the raw source table, so the predicate
-        # merged_on > :watermark can use the merged_on index.
-        source = _qualified(next(iter(ctx.sources)))
-        return text(f"""
-            SELECT order_date, customer_id
-              FROM {source}
-             WHERE merged_on > :watermark
-        """).bindparams(watermark=ctx.watermark)
-
-    def process_changes(self, ctx: MartContext) -> None:
-        # Incremental work: upsert only the changed (order_date, customer_id) keys. No
-        # delete_condition is needed — a deleted order drops out of the sum in place.
-        changed = self._changed_keys(ctx)
-        mart_schema, mart_table = ctx.destination
-        with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
-                     source_table_name="orders_by_customer_view", source_schema=mart_schema,
-                     key=["order_date", "customer_id"]) as merge:
-            source_key = tuple_(merge.source_table.c["order_date"],
-                                merge.source_table.c["customer_id"])
-            ctx.tracker.exec_merge(
-                merge,
-                source_condition=source_key.in_(changed),
-
-                with_lease=True, wait_lease=False,
+    def groups_to_handle_sql(self, ctx):
+        schema = ctx.engine.dialect.identifier_preparer.quote_identifier(next(iter(self.sources))[0])
+        return f"""
+            WITH changed_orders AS (
+                SELECT id::bigint FROM {schema}.orders WHERE merged_on > :watermark
+                UNION
+                -- Hard deletes have no source row; their IDs remain in the mart.
+                SELECT old_id FROM {schema}.orders_by_customer,
+                                   unnest(order_ids) AS old_id
+                 WHERE NOT EXISTS (SELECT 1 FROM {schema}.orders WHERE id = old_id)
             )
+            -- PREVIOUS groups, located through the GIN-indexed array overlap.
+            SELECT order_date, customer_id FROM {schema}.orders_by_customer
+             WHERE order_ids && ARRAY(SELECT id FROM changed_orders)
+            UNION
+            -- CURRENT groups.
+            SELECT order_date, customer_id FROM {schema}.orders_by_customer_rows_view
+             WHERE id = ANY(ARRAY(SELECT id FROM changed_orders))
+        """
 
-    def rebuild(self, ctx: MartContext):
-        # Full rebuild by monthly intervals computed from the source range. An interrupted rebuild
-        # resumes from ctx.rebuild_from (the label of the last completed month).
-        row = self.query(ctx, f"SELECT MIN(order_date), MAX(order_date) FROM {_qualified(next(iter(ctx.sources)))}")[0]
-        first, last = row[0], row[1]
-        if first is None or last is None:
-            return
-        first, last = _as_date(first), _as_date(last)
-        year, month = first.year, first.month
-        end_year, end_month = last.year, last.month
-        while (year, month) <= (end_year, end_month):
-            label = f"{year:04d}-{month:02d}"
-            starts = date(year, month, 1)
-            next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
-            ends = date(next_year, next_month, 1)
-            if not (ctx.rebuild_from and label <= ctx.rebuild_from):
-                mart_schema, mart_table = ctx.destination
-                with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
-                             source_table_name="orders_by_customer_view", source_schema=mart_schema,
-                             key=["order_date", "customer_id"]) as merge:
-                    d = merge.source_table.c["order_date"]
-                    merge.exec(source_condition=and_(d >= starts, d < ends))
-                yield label
-            year, month = next_year, next_month
+    def rebuild_blocks_sql(self, ctx):
+        schema = ctx.engine.dialect.identifier_preparer.quote_identifier(next(iter(self.sources))[0])
+        return f"""
+            SELECT DISTINCT date_trunc('month', order_date)::date AS period
+              FROM (
+                SELECT order_date FROM {schema}.orders
+                UNION
+                SELECT order_date FROM {schema}.orders_by_customer
+              ) dates ORDER BY period
+        """
 
+    def setup(self, ctx):
+        self.execute(ctx, self.ddl(ctx))
 
-if __name__ == "__main__":
+    def process_changes(self, ctx):
+        schema = next(iter(self.sources))[0]
+        groups_to_handle = text(self.groups_to_handle_sql(ctx)).bindparams(watermark=ctx.watermark)
+        with dbmerge(ctx.engine, tracker=ctx.tracker, table_name='orders_by_customer', schema=schema,
+                     source_table_name='orders_by_customer_view', source_schema=schema,
+                     key=['order_date', 'customer_id'], delete_mode='no',
+                     data_types={'merged_on': DateTime(timezone=True),
+                                 'inserted_on': DateTime(timezone=True)},
+                     merged_on_field='merged_on', inserted_on_field='inserted_on') as merge:
+            source_key = tuple_(merge.source_table.c.order_date, merge.source_table.c.customer_id)
+            merge.exec(
+                source_condition=source_key.in_(groups_to_handle),
+                update_condition=ctx.lease_is_mine, insert_condition=ctx.lease_is_mine)
+
+    def rebuild(self, ctx):
+        schema = next(iter(self.sources))[0]
+        for (period,) in self.query(ctx, self.rebuild_blocks_sql(ctx)):
+            label = period.strftime('%Y-%m')
+            if ctx.rebuild_from and label <= ctx.rebuild_from:
+                continue
+            ends = date(period.year + 1, 1, 1) if period.month == 12 else date(
+                period.year, period.month + 1, 1)
+            boundary = ctx.tracker.safe_boundary('orders_by_customer', schema=schema)
+            with dbmerge(ctx.engine, tracker=ctx.tracker, table_name='orders_by_customer', schema=schema,
+                         source_table_name='orders_by_customer_view', source_schema=schema,
+                         key=['order_date', 'customer_id'], delete_mode='no',
+                         data_types={'merged_on': DateTime(timezone=True),
+                                     'inserted_on': DateTime(timezone=True)},
+                         merged_on_field='merged_on', inserted_on_field='inserted_on') as merge:
+                condition = and_(merge.table.c.order_date >= period,
+                                 merge.table.c.order_date < ends,
+                                 or_(merge.table.c.merged_on.is_(None),
+                                     merge.table.c.merged_on < boundary),
+                                 ctx.lease_is_mine)
+                merge.exec(
+                    update_condition=condition,
+                    source_condition=and_(merge.source_table.c.order_date >= period,
+                                          merge.source_table.c.order_date < ends),
+                    insert_condition=ctx.lease_is_mine)
+            yield label
+
+if __name__ == '__main__':
     from sqlalchemy import create_engine
-    from dbmerge.mart import run_mart
 
-    engine = create_engine("postgresql://postgres:postgres@localhost:5432/dbmerge")
-    run_mart(OrdersByCustomer(engine), run_forever=False)
+    engine = create_engine('postgresql://postgres:postgres@localhost:5432/dbmerge')
+    tracker = MergeTracker(engine)
+    mart = OrdersByCustomer(engine, tracker=tracker)
+    mart.run_once()  # Use run_once(rebuild=True) for a full rebuild; see runner_marts.py for polling.

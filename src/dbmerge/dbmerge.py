@@ -15,6 +15,7 @@ import time
 import importlib
 
 if TYPE_CHECKING:
+    from .tracking import MergeTracker
     from pandas import DataFrame as PandasDataFrame
     from polars import DataFrame as PolarsDataFrame
 
@@ -236,7 +237,8 @@ class dbmerge:
                  can_create_schemas: bool = True,
                  commit_all_steps: bool = True,
                  chunk_size: int | None = None,
-                 bulk_load: bool = True) -> None:
+                 bulk_load: bool = True,
+                 tracker: MergeTracker | None = None) -> None:
         """
         Init function prepares the database and internal structures before the merge operation.
         
@@ -257,6 +259,9 @@ class dbmerge:
                 For ClickHouse, a "clickhousedb://" engine (clickhouse-connect) or a clickhouse_connect client; the target
                 table must be a ReplacingMergeTree.
             table_name (str): The name of the target table where data will be merged.
+            tracker (MergeTracker, optional): A caller-owned journal. If supplied, exec() journals
+                the merge automatically and still returns mergeResult; tracking_record holds its
+                MergeRecord. None preserves untracked behavior. The tracker is never closed here.
             data (list[dict] | dict[str,list] | pd.DataFrame | pl.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries (e.g. [{'col1': 'val1'}, ...]), a dict of lists (e.g. {'col1': ['val1', ...], ...}) or a Pandas/Polars DataFrame.
                 For a list of dictionaries, every row must have the same keys as the first one, and a DataFrame must not have two
                 columns of one name: otherwise the values of a column would be lost, so either raises IncorrectDataError.
@@ -328,6 +333,14 @@ class dbmerge:
         
 
         try:
+            if tracker is not None:
+                from .tracking import MergeTracker
+                if not isinstance(tracker, MergeTracker):
+                    raise IncorrectParameter('tracker must be a MergeTracker or None')
+                if tracker._closing or tracker._closed.is_set():
+                    raise IncorrectParameter('tracker must be open')
+            self.tracker = tracker
+            self.tracking_record = None
             _ensure_logger_handler()
 
             init_params = dict(engine=engine, table_name=table_name, data=data,
@@ -700,6 +713,17 @@ class dbmerge:
                 a {column name: SQLAlchemy type} mapping of the columns that were added).
         """
         
+        if self.tracker is not None:
+            self.tracking_record, result = self.tracker.exec_merge(
+                self, delete_condition=delete_condition, source_condition=source_condition,
+                update_condition=update_condition, insert_condition=insert_condition,
+                commit_all_steps=commit_all_steps, chunk_size=chunk_size, bulk_load=bulk_load)
+            return result
+        return self._exec(delete_condition, source_condition, update_condition, insert_condition,
+                          commit_all_steps, chunk_size, bulk_load)
+
+    def _exec(self, delete_condition=None, source_condition=None, update_condition=None,
+              insert_condition=None, commit_all_steps=None, chunk_size=None, bulk_load=None):
         if self.merge_finished:
             raise IncorrectParameter(f'Merge exec already finished on table {self.table_full_name}')
 

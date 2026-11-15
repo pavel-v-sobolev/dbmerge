@@ -513,3 +513,24 @@ Any failure then rolls the whole merge back. The cost is one large transaction h
 3. `data_types` is explicit for every decimal, float, datetime and string column — or the schema is pre-created with `can_create_table=False` and `can_create_columns=False`.
 4. `commit_all_steps` is chosen deliberately for the size of the dataset — remembering that it never covers schema changes.
 5. The merge is safe to re-run, so a partial failure can be resolved by repeating it.
+
+### Optional merge tracking
+
+Pass a caller-owned `MergeTracker` as `tracker=` to journal normal `exec()` calls:
+
+```python
+from dbmerge import dbmerge, MergeTracker
+
+tracker = MergeTracker(engine)
+try:
+    with dbmerge(engine, table_name="orders", data=rows, key=["id"], tracker=tracker) as merge:
+        result = merge.exec()
+        record = merge.tracking_record
+finally:
+    tracker.close()
+```
+
+`result` remains a `mergeResult`. Omitting `tracker` (or passing `None`) preserves
+untracked behavior. The merge never closes the tracker. The tracker may use a
+separate transactional engine, for example PostgreSQL for a ClickHouse merge.
+See [Tracking and Marts](TRACKING_AND_MARTS.md) for lifecycle and concurrency contracts.

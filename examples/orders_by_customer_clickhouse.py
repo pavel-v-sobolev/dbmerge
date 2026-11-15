@@ -1,135 +1,116 @@
-"""
-An example mart: order totals per customer per day, with the SOURCE in PostgreSQL and the MART in
-ClickHouse (the cross-database case).
+"""ClickHouse totals with PostgreSQL sources and a caller-owned PostgreSQL tracker.
 
-The calculation is the same as orders_by_customer.py; only the databases differ:
+Create ClickHouse database source_pg using the PostgreSQL database engine mapped
+onto PostgreSQL schema target. Source orders needs id, order_date, customer_id,
+amount, is_deleted and merged_on. Journal source writes through the same tracker.
+Read the result with FINAL. Retained IDs and tombstones detect moves/deletions.
 
-* the source table `orders` (and the aggregate view) live in PostgreSQL;
-* the mart table `orders_by_customer` lives in ClickHouse (a ReplacingMergeTree, keyed by its
-  ORDER BY columns);
-* the journal (`dbmerge_tracking`) lives in PostgreSQL — MergeTracker rejects ClickHouse, so the
-  tracker's engine is the PostgreSQL one.
-
-Wiring:
-
-    pg = create_engine("postgresql://.../dwh")        # source + journal
-    ch = create_engine("clickhousedb://.../dwh")      # mart target
-
-    tracker = MergeTracker(pg)                        # journal in PostgreSQL
-
-    OrdersByCustomerClickHouse(ch).run_forever(
-        tracker=tracker,    # the journal
-        schema=None,        # ClickHouse has no schemas
-    )
-
-The identity is `schema` + `table_name` only (no server/database name). Tables are declared as
-`(schema, table)` tuples: the source `("target", "orders")` carries the PostgreSQL schema "target",
-while the mart `(None, "orders_by_customer")` has no schema (ClickHouse). MartLoop uses the tuple,
-so the mart's watermark is read by schema "" and the sources are watched by schema "target".
-
-The source table `orders` (id, order_date, customer_id, amount, is_deleted, merged_on) in
-PostgreSQL is assumed to exist and to be filled by the loader through the same MergeTracker. The
-aggregate view `orders_by_customer_view` is created here in ClickHouse (its SELECT reads the
-PostgreSQL table through a ClickHouse database engine, set up once by an administrator — see
-onecdc's config/handlers/zakazy_klientov_clickhouse.py for the pattern).
+ReplacingMergeTree(version) prefers newer staged snapshots, even if an older
+writer finishes later. This is not transactional fencing: source reads, ClickHouse
+writes and PostgreSQL leases are not atomic. Wall-clock versions require synchronized
+clocks; equal versions can tie. Use soft deletes for durable source evidence.
+A single worker processes changes between rebuild blocks, not in a background thread.
 """
 
-from datetime import date, datetime
+from datetime import date
 
 from sqlalchemy import and_, text, tuple_
 
-from dbmerge import dbmerge
-from dbmerge.mart import MartContext, MartHandler
-
-
-def _as_date(value):
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    return date.fromisoformat(str(value)[:10])
+from dbmerge import MartHandler, MergeTracker, dbmerge
 
 
 class OrdersByCustomerClickHouse(MartHandler):
-    destination = (None, "orders_by_customer")  # the result table: (schema=None, table) in ClickHouse
-    sources = [("target", "orders")]           # read table: (schema, table) in PostgreSQL
+    destination = (None, 'orders_by_customer')
+    sources = [('target', 'orders')]
 
-    def setup(self, ctx: MartContext) -> None:
-        # One-time DDL in ClickHouse. The merge key comes from the table's ORDER BY columns.
-        self.execute(ctx, "DROP VIEW IF EXISTS orders_by_customer_view")
-        self.execute(ctx, """
-            CREATE VIEW orders_by_customer_view AS
-            SELECT order_date,
-                   customer_id,
-                   SUM(CASE WHEN is_deleted THEN 0 ELSE amount END) AS total_amount
-              FROM orders
-             GROUP BY order_date, customer_id
-        """)
-        self.execute(ctx, """
-            CREATE TABLE IF NOT EXISTS orders_by_customer (
-                order_date Date,
-                customer_id UInt64,
-                total_amount Decimal(18, 2)
-            ) ENGINE = ReplacingMergeTree
-            ORDER BY (order_date, customer_id)
-        """)
+    def setup(self, ctx):
+        for statement in (
+            """CREATE TABLE IF NOT EXISTS orders_by_customer (
+                order_date Date, customer_id UInt64, total_amount Decimal(18, 2),
+                is_deleted UInt8, order_ids Array(Int64), version UInt64
+            ) ENGINE = ReplacingMergeTree(version) ORDER BY (order_date, customer_id)""",
+            """CREATE OR REPLACE VIEW orders_by_customer_rows_view AS
+                SELECT toInt64(assumeNotNull(id)) AS id,
+                       toDate(assumeNotNull(order_date)) AS order_date,
+                       toUInt64(assumeNotNull(customer_id)) AS customer_id,
+                       assumeNotNull(amount) AS amount,
+                       assumeNotNull(is_deleted) AS is_deleted,
+                       assumeNotNull(merged_on) AS merged_on
+                FROM source_pg.orders""",
+            """CREATE OR REPLACE VIEW orders_by_customer_view AS
+                WITH groups AS (
+                    SELECT order_date, customer_id FROM orders_by_customer_rows_view
+                    UNION DISTINCT
+                    SELECT order_date, customer_id FROM orders_by_customer FINAL
+                ), totals AS (
+                    SELECT order_date, customer_id,
+                           sumIf(amount, NOT is_deleted) AS total_amount,
+                           countIf(NOT is_deleted) AS active_count,
+                           groupUniqArray(toInt64(id)) AS order_ids
+                    FROM orders_by_customer_rows_view GROUP BY order_date, customer_id
+                )
+                SELECT g.order_date, g.customer_id,
+                       CAST(ifNull(t.total_amount, 0) AS Decimal(18, 2)) AS total_amount,
+                       toUInt8(ifNull(t.active_count, 0) = 0) AS is_deleted,
+                       ifNull(t.order_ids, CAST([] AS Array(Int64))) AS order_ids,
+                       toUInt64(toUnixTimestamp64Micro(now64(6))) AS version
+                FROM groups g LEFT JOIN totals t USING (order_date, customer_id)""",
+        ):
+            self.execute(ctx, statement)
 
-    def _changed_keys(self, ctx: MartContext):
-        # The subquery reads the changed composite keys from the raw source table, so the predicate
-        # merged_on > :watermark can use the merged_on index.
-        return text("""
-            SELECT order_date, customer_id
-              FROM orders
-             WHERE merged_on > :watermark
-        """).bindparams(watermark=ctx.watermark)
-
-    def process_changes(self, ctx: MartContext) -> None:
-        # Incremental work: upsert only the changed (order_date, customer_id) keys.
-        changed = self._changed_keys(ctx)
-        mart_schema, mart_table = ctx.destination
-        with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
-                     source_table_name="orders_by_customer_view", source_schema=mart_schema,
-                     key=["order_date", "customer_id"]) as merge:
-            source_key = tuple_(merge.source_table.c["order_date"],
-                                merge.source_table.c["customer_id"])
-            ctx.tracker.exec_merge(
-                merge,
-                source_condition=source_key.in_(changed),
-
-                with_lease=True, wait_lease=False,
+    def groups_to_handle_sql(self, ctx):
+        return """
+            WITH changed_orders AS (
+                SELECT toInt64(id) AS id FROM orders_by_customer_rows_view
+                WHERE merged_on > :watermark
+                UNION DISTINCT
+                SELECT old_id FROM (
+                    SELECT arrayJoin(order_ids) AS old_id FROM orders_by_customer FINAL
+                ) WHERE old_id NOT IN (SELECT toInt64(id) FROM orders_by_customer_rows_view)
             )
+            SELECT order_date, customer_id FROM orders_by_customer FINAL
+            WHERE hasAny(order_ids, (SELECT groupUniqArray(id) FROM changed_orders))
+            UNION DISTINCT
+            SELECT order_date, customer_id FROM orders_by_customer_rows_view
+            WHERE toInt64(id) IN (SELECT id FROM changed_orders)
+        """
 
-    def rebuild(self, ctx: MartContext):
-        # Full rebuild by monthly intervals computed from the source range.
-        row = self.query(ctx, "SELECT MIN(order_date), MAX(order_date) FROM orders")[0]
-        first, last = row[0], row[1]
-        if first is None or last is None:
-            return
-        first, last = _as_date(first), _as_date(last)
-        year, month = first.year, first.month
-        end_year, end_month = last.year, last.month
-        while (year, month) <= (end_year, end_month):
-            label = f"{year:04d}-{month:02d}"
-            starts = date(year, month, 1)
-            next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
-            ends = date(next_year, next_month, 1)
-            if not (ctx.rebuild_from and label <= ctx.rebuild_from):
-                mart_schema, mart_table = ctx.destination
-                with dbmerge(ctx.engine, table_name=mart_table, schema=mart_schema,
-                             source_table_name="orders_by_customer_view", source_schema=mart_schema,
-                             key=["order_date", "customer_id"]) as merge:
-                    d = merge.source_table.c["order_date"]
-                    merge.exec(source_condition=and_(d >= starts, d < ends))
-                yield label
-            year, month = next_year, next_month
+    def process_changes(self, ctx):
+        groups = text(self.groups_to_handle_sql(ctx)).bindparams(watermark=ctx.watermark)
+        with dbmerge(ctx.engine, tracker=ctx.tracker, table_name='orders_by_customer',
+                     source_table_name='orders_by_customer_view',
+                     key=['order_date', 'customer_id'], delete_mode='no') as merge:
+            key = tuple_(merge.source_table.c.order_date, merge.source_table.c.customer_id)
+            # PostgreSQL's lease predicate cannot be evaluated inside ClickHouse SQL.
+            merge.exec(source_condition=key.in_(groups))
+
+    def rebuild(self, ctx):
+        periods = self.query(ctx, """
+            SELECT DISTINCT toStartOfMonth(order_date) AS period FROM (
+                SELECT order_date FROM orders_by_customer_rows_view
+                UNION DISTINCT
+                SELECT order_date FROM orders_by_customer FINAL
+            ) ORDER BY period
+        """)
+        for (period,) in periods:
+            label = period.strftime('%Y-%m')
+            if ctx.rebuild_from and label <= ctx.rebuild_from:
+                continue
+            ends = date(period.year + 1, 1, 1) if period.month == 12 else date(
+                period.year, period.month + 1, 1)
+            with dbmerge(ctx.engine, tracker=ctx.tracker, table_name='orders_by_customer',
+                         source_table_name='orders_by_customer_view',
+                         key=['order_date', 'customer_id'], delete_mode='no') as merge:
+                day = merge.source_table.c.order_date
+                merge.exec(source_condition=and_(day >= period, day < ends))
+            yield label
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     from sqlalchemy import create_engine
-    from dbmerge.mart import run_mart
-    from dbmerge.tracking import MergeTracker
 
-    engine = create_engine("clickhousedb://default:@localhost:8123/default")
-    tracking_engine = create_engine("postgresql://postgres:postgres@localhost:5432/dbmerge")
-    with MergeTracker(tracking_engine) as tracker:
-        run_mart(OrdersByCustomerClickHouse(engine), tracker=tracker, run_forever=False)
+    engine = create_engine('clickhousedb://default:@localhost:8123/default')
+    tracking_engine = create_engine('postgresql://postgres:postgres@localhost:5432/dbmerge')
+    tracker = MergeTracker(tracking_engine)
+    mart = OrdersByCustomerClickHouse(engine, tracker=tracker)
+    mart.run_once()  # Use run_once(rebuild=True) for a full rebuild; see runner_marts.py for polling.

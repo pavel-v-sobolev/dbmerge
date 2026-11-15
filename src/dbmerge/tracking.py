@@ -27,6 +27,8 @@ semantics follow the engine's datetime handling.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 import os
 import hashlib
 import json
@@ -233,6 +235,7 @@ class MergeTracker:
         self._heartbeat_thread: threading.Thread | None = None
         self._lease = None
         self._owns_heartbeat_engine = heartbeat_engine is None
+        self._mart_scope = ContextVar('dbmerge_mart_scope', default=None)
         self.heartbeat_engine = heartbeat_engine or _heartbeat_engine(engine)
 
     # ------------------------------------------------------------------ context manager
@@ -297,6 +300,9 @@ class MergeTracker:
             raise IncorrectParameter("destination requires a non-empty identifier and optional string schema (max 255 characters)")
         if table_name.startswith("lease:"):
             raise IncorrectParameter("destination identifiers starting with 'lease:' are reserved")
+        # Mart callbacks own their operation category; do not leak it to other
+        # threads or retain it after returning to standalone tracking calls.
+        scope = self._mart_scope.get() or scope
         if scope is not None and (not isinstance(scope, str) or not scope.strip() or len(scope) > 255):
             raise IncorrectParameter("scope must be None or a non-empty string of at most 255 characters")
         if wait_interval <= 0:
@@ -346,6 +352,9 @@ class MergeTracker:
             raise IncorrectParameter("exec_merge() expects a dbmerge instance with table_name and exec()")
         if getattr(merge, "merge_finished", False):
             raise IncorrectParameter(f'Merge of table "{table_name}" is already finished')
+        bound_tracker = getattr(merge, 'tracker', None)
+        if bound_tracker is not None and bound_tracker is not self:
+            raise IncorrectParameter('Merge is configured with a different tracker')
         if "next_watermark" in exec_kwargs:
             raise IncorrectParameter("Watermarks belong to MartLoop, not individual writes")
         if "changed" in exec_kwargs:
@@ -354,7 +363,8 @@ class MergeTracker:
 
         def execute_merge():
             nonlocal merge_result
-            merge_result = merge.exec(**exec_kwargs)
+            execute = merge._exec if bound_tracker is not None else merge.exec
+            merge_result = execute(**exec_kwargs)
             return (getattr(merge, "inserted_row_count", 0)
                     + getattr(merge, "updated_row_count", 0)
                     + getattr(merge, "deleted_row_count", 0)) > 0
@@ -700,12 +710,13 @@ class MergeTracker:
 
     def _get_lease(self):
         """The lease behind exec(with_lease=True), created lazily to avoid a circular import."""
-        if self._lease is None:
-            from .lease import Lease
-            self._lease = Lease(self.engine, self.table, self.owner,
-                                period=self.heartbeat_period, ttl=self.heartbeat_ttl,
-                                heartbeat_engine=self.heartbeat_engine)
-        return self._lease
+        with self._lock:
+            if self._lease is None:
+                from .lease import Lease
+                self._lease = Lease(self.engine, self.table, self.owner,
+                                    period=self.heartbeat_period, ttl=self.heartbeat_ttl,
+                                    heartbeat_engine=self.heartbeat_engine)
+            return self._lease
 
     def _acquire_lease(self, name, *, wait, timeout, interval) -> bool:
         """Claim the per-table lease, optionally waiting for another holder to release it."""

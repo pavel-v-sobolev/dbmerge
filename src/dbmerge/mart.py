@@ -14,8 +14,8 @@ A later no-op does not erase an earlier change. ``process_changes`` must be
 idempotent — it may run again. The loop saves progress only after the whole handler succeeds,
 with a lease check in the progress transaction.
 
-``run_mart`` is the convenience entry point for a process that runs several marts: it wraps a handler
-into a ``MartLoop`` with a lease and runs it until :func:`request_stop` is called.
+``MartHandler.run_forever`` wraps a handler into a ``MartLoop`` with a lease and runs it
+until :func:`request_stop` is called. ``run_once(rebuild=True)`` requests a full rebuild.
 """
 
 from __future__ import annotations
@@ -26,12 +26,13 @@ import hashlib
 import json
 import uuid
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Iterator
 
 from sqlalchemy import (Boolean, Column, DateTime, MetaData, String, Table, and_, exists, func, inspect,
-                        case, false, insert, or_, schema, select, text, update)
+                        case, false, insert, or_, schema, select, text, true, update)
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
@@ -136,7 +137,7 @@ class MartContext:
     next_watermark: datetime   # the watermark to record on success (the sources' safe upper boundary)
     full_rebuild: bool         # True on the first run / after reset
     rebuild_from: str | None = None  # last completed rebuild block, None when not resuming
-    lease_is_mine: Any = None  # SQL condition "the mart name is still ours"
+    lease_is_mine: Any = True  # SQL condition "the mart name is still ours"; True without a lease
     logger: Any = logger       # the dbmerge logger, for the handler's own messages
 
 
@@ -149,14 +150,16 @@ class MartLoop:
                  setup: Callable[[MartContext], None] | None = None,
                  rebuild: Callable[[MartContext], None] | None = None,
                  min_interval: float = 0.0, schema: str | None = None,
-                 scope: str | None = None, enabled: bool = True):
+                 enabled: bool = True, with_lease: bool = True):
         if not isinstance(engine, Engine):
             raise IncorrectParameter("MartLoop requires a SQLAlchemy Engine")
         if poll_interval <= 0 or min_interval < 0:
             raise IncorrectParameter("poll_interval must be positive and min_interval non-negative")
-        if scope is not None and (not isinstance(scope, str) or not scope.strip()):
-            raise IncorrectParameter("scope must be a non-empty string or None")
-        self.scope = scope
+        if not isinstance(with_lease, bool):
+            raise IncorrectParameter("with_lease must be a bool")
+        if not with_lease and lease is not None:
+            raise IncorrectParameter("lease cannot be supplied with with_lease=False")
+        self.with_lease = with_lease
         self.enabled = enabled
         self._pass_lock = threading.RLock()
         self._closed = False
@@ -166,7 +169,8 @@ class MartLoop:
         self.destination = _split_name(destination)
         self.sources = _sources(sources)
         # A bounded, unambiguous lease key derived solely from the destination identity.
-        self.name = "mart:" + hashlib.sha256(json.dumps(self.destination).encode()).hexdigest()[:48]
+        self._lease_prefix = "mart:" + hashlib.sha256(json.dumps(self.destination).encode()).hexdigest()[:40]
+        self.name = self._lease_prefix + ":rebuild"
         self.process_changes = process_changes
         self.poll_interval = poll_interval
         # The schema where the dbmerge_marts table lives (a service detail); the business
@@ -182,11 +186,14 @@ class MartLoop:
         for source_schema, source_name in self.sources:
             self._source_groups.setdefault(source_schema or "", []).append(source_name)
 
-        self._owns_lease = lease is None
-        self._lease = lease if lease is not None else Lease(
+        self._owns_lease = with_lease and lease is None
+        self._lease = (lease if lease is not None else Lease(
             tracker.engine, tracker.table, f"mart:{uuid.uuid4().hex}",
-            heartbeat_engine=tracker.heartbeat_engine)
-        self._lease.ensure(self.name)
+            period=tracker.heartbeat_period, ttl=tracker.heartbeat_ttl,
+            heartbeat_engine=tracker.heartbeat_engine)) if with_lease else None
+        if self._lease is not None:
+            self._lease.ensure(self.name)
+            self._lease.ensure(self._lease_prefix + ":changes")
 
         self._stop_signal = threading.Event()
         if _stop_requested.is_set():
@@ -222,7 +229,8 @@ class MartLoop:
             if self._closed:
                 return
             self._closed = True
-            self._lease.release(self.name)
+            if self._lease is not None:
+                self._lease.release(self.name)
             if self._owns_lease:
                 self._lease.close()
             _all_loops.discard(self)
@@ -232,14 +240,15 @@ class MartLoop:
         with self._pass_lock:
             if self._closed or self._stop_requested() or not self.enabled:
                 return False
-            if time.monotonic() < self._next_allowed or not self._lease.acquire(self.name):
+            if time.monotonic() < self._next_allowed:
                 return False
             self._pass_thread = threading.get_ident()
             try:
                 return self._run_pass()
             finally:
                 try:
-                    self._lease.release(self.name)
+                    if self._lease is not None:
+                        self._lease.release(self.name)
                 finally:
                     self._pass_thread = None
 
@@ -263,6 +272,16 @@ class MartLoop:
             if not self._sources_changed(watermark):
                 return False
 
+        self.name = self._lease_prefix + (":rebuild" if full_rebuild else ":changes")
+        if self._lease is not None and not self._lease.acquire(self.name):
+            return False
+        # Another worker may have completed a pass between our state read and
+        # acquisition. Do not run a stale rebuild or consume an outdated request.
+        if (self.tracker.watermark(self._mart_name, schema=self._mart_schema or "") != stored_watermark
+                or self._rebuild_cursor() != cursor
+                or self._request_token() != self._observed_request):
+            return False
+
         context = MartContext(
             engine=self.engine, tracker=self.tracker,
             destination=self.destination, sources=self.sources,
@@ -272,13 +291,22 @@ class MartLoop:
         )
 
         if self.setup is not None and not self._setup_done:
-            self.setup(context)
-            self._setup_done = True
+            setup_name = self._lease_prefix + ":setup"
+            if self._lease is not None:
+                self._lease.ensure(setup_name)
+                if not self._lease.acquire(setup_name):
+                    return False
+            try:
+                self.setup(context)
+                self._setup_done = True
+            finally:
+                if self._lease is not None:
+                    self._lease.release(setup_name)
 
         if full_rebuild:
             self._run_rebuild(context, stored_watermark)
         else:
-            self.process_changes(context)
+            self._process_changes(context)
             self._commit_watermark(context.next_watermark)
 
         self._next_allowed = time.monotonic() + self.min_interval
@@ -328,6 +356,22 @@ class MartLoop:
                          .values(full_rebuild_is_required=False))
 
     def _run_rebuild(self, context: MartContext, watermark: datetime | None) -> None:
+        with self._operation_scope('rebuild'):
+            self._rebuild_blocks(context, watermark)
+
+    @contextmanager
+    def _operation_scope(self, scope):
+        token = self.tracker._mart_scope.set(scope)
+        try:
+            yield
+        finally:
+            self.tracker._mart_scope.reset(token)
+
+    def _process_changes(self, context):
+        with self._operation_scope('changes'):
+            self.process_changes(context)
+
+    def _rebuild_blocks(self, context: MartContext, watermark: datetime | None) -> None:
         """Drive a resumable, block-by-block rebuild; apply increments between blocks."""
         cursor = context.rebuild_from
         if cursor is None:  # An empty cursor is already an active rebuild, not a new request.
@@ -372,6 +416,19 @@ class MartLoop:
 
     def _run_increment(self) -> None:
         """Apply changes that arrived since the mart's watermark (between rebuild blocks)."""
+        rebuild_name = self.name
+        changes_name = self._lease_prefix + ":changes"
+        if self._lease is not None and not self._lease.acquire(changes_name):
+            return
+        self.name = changes_name
+        try:
+            self._apply_increment()
+        finally:
+            if self._lease is not None:
+                self._lease.release(changes_name)
+            self.name = rebuild_name
+
+    def _apply_increment(self) -> None:
         watermark = self.tracker.watermark(self._mart_name, schema=self._mart_schema or "")
         boundary = self._rebuild_boundary()
         if boundary is not None:
@@ -389,7 +446,7 @@ class MartLoop:
             watermark=watermark, next_watermark=next_watermark, full_rebuild=False,
             lease_is_mine=self._lease_is_mine(),
         )
-        self.process_changes(context)
+        self._process_changes(context)
         self._commit_watermark(context.next_watermark)
 
     def _request_token(self):
@@ -409,6 +466,8 @@ class MartLoop:
                                    lease=self._lease, lease_name=self.name)
 
     def _guard_progress(self, conn):
+        if self._lease is None:
+            return
         from .tracking import _coerce_datetime, _now_expr
         t = self.tracker.table
         now = _coerce_datetime(conn.scalar(select(_now_expr(self.tracker.engine))))
@@ -424,8 +483,7 @@ class MartLoop:
                    for schema, names in self._source_groups.items())
 
     def _sources_changed(self, watermark: datetime) -> bool:
-        kwargs = {} if self.scope is None else {"scope": self.scope}
-        return any(self.tracker.is_changed_since(names, since=watermark, schema=schema, **kwargs)
+        return any(self.tracker.is_changed_since(names, since=watermark, schema=schema)
                    for schema, names in self._source_groups.items())
 
     def _lease_is_mine(self):
@@ -435,7 +493,7 @@ class MartLoop:
         ``now() - interval`` works.
         """
         if self._lease is None:
-            return None
+            return true()
         t = self.tracker.table
         return exists().where(
             t.c.table_name == self._lease.key(self.name),
@@ -449,18 +507,33 @@ class MartHandler:
     Subclass and set the required ``destination`` and ``sources``, then implement ``process_changes`` (and
     optionally ``setup`` for one-time DDL and ``rebuild`` for a full rebuild; the default rebuild is
     ``process_changes`` with ``full_rebuild=True``). ``loop()`` builds a MartLoop; ``run_forever`` runs it.
+    Operation scopes are assigned internally: ``rebuild`` or ``changes``.
+    ``tracker=`` is required and caller-owned; it may be shared across worker threads.
+    Stop and join all workers before closing the tracker or disposing the engines.
+    ``with_lease=True`` coordinates rebuild and changes
+    with separate operation leases; handlers still pass ctx.lease_is_mine to their write guards.
+    With leases disabled that condition is SQL TRUE, and competing workers are not coordinated.
     """
 
     destination: str | tuple[str | None, str]
     sources: Iterable[str | tuple[str | None, str]]
     min_interval: float = 0.0
-    scope: str | None = None
     enabled: bool = True
+    with_lease: bool = True
 
-    def __init__(self, engine: Engine, *, destination=None, sources=None):
+    def __init__(self, engine: Engine, *, tracker: MergeTracker, destination=None, sources=None,
+                 with_lease: bool = True):
         if not isinstance(engine, Engine):
             raise IncorrectParameter("MartHandler requires a SQLAlchemy Engine")
         self.engine = engine
+        if not isinstance(tracker, MergeTracker):
+            raise IncorrectParameter("MartHandler requires a MergeTracker via tracker=")
+        if tracker._closing or tracker._closed.is_set():
+            raise IncorrectParameter("MartHandler requires an open tracker")
+        self.tracker = tracker
+        if not isinstance(with_lease, bool):
+            raise IncorrectParameter("with_lease must be a bool")
+        self.with_lease = with_lease
         self.destination = _split_name(
             destination if destination is not None else getattr(self, "destination", None))
         self.sources = _sources(sources if sources is not None else getattr(self, "sources", None))
@@ -489,6 +562,11 @@ class MartHandler:
     def execute(self, ctx: MartContext, sql: str, **params) -> None:
         """Run a SQL statement in its own transaction."""
         with ctx.engine.begin() as conn:
+            if ctx.engine.dialect.name == 'postgresql':
+                # Send unbound DDL batches directly, without prepared parameters.
+                if not params:
+                    conn.exec_driver_sql(sql)
+                    return
             conn.execute(text(sql), params)
 
     def query(self, ctx: MartContext, sql: str, **params) -> list:
@@ -496,72 +574,38 @@ class MartHandler:
         with ctx.engine.connect() as conn:
             return conn.execute(text(sql), params).all()
 
-    def loop(self, tracker: MergeTracker, *, poll_interval: float = 2.0,
+    def loop(self, *, poll_interval: float = 2.0,
              lease: Lease | None = None, schema: str | None = None) -> MartLoop:
-        return MartLoop(self.engine, tracker, self.destination, self.sources,
+        return MartLoop(self.engine, self.tracker, self.destination, self.sources,
                         self.process_changes, poll_interval=poll_interval, lease=lease,
                         setup=self.setup, rebuild=self.rebuild,
                         min_interval=self.min_interval, schema=schema,
-                        scope=self.scope, enabled=self.enabled)
+                        enabled=self.enabled, with_lease=self.with_lease)
 
-    def run_forever(self, tracker: MergeTracker | None = None, **kwargs) -> None:
-        run_mart(self, tracker=tracker, **kwargs)
+    def run_forever(self, poll_interval: float = 2.0) -> None:
+        """Poll until request_stop(); the caller owns the shared tracker and engines."""
+        self._run(poll_interval, continuous=True)
 
+    def run_once(self, *, rebuild: bool = False) -> bool:
+        """Run one pending pass, optionally requesting a full rebuild first.
 
-# Backward-compatible alias; prefer MartHandler in new code.
-Handler = MartHandler
+        A rebuild runs all remaining blocks, resuming a saved cursor if present.
+        False means no work ran (for example, another worker holds the lease).
+        The rebuild request remains pending if this worker cannot acquire the lease.
+        Errors propagate; engines remain caller-owned.
+        """
+        return self._run(continuous=False, rebuild=rebuild)
 
-
-def as_handler(obj, engine: Engine | None = None) -> MartHandler:
-    """Normalize a handler declared as a MartHandler instance, a module or a callable.
-
-    A module or a callable is read for the same attributes a MartHandler declares; a callable
-    without a separate ``process_changes`` attribute is the process_changes itself.
-    """
-    if isinstance(obj, MartHandler):
-        if engine is not None and engine is not obj.engine:
-            raise IncorrectParameter("engine differs from the handler's constructor engine")
-        return obj
-    handler = MartHandler(engine if engine is not None else getattr(obj, "engine", None),
-                          destination=getattr(obj, "destination", None),
-                          sources=getattr(obj, "sources", None))
-    for attr in ("setup", "rebuild", "min_interval", "scope", "enabled"):
-        if hasattr(obj, attr):
-            setattr(handler, attr, getattr(obj, attr))
-    if hasattr(obj, "process_changes"):
-        handler.process_changes = obj.process_changes
-    elif callable(obj):
-        handler.process_changes = obj
-    else:
-        raise IncorrectParameter("A mart requires a callable process_changes(ctx)")
-    return handler
-
-
-_running_loops: list["MartLoop"] = []
-_all_loops = weakref.WeakSet()
-_stop_requested = threading.Event()
-
-
-def run_mart(mart, engine: Engine | None = None, tracker: MergeTracker | None = None, *,
-             poll_interval: float = 2.0, schema: str | None = None,
-             lease: Lease | None = None, run_forever: bool = True) -> bool | None:
-    """Poll a mart, or perform one pending pass with ``run_forever=False``.
-
-    ``mart`` is a ``MartHandler`` instance, a module or a callable (see :func:`as_handler`). The
-    ``MergeTracker`` is created automatically when not given and closed on exit. Each loop gets
-    a destination-derived lease by default. ``engine`` is only needed for modules/callables.
-    A single pass returns whether work ran and propagates errors to the caller; continuous mode
-    runs until :func:`request_stop` and logs pass errors. Both modes close their owned resources.
-    """
-    handler = as_handler(mart, engine)
-    owns_tracker = tracker is None
-    if tracker is None:
-        tracker = MergeTracker(handler.engine, schema=schema)
-    try:
-        loop = handler.loop(tracker, poll_interval=poll_interval, lease=lease, schema=schema)
+    def _run(self, poll_interval=2.0, *, continuous, rebuild=False):
+        tracker = self.tracker
+        if tracker._closing or tracker._closed.is_set():
+            raise IncorrectParameter("Cannot run a mart with a closed tracker")
+        if rebuild:
+            request_rebuild(tracker.engine, self.destination, schema=tracker.schema)
+        loop = self.loop(poll_interval=poll_interval)
         _running_loops.append(loop)
         try:
-            if run_forever:
+            if continuous:
                 loop.run_forever()
             else:
                 return loop.run_if_pending()
@@ -570,13 +614,19 @@ def run_mart(mart, engine: Engine | None = None, tracker: MergeTracker | None = 
                 loop.close()
             finally:
                 _running_loops.remove(loop)
-    finally:
-        if owns_tracker:
-            tracker.close()
+
+
+# Backward-compatible alias; prefer MartHandler in new code.
+Handler = MartHandler
+
+
+_running_loops: list["MartLoop"] = []
+_all_loops = weakref.WeakSet()
+_stop_requested = threading.Event()
 
 
 def request_stop(*_args) -> None:
-    """Ask every loop started by :func:`run_mart` to stop after its current pass.
+    """Ask every mart loop to stop after its current pass.
 
     Accepts the two arguments a signal handler receives, so it can be passed directly to
     ``signal.signal``.
