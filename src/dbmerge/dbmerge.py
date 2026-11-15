@@ -214,6 +214,34 @@ class mergeResult:
     added_fields: dict[str, types.TypeEngine] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class LeaseOptions:
+    """Enable a destination lease and configure acquisition waiting.
+
+    Requires a caller-owned MergeTracker. The lease covers execution, not the
+    constructor's schema/staging preparation. No waiting is performed by default.
+    """
+
+    wait_lease: bool = False
+    wait_timeout: float | None = None
+    wait_interval: float = 30.0
+
+    def __post_init__(self):
+        from math import isfinite
+
+        if not isinstance(self.wait_lease, bool):
+            raise IncorrectParameter('wait_lease must be a bool')
+        for name, value in (('wait_timeout', self.wait_timeout),
+                            ('wait_interval', self.wait_interval)):
+            if name == 'wait_timeout' and value is None:
+                continue
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not isfinite(value) or value < 0
+                    or name == 'wait_interval' and value == 0):
+                raise IncorrectParameter(f'{name} must be finite and '
+                                         + ('positive' if name == 'wait_interval' else 'non-negative or None'))
+
+
 class dbmerge:
     def __init__(self,
                  engine: Engine, 
@@ -238,7 +266,8 @@ class dbmerge:
                  commit_all_steps: bool = True,
                  chunk_size: int | None = None,
                  bulk_load: bool = True,
-                 tracker: MergeTracker | None = None) -> None:
+                 tracker: MergeTracker | None = None,
+                 lease: LeaseOptions | None = None) -> None:
         """
         Init function prepares the database and internal structures before the merge operation.
         
@@ -259,9 +288,11 @@ class dbmerge:
                 For ClickHouse, a "clickhousedb://" engine (clickhouse-connect) or a clickhouse_connect client; the target
                 table must be a ReplacingMergeTree.
             table_name (str): The name of the target table where data will be merged.
-            tracker (MergeTracker, optional): A caller-owned journal. If supplied, exec() journals
-                the merge automatically and still returns mergeResult; tracking_record holds its
-                MergeRecord. None preserves untracked behavior. The tracker is never closed here.
+            tracker (MergeTracker, optional): Caller-owned journal for exec(). The result remains
+                mergeResult; tracking_record holds the journal record. None disables tracking.
+            lease (LeaseOptions, optional): Its presence enables a destination lease and requires
+                tracker. A busy lease returns None from exec(). The lease covers execution only,
+                not constructor DDL/staging preparation. None disables automatic leasing.
             data (list[dict] | dict[str,list] | pd.DataFrame | pl.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries (e.g. [{'col1': 'val1'}, ...]), a dict of lists (e.g. {'col1': ['val1', ...], ...}) or a Pandas/Polars DataFrame.
                 For a list of dictionaries, every row must have the same keys as the first one, and a DataFrame must not have two
                 columns of one name: otherwise the values of a column would be lost, so either raises IncorrectDataError.
@@ -333,13 +364,20 @@ class dbmerge:
         
 
         try:
+            from .tracking import MergeTracker
+
             if tracker is not None:
-                from .tracking import MergeTracker
                 if not isinstance(tracker, MergeTracker):
                     raise IncorrectParameter('tracker must be a MergeTracker or None')
                 if tracker._closing or tracker._closed.is_set():
                     raise IncorrectParameter('tracker must be open')
+            if lease is not None:
+                if not isinstance(lease, LeaseOptions):
+                    raise IncorrectParameter('lease must be LeaseOptions or None')
+                if tracker is None:
+                    raise IncorrectParameter('lease requires tracker')
             self.tracker = tracker
+            self.lease = lease
             self.tracking_record = None
             _ensure_logger_handler()
 

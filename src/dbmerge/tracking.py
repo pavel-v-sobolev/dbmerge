@@ -338,14 +338,16 @@ class MergeTracker:
                 self._release_lease(lease_name)
 
     def exec_merge(self, merge, *, scope: str | None = None,
-                   with_lease: bool = False,
-                   wait_lease: bool = False, wait_timeout: float | None = None,
-                   wait_interval: float = 30.0, **exec_kwargs):
+                   with_lease: bool | None = None,
+                   wait_lease: bool | None = None, wait_timeout: float | None = None,
+                   wait_interval: float | None = None, **exec_kwargs):
         """Run a dbmerge instance through :meth:`exec`, returning its original merge result.
 
         Destination is inferred from the merge; change detection uses its inserted, updated and
         deleted row counters, not the truth value of the returned mergeResult. Additional keyword
         arguments are forwarded to ``merge.exec``. There is no ``changed`` override.
+        Bound merges execute without recursive journaling. Omitted lease arguments inherit
+        the merge's LeaseOptions; None for wait_timeout also inherits its configured timeout.
         """
         table_name = getattr(merge, "table_name", None)
         if not table_name or not callable(getattr(merge, "exec", None)):
@@ -355,6 +357,15 @@ class MergeTracker:
         bound_tracker = getattr(merge, 'tracker', None)
         if bound_tracker is not None and bound_tracker is not self:
             raise IncorrectParameter('Merge is configured with a different tracker')
+        lease = getattr(merge, 'lease', None)
+        if with_lease is None:
+            with_lease = lease is not None
+        if wait_lease is None:
+            wait_lease = lease.wait_lease if lease is not None else False
+        if wait_timeout is None and lease is not None:
+            wait_timeout = lease.wait_timeout
+        if wait_interval is None:
+            wait_interval = lease.wait_interval if lease is not None else 30.0
         if "next_watermark" in exec_kwargs:
             raise IncorrectParameter("Watermarks belong to MartLoop, not individual writes")
         if "changed" in exec_kwargs:
@@ -373,6 +384,8 @@ class MergeTracker:
                               scope=scope, with_lease=with_lease,
                               wait_lease=wait_lease, wait_timeout=wait_timeout,
                               wait_interval=wait_interval)
+        if bound_tracker is not None:
+            merge.tracking_record = record
         return record, merge_result
 
     def _begin(self, table_name: str, schema: str, scope: str | None = None):

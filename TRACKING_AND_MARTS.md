@@ -14,7 +14,7 @@ a merge ──► a row in the tracking table ──► MartLoop sees the change
              (started/finished/changed/watermark)
 ```
 
-- Every merge configured with `tracker=tracker` leaves a row in the tracking table.
+- Every merge executed through `tracker.exec_merge(...)` leaves a row in the tracking table.
 - While the merge runs, the row is "alive" (its heartbeat is refreshed) and holds the safe boundary.
 - When the merge finishes, the row gets `finished_at` and a `changed` flag ("did rows actually change").
 - `MartLoop` polls this table and rebuilds the mart only when the sources really changed.
@@ -36,9 +36,9 @@ The journal lives in a **transactional** database. `MergeTracker` refuses ClickH
 
 ```python
 tracker = MergeTracker(postgres_engine)              # the journal in PostgreSQL
-with dbmerge(clickhouse_engine, tracker=tracker, table_name="mart",   # the merge itself in ClickHouse
+with dbmerge(clickhouse_engine, table_name="mart",   # the merge itself in ClickHouse
              data=rows, key=["id"]) as merge:
-    merge.exec()
+    tracker.exec_merge(merge)
 ```
 
 Every journal row records the schema of the merged table together with its name — `schema` + `table_name` is the identity. The read methods take a `schema=...` filter; two databases with a conflicting name need separate tracking tables.
@@ -50,34 +50,59 @@ from dbmerge import dbmerge
 from dbmerge.tracking import MergeTracker
 
 tracker = MergeTracker(engine)          # the dbmerge_tracking table is created lazily; the tracker is long-lived
-with dbmerge(engine, tracker=tracker, table_name="orders", data=orders_rows,
+with dbmerge(engine, table_name="orders", data=orders_rows,
              key=["id"], merged_on_field="merged_on") as merge:
+    record, result = tracker.exec_merge(merge)
+```
+
+`tracker.exec_merge(merge)` runs the merge and returns `(MergeRecord, mergeResult)`.
+Plain `merge.exec()` remains untracked unless `tracker=` is supplied.
+The tracker is caller-owned. Journaling starts when `exec_merge` is called, not
+while the merge constructor prepares DDL/staging tables. Data and journal commits
+remain separate.
+
+Pass conditions and execution options through `tracker.exec_merge`:
+
+```python
+with dbmerge(engine, table_name="orders", source_table_name="orders_source",
+             source_schema="source", key=["id"], merged_on_field="merged_on") as merge:
+    record, result = tracker.exec_merge(
+        merge, source_condition=merge.source_table.c["Period"] == period,
+        with_lease=True, wait_lease=True, wait_timeout=300, wait_interval=2,
+    )
+```
+
+A busy lease returns `(None, None)` if waiting is disabled or the wait times out.
+Heartbeat renews a held lease, and it is released on success or failure. Constructor
+DDL runs before this lease is acquired; this is not a fence around constructor work.
+
+The table name is taken from the merge itself; the `changed` flag comes from its result.
+
+### Constructor tracking and lease options
+
+```python
+from dbmerge import dbmerge, MergeTracker, LeaseOptions
+
+tracker = MergeTracker(engine)
+with dbmerge(engine, table_name="orders", data=orders_rows, key=["id"],
+             tracker=tracker,
+             lease=LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2)) as merge:
     result = merge.exec()
     record = merge.tracking_record
 ```
 
-`merge.exec()` returns the usual `mergeResult`; `merge.tracking_record` holds the
-`MergeRecord`. With `tracker=None` (the default), no tracking tables are used and
-`tracking_record` remains `None`. The tracker is caller-owned and is never closed
-by the merge. Construct it once and share it with loaders and marts as needed.
-A closed or invalid tracker is rejected. Journaling starts at `exec()`, not during
-constructor DDL/preparation, and data commits and journal commits remain separate.
+`tracker=` enables journaling; `lease=None` does not acquire a lease.
+The presence of `LeaseOptions` enables a lease automatically and requires a tracker.
+Defaults are `wait_lease=False`, `wait_timeout=None`, `wait_interval=30.0`.
+Timeouts must be finite and non-negative (or None); intervals must be finite and positive.
+A busy lease returns `None` from `merge.exec()` and leaves `tracking_record=None`;
+the merge may be retried while its context remains open. Other failures propagate.
+The tracker remains caller-owned. Neither journaling nor the lease covers constructor
+DDL/staging preparation, and data and journal commits are not atomic.
 
-Pass conditions and execution options directly to `merge.exec()`:
-
-```python
-with dbmerge(engine, tracker=tracker, table_name="orders",
-             source_table_name="orders_source", source_schema="source",
-             key=["id"], merged_on_field="merged_on") as merge:
-    result = merge.exec(source_condition=merge.source_table.c["Period"] == period)
-```
-
-The older `tracker.exec_merge(merge, ...)` adapter remains available for compatibility
-and advanced per-operation lease/category options. Do not wrap a merge bound to a
-different tracker; this is rejected. Using the same adapter and bound tracker journals
-only once, not recursively. Prefer `dbmerge(..., tracker=tracker)` in new code.
-
-The table name is taken from the merge itself; the `changed` flag comes from its result.
+`tracker.exec_merge(merge, ...)` remains supported: bound merges are journaled once,
+conflicting trackers are rejected, omitted lease arguments inherit `LeaseOptions`,
+and explicit arguments override them (`wait_timeout=None` inherits the configured timeout).
 
 ### Tracking other committed writes
 
@@ -197,9 +222,9 @@ class OrdersByCustomer(MartHandler):
         # Read everything changed since the watermark; the read is unbounded — rows to the right of
         # ctx.next_watermark are processed now and again in the next window.
         rows = build_rows(since=ctx.watermark)   # your SELECT, e.g. ... WHERE merged_on > :watermark
-        with dbmerge(ctx.engine, tracker=ctx.tracker, schema=ctx.destination[0], table_name=ctx.destination[1],
+        with dbmerge(ctx.engine, schema=ctx.destination[0], table_name=ctx.destination[1],
                      data=rows, key=["customer_id"]) as merge:
-            merge.exec()
+            ctx.tracker.exec_merge(merge)
 
     def rebuild(self, ctx):
         # a full rebuild; by default the same as process_changes with full_rebuild=True
@@ -212,7 +237,7 @@ OrdersByCustomer(engine, tracker=tracker).run_forever(poll_interval=60)
 
 The low-level alternative without a class is `MartLoop(engine, tracker, destination=..., sources=..., process_changes=process_changes)`, where `process_changes` is a plain function. `MartHandler` is a convenience wrapper over it.
 
-Important: for `MartLoop` to see source changes, the source merges must also receive `tracker=tracker` — as in the Tracking section.
+Important: for `MartLoop` to see source changes, the source merges must also run through `tracker.exec_merge(...)` — as in the Tracking section.
 
 ### What MartLoop does
 
@@ -467,7 +492,7 @@ The two examples are `examples/orders_by_customer.py` (PostgreSQL) and
 class declares one logical destination and implements `process_changes(ctx)` and
 `rebuild(ctx)`. No constructor scope or separate full/changes destinations are needed.
 The parent assigns `scope="changes"` while processing changes and `scope="rebuild"`
-while iterating rebuild blocks, including merges constructed with `tracker=ctx.tracker`.
+while iterating rebuild blocks, including writes through `ctx.tracker.exec_merge(...)`.
 Between rebuild blocks, incremental writes are labelled `changes`, then the scope
 returns to `rebuild`. Scopes are execution-context-local even with a shared tracker.
 

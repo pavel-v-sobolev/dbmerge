@@ -514,23 +514,30 @@ Any failure then rolls the whole merge back. The cost is one large transaction h
 4. `commit_all_steps` is chosen deliberately for the size of the dataset — remembering that it never covers schema changes.
 5. The merge is safe to re-run, so a partial failure can be resolved by repeating it.
 
-### Optional merge tracking
-
-Pass a caller-owned `MergeTracker` as `tracker=` to journal normal `exec()` calls:
+### Optional merge tracking and leases
 
 ```python
-from dbmerge import dbmerge, MergeTracker
+from dbmerge import dbmerge, MergeTracker, LeaseOptions
 
 tracker = MergeTracker(engine)
-try:
-    with dbmerge(engine, table_name="orders", data=rows, key=["id"], tracker=tracker) as merge:
-        result = merge.exec()
-        record = merge.tracking_record
-finally:
-    tracker.close()
+with dbmerge(engine, table_name="orders", data=rows, key=["id"],
+             tracker=tracker,
+             lease=LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2)) as merge:
+    result = merge.exec()
+    record = merge.tracking_record
 ```
 
-`result` remains a `mergeResult`. Omitting `tracker` (or passing `None`) preserves
-untracked behavior. The merge never closes the tracker. The tracker may use a
-separate transactional engine, for example PostgreSQL for a ClickHouse merge.
+`tracker=` journals execution. Without it, `merge.exec()` remains untracked.
+`lease=None` (the default) does not acquire a lease. Supplying `LeaseOptions()`
+enables a destination lease without waiting; configure its fields to wait.
+A lease requires a tracker. The tracker remains caller-owned and may use a
+separate transactional engine (for example PostgreSQL for a ClickHouse merge).
+
+`exec()` returns the usual `mergeResult`, or `None` if the lease cannot be acquired;
+`tracking_record` is also `None` for a skipped operation. Acquisition happens at
+execution, not during constructor DDL/staging preparation. Heartbeat renews the
+lease; completion or failure releases it. Data and journal commits are separate.
+The explicit `tracker.exec_merge(merge, ...)` API remains supported and avoids
+double tracking for bound merges. Its explicit lease arguments override constructor
+settings; omitted arguments inherit the supplied `LeaseOptions`.
 See [Tracking and Marts](TRACKING_AND_MARTS.md) for lifecycle and concurrency contracts.

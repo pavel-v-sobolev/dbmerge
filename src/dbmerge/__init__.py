@@ -5,7 +5,7 @@ try:
 except PackageNotFoundError:
     __version__ = "dev"
 
-from .dbmerge import dbmerge, drop_table_if_exists, format_ms, mergeResult
+from .dbmerge import dbmerge, drop_table_if_exists, format_ms, mergeResult, LeaseOptions
 from .dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError, TableNotFoundError, TempTableAlreadyExists
 from .tracking import (MergeTracker, MergeRecord, TRACKING_TABLE,
                        HEARTBEAT_PERIOD, HEARTBEAT_TTL, TRACKING_UNSUPPORTED_DIALECTS)
@@ -17,5 +17,5 @@ __all__ = ["dbmerge", "drop_table_if_exists", "format_ms", "mergeResult", "__ver
            "IncorrectParameter", "IncorrectDataError", "NoKeyError", "TableNotFoundError", "TempTableAlreadyExists",
            "MergeTracker", "MergeRecord", "TRACKING_TABLE",
            "HEARTBEAT_PERIOD", "HEARTBEAT_TTL", "TRACKING_UNSUPPORTED_DIALECTS",
-           "Lease", "MartLoop", "MartContext", "MartHandler", "Handler",
+           "Lease", "LeaseOptions", "MartLoop", "MartContext", "MartHandler", "Handler",
            "request_stop", "reset_stop", "rebuild_requested", "request_rebuild"]

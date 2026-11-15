@@ -520,51 +520,96 @@ def test_exec_merge_delegates_and_preserves_result(engine, tracker):
         assert not record.changed and result.inserted_row_count == 0
 
 
-def test_dbmerge_optional_tracker_and_noop(engine, tracker):
+@pytest.mark.parametrize('leased', [False, True])
+def test_dbmerge_inline_tracker(engine, tracker, leased):
+    from dbmerge import LeaseOptions
     from unittest.mock import patch
 
-    for expected_changed in (True, False):
-        with _dbmerge(engine, tracker=tracker, table_name='orders', data=_rows(), key=['id']) as merge:
-            with patch.object(tracker, 'exec', wraps=tracker.exec) as execute, \
-                    patch.object(tracker, 'close') as close:
+    options = LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2) if leased else None
+    for changed in (True, False):
+        with _dbmerge(engine, tracker=tracker, lease=options,
+                      table_name='orders', data=_rows(), key=['id']) as merge:
+            with patch.object(tracker, 'exec', wraps=tracker.exec) as execute:
                 result = merge.exec(chunk_size=1)
-                execute.assert_called_once()
-                close.assert_not_called()
-            assert merge.tracking_record.changed is expected_changed
-            assert result.inserted_row_count == (2 if expected_changed else 0)
-            assert merge.chunk_size == 1
+            execute.assert_called_once()
+            assert execute.call_args.kwargs['with_lease'] is leased
+            assert merge.tracking_record.changed is changed
+            assert result.inserted_row_count == (2 if changed else 0)
+            assert not tracker._closed.is_set()
             with pytest.raises(IncorrectParameter, match='already finished'):
                 merge.exec()
-    with _dbmerge(engine, table_name='orders', data=_rows(), key=['id']) as merge:
-        merge.exec()
-        assert merge.tracker is None and merge.tracking_record is None
 
 
-def test_dbmerge_tracker_failure_and_validation(engine, tracker):
+def test_dbmerge_lease_busy_and_adapter(engine, tracker):
+    from dbmerge import LeaseOptions
     from unittest.mock import patch
 
-    with pytest.raises(IncorrectParameter, match='tracker'):
-        _dbmerge(engine, tracker=object(), table_name='orders', data=_rows(), key=['id'])
-    with _dbmerge(engine, tracker=tracker, table_name='orders', data=_rows(), key=['id']) as merge:
+    with _dbmerge(engine, tracker=tracker, lease=LeaseOptions(wait_lease=True, wait_timeout=0),
+                  table_name='orders', data=_rows(), key=['id']) as merge:
+        with patch.object(tracker, '_acquire_lease', return_value=False) as acquire:
+            assert merge.exec() is None
+            assert merge.tracking_record is None and not merge.merge_finished
+            assert acquire.call_args.kwargs == dict(wait=True, timeout=0, interval=30.0)
+        with patch.object(tracker, 'exec', wraps=tracker.exec) as execute:
+            record, result = tracker.exec_merge(merge)
+        execute.assert_called_once()
+        assert record is merge.tracking_record
+        assert record.changed and result.inserted_row_count == 2
+
+
+def test_dbmerge_tracker_validation_and_failure(engine, tracker):
+    from dbmerge import LeaseOptions
+    from unittest.mock import patch
+
+    for kwargs in ({'tracker': object()}, {'lease': LeaseOptions()},
+                   {'tracker': tracker, 'lease': True}):
+        with pytest.raises(IncorrectParameter):
+            _dbmerge(engine, table_name='orders', data=_rows(), key=['id'], **kwargs)
+    with _dbmerge(engine, tracker=tracker, lease=LeaseOptions(),
+                  table_name='orders', data=_rows(), key=['id']) as merge:
+        other = object.__new__(MergeTracker)
+        with pytest.raises(IncorrectParameter, match='different tracker'):
+            other.exec_merge(merge)
+        with patch.object(tracker, 'exec', wraps=tracker.exec) as execute:
+            # An explicit adapter override may disable the constructor lease.
+            record, result = tracker.exec_merge(merge, with_lease=False)
+        assert execute.call_args.kwargs['with_lease'] is False
+        assert record.changed and result.inserted_row_count == 2
+    with _dbmerge(engine, tracker=tracker, lease=LeaseOptions(),
+                  table_name='orders', data=_rows(), key=['id']) as merge:
         with patch.object(merge, '_execute_steps', side_effect=RuntimeError('write failed')):
             with pytest.raises(RuntimeError, match='write failed'):
                 merge.exec()
-        assert merge.merge_finished
         assert not tracker._in_flight
-        assert not tracker._closed.is_set()
+        with patch.object(tracker, '_release_lease') as release:
+            # An unrelated tracker must never execute a bound merge.
+            other = object.__new__(MergeTracker)
+            with pytest.raises(IncorrectParameter):
+                other.exec_merge(merge)
+            release.assert_not_called()
     tracker.close()
     with pytest.raises(IncorrectParameter, match='open'):
         _dbmerge(engine, tracker=tracker, table_name='orders', data=_rows(), key=['id'])
 
 
-def test_bound_tracker_legacy_adapter_does_not_track_twice(engine, tracker):
+def test_dbmerge_without_tracker_remains_untracked(engine, tracker):
     from unittest.mock import patch
 
-    with _dbmerge(engine, tracker=tracker, table_name='orders', data=_rows(), key=['id']) as merge:
-        with patch.object(tracker, 'exec', wraps=tracker.exec) as execute:
-            record, result = tracker.exec_merge(merge)
-        execute.assert_called_once()
-        assert record.changed and result.inserted_row_count == 2
+    with _dbmerge(engine, table_name='orders', data=_rows(), key=['id']) as merge:
+        with patch.object(tracker, 'exec') as execute:
+            assert merge.exec().inserted_row_count == 2
+        execute.assert_not_called()
+        assert merge.tracking_record is None and merge.lease is None
+
+
+@pytest.mark.parametrize('kwargs', [dict(wait_lease=1), dict(wait_timeout=-1),
+                                   dict(wait_timeout=float('nan')), dict(wait_interval=0),
+                                   dict(wait_interval=float('inf')), dict(wait_interval=True)])
+def test_lease_options_validation(kwargs):
+    from dbmerge import LeaseOptions
+
+    with pytest.raises(IncorrectParameter):
+        LeaseOptions(**kwargs)
 
 
 def test_existing_tracking_table_gets_scope_column(engine):

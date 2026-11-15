@@ -10,7 +10,7 @@ Tracking, leases and marts remain **beta**. Existing untracked merge calls retai
 
 ### Added
 
-- Optional `dbmerge(..., tracker=tracker)`: normal `merge.exec()` journals the operation and still returns `mergeResult`. The journal record is available as `merge.tracking_record`; omitting the tracker preserves untracked behavior.
+- Optional `dbmerge(..., tracker=tracker, lease=LeaseOptions(...))`: `exec()` journals the merge and acquires a destination lease when options are supplied. Returns `mergeResult` or `None` for a busy lease; journal records are available as `merge.tracking_record`. A lease requires a tracker.
 - `mart.run_once(rebuild=True)` requests a full rebuild and executes one pass through its remaining blocks, resuming a saved cursor. A busy lease returns `False` and leaves the request pending.
 - One-off full rebuild example in `examples/rebuild_mart.py` and a continuous runner with signal handling and ordered worker/tracker/engine shutdown.
 
@@ -24,12 +24,11 @@ Tracking, leases and marts remain **beta**. Existing untracked merge calls retai
 ### Fixed
 
 - Permit a tracker to be shared by mart threads without mixing operation scopes or closing another worker's resources; protect lazy internal lease creation with a lock.
-- Avoid double journaling when the compatibility `tracker.exec_merge` adapter receives a merge already bound to the same tracker; reject a conflicting tracker.
 
 ### Migration notes
 
-- Construct and configure `MergeTracker` externally, then pass `tracker=tracker` to both marts and tracked merges. A missing, invalid or closed mart tracker is rejected. Close shared trackers only after all worker threads have stopped.
-- The compatibility `tracker.exec_merge(...)` adapter remains available. New code should prefer `dbmerge(..., tracker=tracker)` and `merge.exec(...)`.
+- Construct and configure `MergeTracker` externally, then pass `tracker=tracker` to marts and execute tracked merges through `tracker.exec_merge(...)`. A missing, invalid or closed mart tracker is rejected. Close shared trackers only after all worker threads have stopped.
+- `tracker.exec_merge(merge, ...)` remains supported without double tracking for bound merges. Without a tracker, plain `merge.exec()` stays untracked.
 - One worker applies changes **between** rebuild blocks, not in an automatically created background thread. Separate leases do not create parallel execution or fence all concurrent writes; see `TRACKING_AND_MARTS.md`.
 
 ## [2.4.1] - 2026-11-14
