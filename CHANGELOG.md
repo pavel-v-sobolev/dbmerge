@@ -4,21 +4,28 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
-## [2.5.0] - 2026-11-15
+## [2.5.0] - 2026-11-16
 
 Tracking, leases and marts remain **beta**. Existing untracked merge calls retain their behavior.
 
 ### Added
 
-- Optional `dbmerge(..., tracker=tracker, lease=LeaseOptions(...))`: `exec()` journals the merge and acquires a destination lease when options are supplied. Returns `mergeResult` or `None` for a busy lease; journal records are available as `merge.tracking_record`. A lease requires a tracker.
+- Unified `lease_options` / `lease_handle` arguments, exported `LeaseHandle`, `LeaseLost` and `LeaseBusy`. Handles refer to a single acquisition and are never released by borrowers.
+- `use_safe_border=True` protects destination rows at or after the captured safe boundary, including tombstone writes. Requires a tracker, a timestamp `merged_on_field` and `delete_mode='no'` or `'mark'`.
+- `LeaseOptions(scope=...)` separates destination leases by operation category.
+- Optional `dbmerge(..., tracker=tracker, lease_options=LeaseOptions(...))`: `exec()` journals the merge and acquires a destination lease when options are supplied. Returns `mergeResult` or `None` for a busy lease; journal records are available as `merge.tracking_record`. A lease requires a tracker.
 - `mart.run_once(rebuild=True)` requests a full rebuild and executes one pass through its remaining blocks, resuming a saved cursor. A busy lease returns `False` and leaves the request pending.
 - One-off full rebuild example in `examples/rebuild_mart.py` and a continuous runner with signal handling and ordered worker/tracker/engine shutdown.
 
 ### Changed
 
+- Merge writes explicitly borrow mart pass acquisitions using `lease_handle=ctx.lease_handle`. Explicit merge leases guard update, insert and delete/mark phases without caller-supplied ownership predicates; cross-engine checks are explicitly non-atomic.
+- Document the primary bound-tracker execution style, the distinct merge/mart lease defaults, and caller responsibility for the key of a borrowed acquisition. Centralize mart lease validation and remove redundant ownership/release calls.
+- Tracked merges fill audit timestamps from the tracker engine's clock, including ClickHouse destinations and the explicit `exec_merge()` adapter.
+
 - **Beta mart API:** require an explicit SQLAlchemy data engine and an open, caller-owned `tracker=` in `MartHandler`. Use `mart.run_forever(poll_interval=...)`, `mart.run_once()` or `mart.loop()`; the separate `run_mart` entry point and module/function adapters are removed.
 - Assign mart operation scopes internally: `rebuild` and `changes`. Remove the public mart scope filter; source notifications include all categories.
-- Coordinate setup, rebuild and changes with separate parent-managed leases. `with_lease=False` disables coordination and supplies a SQL TRUE write guard. Stop old workers before deploying the changed lease-key format.
+- Coordinate setup, rebuild and changes with separate parent-managed leases. `lease_options=None` disables coordination. Stop old workers before deploying the changed lease-key format.
 - Consolidate mart implementations into PostgreSQL and ClickHouse examples using rows/aggregate views, retained order IDs, tombstones and monthly rebuild blocks. ClickHouse uses `ReplacingMergeTree(version)`; concurrency and fencing limitations are documented.
 
 ### Fixed
@@ -27,7 +34,8 @@ Tracking, leases and marts remain **beta**. Existing untracked merge calls retai
 
 ### Migration notes
 
-- Construct and configure `MergeTracker` externally, then pass `tracker=tracker` to marts and execute tracked merges through `tracker.exec_merge(...)`. A missing, invalid or closed mart tracker is rejected. Close shared trackers only after all worker threads have stopped.
+- Construct and configure `MergeTracker` externally, then pass `tracker=tracker` to marts and merges. Inside mart callbacks explicitly pass `lease_handle=ctx.lease_handle` to merge writes. A missing, invalid or closed mart tracker is rejected. Close shared trackers only after all worker threads have stopped.
+- Replace merge `lease=` and tracker `with_lease=` / waiting arguments with `lease_options=LeaseOptions(...)`. Replace mart `with_lease=False` with `lease_options=None`. Borrow an acquired lease using `lease_handle=...`; do not supply options and a handle together. Old ownership predicates and implicit lease inheritance are removed.
 - `tracker.exec_merge(merge, ...)` remains supported without double tracking for bound merges. Without a tracker, plain `merge.exec()` stays untracked.
 - One worker applies changes **between** rebuild blocks, not in an automatically created background thread. Separate leases do not create parallel execution or fence all concurrent writes; see `TRACKING_AND_MARTS.md`.
 

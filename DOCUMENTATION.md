@@ -241,7 +241,7 @@ Should the staging table fail to drop when the merge ends, DBMerge logs a warnin
 
 ## Audit Timestamps
 
-`merged_on_field` and `inserted_on_field` are filled by the **database**, not by the Python process: DBMerge emits the engine's own "current time" function as part of the `INSERT` and `UPDATE` statements. Nothing is normalized on the way — the timezone and the resolution of the stored value are whatever that engine's clock gives.
+Without a tracker, `merged_on_field` and `inserted_on_field` are filled by the destination database's current-time function. With a tracker (including `tracker.exec_merge(merge)`), DBMerge reads the **tracker engine's clock before each write phase** and binds that timestamp into the destination SQL. This avoids using different clocks for the journal and audit columns when, for example, PostgreSQL tracks a ClickHouse merge. Destination column precision/timezone rules still apply; use compatible timestamp types and UTC sessions across engines. `inserted_on_field` remains unchanged on updates.
 
 This is deliberate. The timestamp then reflects the moment the database applied the change, is immune to clock skew between application hosts, and stays consistent with any other column your schema fills with a database default. The cost is that the exact meaning of the value is engine-specific:
 
@@ -516,28 +516,91 @@ Any failure then rolls the whole merge back. The cost is one large transaction h
 
 ### Optional merge tracking and leases
 
+Choose one execution style: normally bind `tracker=` to the merge and call
+`merge.exec()`. Use `tracker.exec_merge(merge)` when adapting an existing unbound
+merge. These are alternatives, not two steps to perform on the same merge.
+
 ```python
 from dbmerge import dbmerge, MergeTracker, LeaseOptions
 
 tracker = MergeTracker(engine)
 with dbmerge(engine, table_name="orders", data=rows, key=["id"],
              tracker=tracker,
-             lease=LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2)) as merge:
+             lease_options=LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2)) as merge:
     result = merge.exec()
     record = merge.tracking_record
 ```
 
 `tracker=` journals execution. Without it, `merge.exec()` remains untracked.
-`lease=None` (the default) does not acquire a lease. Supplying `LeaseOptions()`
+`lease_options=None` (the default) does not acquire a lease. Supplying `LeaseOptions()`
 enables a destination lease without waiting; configure its fields to wait.
 A lease requires a tracker. The tracker remains caller-owned and may use a
 separate transactional engine (for example PostgreSQL for a ClickHouse merge).
+
+| Configuration | Merge / tracker operation | Mart |
+|---|---|---|
+| Arguments omitted | No lease | Own coordinated pass lease |
+| `lease_options=LeaseOptions(...)` | Acquire and release an execution lease | Acquire and release a pass lease |
+| `lease_handle=handle` | Borrow this acquisition | Borrow this acquisition for the pass |
+| `lease_options=None`, no handle | No lease | No coordination |
+
+Never supply both non-None options and a handle. In a mart callback, the normal
+write configuration is `tracker=ctx.tracker, lease_handle=ctx.lease_handle`;
+do not create another lease for that write. If coordination was disabled on the
+mart, `ctx.lease_handle` is None and the same callback remains valid.
 
 `exec()` returns the usual `mergeResult`, or `None` if the lease cannot be acquired;
 `tracking_record` is also `None` for a skipped operation. Acquisition happens at
 execution, not during constructor DDL/staging preparation. Heartbeat renews the
 lease; completion or failure releases it. Data and journal commits are separate.
 The explicit `tracker.exec_merge(merge, ...)` API remains supported and avoids
-double tracking for bound merges. Its explicit lease arguments override constructor
-settings; omitted arguments inherit the supplied `LeaseOptions`.
+double tracking for bound merges. Lease configuration is supplied either on the
+merge or on the adapter, not both. Omitted adapter arguments use the merge's settings.
+
+Borrowing performs no reacquisition, waiting, release or replacement.
+`LeaseOptions(scope="full")` and `LeaseOptions(scope="changes")` acquire different
+destination leases. Lease scope does not label the journal: journal `scope` is separate.
+Different lease scopes do **not** exclude each other. Leave scope unset unless
+independent writers are intentional and their data-level conflict handling is defined.
+A handle binds the storage, key and acquisition token; release/reacquisition makes
+old handles invalid, even with the same owner. Incompatible storage is rejected.
+Obtain a handle from `ctx.lease_handle`, or from `lease.handle(name)` after a
+successful low-level `Lease.acquire(name)`. Do not construct handles manually.
+The acquisition owner remains responsible for heartbeat and release. A borrowed
+handle does not need to match the merge's destination: it can protect a whole
+multi-write pass. The caller must ensure competing passes use the same lease key;
+unrelated handles do not coordinate merely because their writes share a destination.
+`LeaseLost` indicates stale/lost ownership. A standalone busy acquisition returns
+None; in a mart callback it raises `LeaseBusy` and the pass returns False without
+advancing the unprocessed block/watermark.
+
+Mart passes retain their lease until progress is saved. There is no implicit lease
+inheritance through tracker.
+Mart pass scopes (`rebuild`/`changes`) are internal; setting `LeaseOptions.scope`
+on a mart is rejected. Scope is configurable for standalone merge/tracker operations.
+Ownership predicates are ANDed with custom update/insert/delete conditions when
+the tracker and destination use the same engine or URL. Ownership is also checked
+before each write phase and after execution. For different databases only these
+external checks are possible: they cannot atomically fence a destination statement.
+Neither leases nor these predicates make several commits a single transaction.
+
+### Protecting newer target rows
+
+`use_safe_border=True` requires an open `tracker`, `delete_mode='no'` or `'mark'`,
+and a timestamp `merged_on_field` (the existing last-update field; there is no
+separate `update_on` argument). At execution, before staging the source, dbmerge
+captures `tracker.safe_boundary()` for the destination across **all scopes**.
+Updates and tombstone writes then require `merged_on IS NULL OR merged_on < border`,
+in addition to any custom conditions. Rows equal to the boundary are protected too.
+Missing keys may still be inserted; `inserted_on_field` is not a concurrency guard.
+The captured value is exposed as `merge.safe_border`.
+
+This protects newer target writes, not a consistent source snapshot or arbitrary
+out-of-order input. For externally prepared `data`, the snapshot must not predate
+the captured boundary in a way that could overwrite newer data. Tracked writers
+must refresh the timestamp, and soft-deleted rows must be retained. Hard deletes
+are rejected because they discard that evidence. Precision loss can conservatively
+skip additional rows. ClickHouse still requires a suitable version column and
+`FINAL` reads; timestamp equality/version ties and cross-engine races are not solved
+by a boundary filter. Skipped rows are not automatically retried or journaled as changes.
 See [Tracking and Marts](TRACKING_AND_MARTS.md) for lifecycle and concurrency contracts.

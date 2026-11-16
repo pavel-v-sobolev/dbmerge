@@ -16,6 +16,7 @@ import importlib
 
 if TYPE_CHECKING:
     from .tracking import MergeTracker
+    from .lease import LeaseHandle
     from pandas import DataFrame as PandasDataFrame
     from polars import DataFrame as PolarsDataFrame
 
@@ -218,17 +219,24 @@ class mergeResult:
 class LeaseOptions:
     """Enable a destination lease and configure acquisition waiting.
 
-    Requires a caller-owned MergeTracker. The lease covers execution, not the
-    constructor's schema/staging preparation. No waiting is performed by default.
+    Requires a caller-owned MergeTracker. Different scopes acquire independent leases,
+    not mutually exclusive locks on the same destination.
+    Ownership guards are automatic; cross-engine checks are not atomic fencing.
+    The lease covers execution, not constructor schema/staging preparation.
+    No waiting is performed by default.
     """
 
     wait_lease: bool = False
     wait_timeout: float | None = None
     wait_interval: float = 30.0
+    scope: str | None = None
 
     def __post_init__(self):
         from math import isfinite
 
+        if self.scope is not None and (not isinstance(self.scope, str)
+                                       or not self.scope.strip() or len(self.scope) > 255):
+            raise IncorrectParameter('scope must be None or a non-empty string of at most 255 characters')
         if not isinstance(self.wait_lease, bool):
             raise IncorrectParameter('wait_lease must be a bool')
         for name, value in (('wait_timeout', self.wait_timeout),
@@ -267,7 +275,9 @@ class dbmerge:
                  chunk_size: int | None = None,
                  bulk_load: bool = True,
                  tracker: MergeTracker | None = None,
-                 lease: LeaseOptions | None = None) -> None:
+                 lease_options: LeaseOptions | None = None,
+                 lease_handle: LeaseHandle | None = None,
+                 use_safe_border: bool = False) -> None:
         """
         Init function prepares the database and internal structures before the merge operation.
         
@@ -290,9 +300,14 @@ class dbmerge:
             table_name (str): The name of the target table where data will be merged.
             tracker (MergeTracker, optional): Caller-owned journal for exec(). The result remains
                 mergeResult; tracking_record holds the journal record. None disables tracking.
-            lease (LeaseOptions, optional): Its presence enables a destination lease and requires
+            lease_options (LeaseOptions, optional): Enables a new destination lease and requires
                 tracker. A busy lease returns None from exec(). The lease covers execution only,
                 not constructor DDL/staging preparation. None disables automatic leasing.
+            lease_handle (LeaseHandle, optional): Borrow an already acquired lease without
+                reacquiring or releasing it. Requires tracker; mutually exclusive with lease_options.
+            use_safe_border (bool): Protect target rows at/after the destination's safe boundary.
+                Requires tracker, delete_mode no/mark and a timestamp merged_on_field.
+                Applies to updates and marks; missing keys can still be inserted.
             data (list[dict] | dict[str,list] | pd.DataFrame | pl.DataFrame | None, optional): The source data to merge. Accepts a list of dictionaries (e.g. [{'col1': 'val1'}, ...]), a dict of lists (e.g. {'col1': ['val1', ...], ...}) or a Pandas/Polars DataFrame.
                 For a list of dictionaries, every row must have the same keys as the first one, and a DataFrame must not have two
                 columns of one name: otherwise the values of a column would be lost, so either raises IncorrectDataError.
@@ -371,13 +386,21 @@ class dbmerge:
                     raise IncorrectParameter('tracker must be a MergeTracker or None')
                 if tracker._closing or tracker._closed.is_set():
                     raise IncorrectParameter('tracker must be open')
-            if lease is not None:
-                if not isinstance(lease, LeaseOptions):
-                    raise IncorrectParameter('lease must be LeaseOptions or None')
-                if tracker is None:
-                    raise IncorrectParameter('lease requires tracker')
+            from .lease import validate_lease_arguments
+            validate_lease_arguments(lease_options, lease_handle, tracker)
             self.tracker = tracker
-            self.lease = lease
+            self.lease_options = lease_options
+            self.lease_handle = lease_handle
+            self._execution_lease_handle = None
+            if not isinstance(use_safe_border, bool):
+                raise IncorrectParameter('use_safe_border must be a bool')
+            if use_safe_border and (tracker is None or delete_mode not in ('no', 'mark')
+                                    or not merged_on_field):
+                raise IncorrectParameter('use_safe_border requires tracker, delete_mode no/mark and merged_on_field')
+            self.use_safe_border = use_safe_border
+            self.safe_border = None
+            self._audit_time = None
+            self._execution_tracker = None
             self.tracking_record = None
             _ensure_logger_handler()
 
@@ -671,6 +694,10 @@ class dbmerge:
                     else:
                         self._remove_new_fields()
 
+            if self.use_safe_border and (self.merged_on_field not in self.table.c
+                                        or not isinstance(self.table.c[self.merged_on_field].type, DateTime)):
+                raise IncorrectParameter('use_safe_border requires an existing timestamp merged_on_field')
+
             if self.delete_mark_field is not None:
                 self._resolve_delete_mark_values()
 
@@ -820,6 +847,13 @@ class dbmerge:
         self.chunk_size = chunk_size
         
         try:
+            if self.use_safe_border:
+                self.safe_border = self.tracker.safe_boundary(self.table_name, schema=self.schema or '')
+                stamp = self.table.c[self.merged_on_field]
+                border = or_(stamp.is_(None), stamp < self.safe_border)
+                self.update_condition = and_(self.update_condition, border) if self.update_condition is not None else border
+                self.delete_condition = and_(self.delete_condition, border) if self.delete_condition is not None else border
+            self._apply_lease_conditions()
             return self._execute_steps(commit_all_steps)
         except Exception:
             try:
@@ -851,16 +885,19 @@ class dbmerge:
         if commit_all_steps:
             self.conn.commit()
 
+        self._prepare_write()
         self._update_not_matching_data()
         updated_msg = f'Updated: {self.updated_row_count} rows ({format_ms(self.update_time)})'
         if commit_all_steps:
             self.conn.commit()
 
+        self._prepare_write()
         self._insert_missing_data()
         inserted_msg = f'Inserted: {self.inserted_row_count} rows ({format_ms(self.insert_time)})'
         if commit_all_steps:
             self.conn.commit()
 
+        self._prepare_write()
         if self.delete_mode == 'delete':
             self._delete_rows_missing_in_source()
             delete_msg = f'Deleted: {self.deleted_row_count} rows ({format_ms(self.delete_time)})'
@@ -872,6 +909,7 @@ class dbmerge:
             self.delete_time = 0
 
         self.conn.commit()
+        self._check_lease()
         self.total_time = self.temp_insert_time + self.insert_time + self.update_time + self.delete_time
         logger.info(f'Merged data into table "{self.table_full_name}". ' + ', '.join(
             [data_msg, inserted_msg, updated_msg, delete_msg]) + f', Total time: {format_ms(self.total_time)}')
@@ -1245,7 +1283,35 @@ class dbmerge:
                 self._set_new_field_type(f, dialects.mssql.DATETIME2())
 
 
+    def _check_lease(self):
+        handle = self._execution_lease_handle or self.lease_handle
+        if handle is not None:
+            handle.check()
+
+    def _prepare_write(self):
+        """Refresh external guards and the audit clock immediately before each write phase."""
+        self._check_lease()
+        tracker = self._execution_tracker or self.tracker
+        if tracker is None:
+            return
+        if self.merged_on_field or self.inserted_on_field:
+            self._audit_time = tracker._db_now()
+
+    def _apply_lease_conditions(self):
+        tracker = self._execution_tracker or self.tracker
+        if tracker is None:
+            return
+        if tracker.engine is self.engine or tracker.engine.url == self.engine.url:
+            handle = self._execution_lease_handle or self.lease_handle
+            if handle is not None:
+                guard = handle.sql_condition()
+                for attr in ('update_condition', 'insert_condition', 'delete_condition'):
+                    condition = getattr(self, attr)
+                    setattr(self, attr, and_(condition, guard) if condition is not None else guard)
+
     def _now(self):
+        if self._audit_time is not None:
+            return literal(self._audit_time)
         # The audit timestamps are produced by the database, so their timezone and resolution are
         # the engine's, not ours. The only thing asked for here is the fractional precision that an
         # engine hides behind a default: MySQL/MariaDB NOW() drops the fraction unless NOW(fsp) is

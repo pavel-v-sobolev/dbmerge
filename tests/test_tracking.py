@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.exc import NoSuchModuleError
 
-from dbmerge import (MergeTracker, dbmerge, IncorrectParameter, drop_table_if_exists)
+from dbmerge import (MergeTracker, dbmerge, IncorrectParameter, LeaseOptions, drop_table_if_exists)
 
 from conftest import engines, make_engine
 
@@ -47,6 +47,163 @@ def tracker(engine):
 
 def _rows(name="a"):
     return [{"id": 1, "name": name}, {"id": 2, "name": name}]
+
+
+@pytest.mark.parametrize('mode', ['no', 'mark'])
+def test_inline_safe_border_protects_newer_and_equal_rows(engine, tracker, mode):
+    from unittest.mock import patch
+    from sqlalchemy import DateTime
+
+    border = tracker._db_now() - timedelta(days=1)
+    with _dbmerge(engine, table_name='orders', key=['id'], data=_rows(),
+                  merged_on_field='merged_on', delete_mark_field='deleted',
+                  data_types={'merged_on': DateTime(timezone=True)}) as merge:
+        merge.exec()
+        table = merge.table
+    with engine.begin() as conn:
+        conn.execute(update(table).values(merged_on=border))
+    # Equality must be protected too; a missing source row must not be marked.
+    with _dbmerge(engine, tracker=tracker, table_name='orders', key=['id'],
+                  data=[{'id': 1, 'name': 'new'}, {'id': 3, 'name': 'new'}],
+                  delete_mode=mode, delete_mark_field='deleted',
+                  merged_on_field='merged_on', use_safe_border=True) as merge:
+        with patch.object(tracker, 'safe_boundary', return_value=border):
+            result = merge.exec()
+        assert result.updated_row_count == result.deleted_row_count == 0
+        assert result.inserted_row_count == 1
+    with engine.begin() as conn:
+        conn.execute(update(table).values(merged_on=border - timedelta(days=1)))
+    with _dbmerge(engine, tracker=tracker, table_name='orders', key=['id'],
+                  data=[{'id': 1, 'name': 'new'}], delete_mode=mode,
+                  delete_mark_field='deleted', merged_on_field='merged_on',
+                  use_safe_border=True) as merge:
+        with patch.object(tracker, 'safe_boundary', return_value=border):
+            result = merge.exec()
+        assert result.updated_row_count == 1
+        assert result.deleted_row_count == (2 if mode == 'mark' else 0)
+
+
+def test_inline_tracker_supplies_audit_clock(engine, tracker):
+    from unittest.mock import patch
+    stamp = tracker._db_now().replace(microsecond=0) - timedelta(days=100)
+    with _dbmerge(engine, tracker=tracker, table_name='orders', key=['id'], data=_rows(),
+                  merged_on_field='merged_on', inserted_on_field='inserted_on') as merge:
+        with patch.object(tracker, '_db_now', return_value=stamp):
+            merge.exec()
+        with engine.connect() as conn:
+            row = conn.execute(select(merge.table)).first()
+        assert row.merged_on.replace(tzinfo=None) == stamp.replace(tzinfo=None)
+        assert row.inserted_on.replace(tzinfo=None) == stamp.replace(tzinfo=None)
+
+
+def test_inline_lease_scopes_are_independent(engine, tracker):
+    from dbmerge import LeaseOptions
+    from dbmerge.tracking import _lease_name
+    lease = tracker._get_lease()
+    name = _lease_name(_schema(engine) or '', 'orders', 'full')
+    lease.ensure(name)
+    assert lease.acquire(name)
+    try:
+        for scope, expected in [('full', False), ('changes', True)]:
+            with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(scope=scope),
+                          table_name='orders', key=['id'], data=_rows()) as merge:
+                result = merge.exec()
+                assert (result is not None) is expected
+                if expected:
+                    assert merge.tracking_record.scope is None
+    finally:
+        lease.release(name)
+
+
+def test_inline_lost_lease_prevents_target_writes(engine, tracker):
+    from dbmerge import LeaseOptions
+    from unittest.mock import patch
+    with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(), table_name='orders',
+                  key=['id'], data=_rows()) as merge:
+        with patch.object(tracker._get_lease(), 'still_mine', return_value=False):
+            with pytest.raises(RuntimeError, match='Lease lost'):
+                merge.exec()
+        with engine.connect() as conn:
+            assert conn.execute(select(merge.table)).first() is None
+
+
+def test_inline_sql_lease_guard_is_not_only_a_preflight_check(engine, tracker):
+    from dbmerge import LeaseOptions
+    from sqlalchemy import false
+    from unittest.mock import patch
+
+    with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(), table_name='orders',
+                  key=['id'], data=_rows()) as merge:
+        # Simulate ownership changing after preflight, as seen by the SQL predicate.
+        with patch.object(tracker._get_lease(), 'sql_condition', return_value=false()):
+            result = merge.exec(insert_condition=merge.temp_table.c.id > 0)
+        assert result.inserted_row_count == 0
+        assert not merge.tracking_record.changed
+
+
+def test_safe_border_validation(engine, tracker):
+    for kwargs in ({'use_safe_border': 1}, {'use_safe_border': True},
+                   {'use_safe_border': True, 'tracker': tracker},
+                   {'use_safe_border': True, 'tracker': tracker,
+                    'merged_on_field': 'merged_on', 'delete_mode': 'delete'}):
+        with pytest.raises(IncorrectParameter, match='use_safe_border'):
+            _dbmerge(engine, table_name='orders', key=['id'], data=_rows(), **kwargs)
+
+
+def test_borrowed_handle_is_not_released_and_old_acquisition_is_invalid(engine, tracker):
+    from dbmerge import LeaseLost
+    lease = tracker._get_lease()
+    lease.ensure('borrowed')
+    assert lease.acquire('borrowed')
+    handle = lease.handle('borrowed')
+    with _dbmerge(engine, tracker=tracker, lease_handle=handle,
+                  table_name='orders', data=_rows(), key=['id']) as merge:
+        assert merge.exec().inserted_row_count == 2
+    handle.check()
+    record, result = tracker.exec(lambda: 1, destination='other', lease_handle=handle)
+    assert record.changed and result == 1
+    handle.check()
+    with _dbmerge(engine, tracker=tracker, lease_handle=handle,
+                  table_name='orders', data=_rows(), key=['id']) as merge:
+        lease.release('borrowed')
+        assert lease.acquire('borrowed')
+        with pytest.raises(LeaseLost):
+            merge.exec()
+    with pytest.raises(LeaseLost):
+        handle.check()
+    lease.handle('borrowed').check()
+    with pytest.raises(IncorrectParameter, match='mutually exclusive'):
+        tracker.exec(lambda: 1, destination='orders', lease_options=LeaseOptions(),
+                     lease_handle=lease.handle('borrowed'))
+    lease.release('borrowed')
+
+
+def test_borrowed_handle_rejects_other_storage(engine, tracker):
+    other = MergeTracker(engine, table_name='other_' + uuid.uuid4().hex[:8], schema=_schema(engine))
+    try:
+        lease = tracker._get_lease()
+        lease.ensure('borrowed')
+        assert lease.acquire('borrowed')
+        with pytest.raises(IncorrectParameter, match='storage'):
+            other.exec(lambda: 1, destination='orders', lease_handle=lease.handle('borrowed'))
+    finally:
+        other.close()
+
+
+def test_handle_is_not_implicitly_inherited(engine, tracker):
+    from dbmerge import LeaseLost
+    lease = tracker._get_lease()
+    lease.ensure('outer')
+    assert lease.acquire('outer')
+    handle = lease.handle('outer')
+    def write():
+        with _dbmerge(engine, tracker=tracker, table_name='orders', data=_rows(), key=['id']) as merge:
+            lease.release('outer')
+            # The inner merge has no lease_handle: only the outer operation must fail.
+            assert merge.exec().inserted_row_count == 2
+        return 1
+    with pytest.raises(LeaseLost):
+        tracker.exec(write, destination='outer', lease_handle=handle)
 
 
 @pytest.mark.parametrize('dialect,message,retries', [
@@ -443,17 +600,17 @@ def test_exec_with_lease_skips_and_waits(engine):
             return None
 
     thread = threading.Thread(target=tracker_a.exec_merge, args=(SlowMerge(),),
-                              kwargs={"with_lease": True}, daemon=True)
+                              kwargs={"lease_options": LeaseOptions()}, daemon=True)
     thread.start()
     assert a_started.wait(timeout=5)
 
     # Without wait_lease the held lease skips the merge entirely.
-    record, result = tracker_b.exec_merge(FastMerge(), with_lease=True, wait_lease=False)
+    record, result = tracker_b.exec_merge(FastMerge(), lease_options=LeaseOptions())
     assert record is None and result is None
 
     # With wait_lease it polls until the holder releases it, then runs.
-    record, result = tracker_b.exec_merge(FastMerge(), with_lease=True, wait_lease=True,
-                                    wait_interval=0.05, wait_timeout=10)
+    record, result = tracker_b.exec_merge(FastMerge(), lease_options=LeaseOptions(wait_lease=True,
+                                    wait_interval=0.05, wait_timeout=10))
     assert record is not None and record.changed is True
 
     thread.join(timeout=5)
@@ -599,12 +756,12 @@ def test_dbmerge_inline_tracker(engine, tracker, leased):
 
     options = LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2) if leased else None
     for changed in (True, False):
-        with _dbmerge(engine, tracker=tracker, lease=options,
+        with _dbmerge(engine, tracker=tracker, lease_options=options,
                       table_name='orders', data=_rows(), key=['id']) as merge:
             with patch.object(tracker, 'exec', wraps=tracker.exec) as execute:
                 result = merge.exec(chunk_size=1)
             execute.assert_called_once()
-            assert execute.call_args.kwargs['with_lease'] is leased
+            assert (execute.call_args.kwargs['lease_options'] is not None) is leased
             assert merge.tracking_record.changed is changed
             assert result.inserted_row_count == (2 if changed else 0)
             assert not tracker._closed.is_set()
@@ -616,7 +773,7 @@ def test_dbmerge_lease_busy_and_adapter(engine, tracker):
     from dbmerge import LeaseOptions
     from unittest.mock import patch
 
-    with _dbmerge(engine, tracker=tracker, lease=LeaseOptions(wait_lease=True, wait_timeout=0),
+    with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(wait_lease=True, wait_timeout=0),
                   table_name='orders', data=_rows(), key=['id']) as merge:
         with patch.object(tracker, '_acquire_lease', return_value=False) as acquire:
             assert merge.exec() is None
@@ -633,21 +790,25 @@ def test_dbmerge_tracker_validation_and_failure(engine, tracker):
     from dbmerge import LeaseOptions
     from unittest.mock import patch
 
-    for kwargs in ({'tracker': object()}, {'lease': LeaseOptions()},
-                   {'tracker': tracker, 'lease': True}):
+    # This validates API configuration, not expiry; Oracle's coarse clock can
+    # exhaust a one-second lease between its acquisition and SQL guard.
+    tracker.heartbeat_ttl = 30.0
+    for kwargs in ({'tracker': object()}, {'lease_options': LeaseOptions()},
+                   {'tracker': tracker, 'lease_options': True}):
         with pytest.raises(IncorrectParameter):
             _dbmerge(engine, table_name='orders', data=_rows(), key=['id'], **kwargs)
-    with _dbmerge(engine, tracker=tracker, lease=LeaseOptions(),
+    with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(),
                   table_name='orders', data=_rows(), key=['id']) as merge:
         other = object.__new__(MergeTracker)
         with pytest.raises(IncorrectParameter, match='different tracker'):
             other.exec_merge(merge)
         with patch.object(tracker, 'exec', wraps=tracker.exec) as execute:
-            # An explicit adapter override may disable the constructor lease.
-            record, result = tracker.exec_merge(merge, with_lease=False)
-        assert execute.call_args.kwargs['with_lease'] is False
+            with pytest.raises(IncorrectParameter, match='not both'):
+                tracker.exec_merge(merge, lease_options=LeaseOptions())
+            record, result = tracker.exec_merge(merge)
+        assert execute.call_args.kwargs['lease_options'] is merge.lease_options
         assert record.changed and result.inserted_row_count == 2
-    with _dbmerge(engine, tracker=tracker, lease=LeaseOptions(),
+    with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(),
                   table_name='orders', data=_rows(), key=['id']) as merge:
         with patch.object(merge, '_execute_steps', side_effect=RuntimeError('write failed')):
             with pytest.raises(RuntimeError, match='write failed'):
@@ -671,12 +832,13 @@ def test_dbmerge_without_tracker_remains_untracked(engine, tracker):
         with patch.object(tracker, 'exec') as execute:
             assert merge.exec().inserted_row_count == 2
         execute.assert_not_called()
-        assert merge.tracking_record is None and merge.lease is None
+        assert merge.tracking_record is None and merge.lease_options is None
 
 
 @pytest.mark.parametrize('kwargs', [dict(wait_lease=1), dict(wait_timeout=-1),
                                    dict(wait_timeout=float('nan')), dict(wait_interval=0),
-                                   dict(wait_interval=float('inf')), dict(wait_interval=True)])
+                                   dict(wait_interval=float('inf')), dict(wait_interval=True),
+                                   dict(scope=''), dict(scope=123), dict(scope='x' * 256)])
 def test_lease_options_validation(kwargs):
     from dbmerge import LeaseOptions
 

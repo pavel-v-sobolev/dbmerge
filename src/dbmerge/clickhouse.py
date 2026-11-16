@@ -499,7 +499,7 @@ def insert_changed_rows(merge: dbmerge):
         if name in merge.key or name in non_key_cols:
             value = staging.c[name]
         elif name == merge.merged_on_field:
-            value = now()
+            value = merge._now()
         elif manage_mark_reset and name == merge.delete_mark_field:
             value = literal(merge.delete_mark_active_value)
         else:
@@ -531,10 +531,10 @@ def insert_new_rows(merge: dbmerge):
     values = [staging.c[f] for f in merge.data_fields]
     if merge.merged_on_field is not None:
         columns.append(merge.merged_on_field)
-        values.append(now())
+        values.append(merge._now())
     if merge.inserted_on_field is not None:
         columns.append(merge.inserted_on_field)
-        values.append(now())
+        values.append(merge._now())
     if merge.delete_mark_field is not None and not merge.delete_mark_from_data:
         columns.append(merge.delete_mark_field)
         values.append(literal(merge.delete_mark_active_value))
@@ -564,7 +564,7 @@ def insert_marked_rows(merge: dbmerge):
         if name == merge.delete_mark_field:
             value = literal(merge.delete_mark_deleted_value)
         elif name == merge.merged_on_field:
-            value = now()
+            value = merge._now()
         elif name in merge.delete_mark_values:
             value = literal(merge.delete_mark_values[name])
         else:

@@ -173,7 +173,7 @@ def test_equal_total_renews_protection_against_intermediate_full(concurrent):
     write(insert(orders).values(id=1, order_date=DAY, customer_id=1, amount=10))
     assert change_loop.run_if_pending()
     write(update(orders).values(amount=50), 'full_load')
-    ctx = SimpleNamespace(engine=full.engine, tracker=tracker, lease_is_mine=None)
+    ctx = SimpleNamespace(engine=full.engine, tracker=tracker, lease_handle=None)
     full.setup(ctx)
     rows, boundary = full._read_month(ctx, date(2026, 1, 1), date(2026, 2, 1))
     write(update(orders).values(amount=10))
@@ -201,8 +201,11 @@ def test_sql_variant_writes_through_dbmerge_with_full_guard(concurrent):
         assert merge.inserted_on_field == 'inserted_on'
         assert 'scope' not in kwargs
         assert tracker._mart_scope.get() is None
-        assert 'merged_on' in str(kwargs['update_condition'])
-        assert kwargs['insert_condition'] is not None
+        assert merge.use_safe_border
+        assert 'merged_on' in str(merge.update_condition)
+        assert kwargs['insert_condition'] is None
+        assert 'EXISTS' in str(merge.insert_condition)
+        assert not hasattr(tracker, "_write_leases")
     write(update(orders).values(amount=20))
     # Initialize this consumer's watermark before testing its incremental path.
     tracker.mark_watermark(changes.destination[1], full_loop.tracker.watermark(
@@ -213,7 +216,10 @@ def test_sql_variant_writes_through_dbmerge_with_full_guard(concurrent):
         assert execute.call_args.args[0].source_table_name.endswith('_view')
         assert execute.call_args.kwargs['source_condition'] is not None
         # Changes has only the lease guard, not full's timestamp restriction.
-        assert 'merged_on' not in str(execute.call_args.kwargs['update_condition'])
+        merge = execute.call_args.args[0]
+        assert not merge.use_safe_border
+        assert 'merged_on' not in str(merge.update_condition)
+        assert 'EXISTS' in str(merge.update_condition)
 
 
 def test_sql_changes_do_not_touch_unrelated_groups(concurrent):

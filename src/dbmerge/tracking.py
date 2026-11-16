@@ -158,9 +158,12 @@ def _tracking_table(metadata: MetaData, name: str, schema: str | None) -> Table:
         schema=schema,
     )
 
-def _lease_name(schema: str, table_name: str) -> str:
-    """A stable per-(schema, table) key for the exec lease."""
-    return f"{schema}|{table_name}"
+def _lease_name(schema: str, table_name: str, scope: str | None = None) -> str:
+    """A stable per-(schema, table, scope) key; preserve the legacy unscoped key."""
+    base = f"{schema}|{table_name}"
+    if scope is None:
+        return base
+    return 'scoped:' + hashlib.sha256(json.dumps([schema, table_name, scope]).encode()).hexdigest()[:48]
 
 
 class MergeTracker:
@@ -250,8 +253,7 @@ class MergeTracker:
 
     def exec(self, operation: Callable[[], Any], *, destination,
              scope: str | None = None,
-             with_lease: bool = False, wait_lease: bool = False,
-             wait_timeout: float | None = None, wait_interval: float = 30.0):
+             lease_options=None, lease_handle=None):
         """Track a committed zero-argument write; only False/numeric zero means no change.
 
         Returns (record, original_result). Consumer watermarks belong to MartLoop, not writes.
@@ -264,8 +266,7 @@ class MergeTracker:
             self._active[thread_id] = self._active.get(thread_id, 0) + 1
         try:
             return self._exec(operation, destination=destination, scope=scope,
-                              with_lease=with_lease, wait_lease=wait_lease,
-                              wait_timeout=wait_timeout, wait_interval=wait_interval)
+                              lease_options=lease_options, lease_handle=lease_handle)
         finally:
             with self._idle:
                 self._active[thread_id] -= 1
@@ -273,8 +274,7 @@ class MergeTracker:
                     del self._active[thread_id]
                 self._idle.notify_all()
 
-    def _exec(self, operation, *, destination, scope, with_lease, wait_lease,
-              wait_timeout, wait_interval):
+    def _exec(self, operation, *, destination, scope, lease_options, lease_handle):
         """Run a callable and journal the write to ``destination``.
 
         ``destination`` is a bare/schema-qualified string or a ``(schema, identifier)`` tuple.
@@ -302,28 +302,36 @@ class MergeTracker:
             raise IncorrectParameter("destination identifiers starting with 'lease:' are reserved")
         # Mart callbacks own their operation category; do not leak it to other
         # threads or retain it after returning to standalone tracking calls.
+        from .lease import validate_lease_arguments
+        validate_lease_arguments(lease_options, lease_handle, self)
         scope = self._mart_scope.get() or scope
         if scope is not None and (not isinstance(scope, str) or not scope.strip() or len(scope) > 255):
             raise IncorrectParameter("scope must be None or a non-empty string of at most 255 characters")
-        if wait_interval <= 0:
-            raise IncorrectParameter("wait_interval must be positive")
         if self._closed.is_set():
             raise IncorrectParameter("Cannot execute an operation with a closed tracker")
 
         destination_schema = destination_schema or ""
         lease_name = None
-        if with_lease:
-            lease_name = _lease_name(destination_schema, table_name)
-            if not self._acquire_lease(lease_name, wait=wait_lease, timeout=wait_timeout,
-                                       interval=wait_interval):
+        if lease_options is not None:
+            lease_name = _lease_name(destination_schema, table_name, lease_options.scope)
+            if not self._acquire_lease(lease_name, wait=lease_options.wait_lease,
+                                       timeout=lease_options.wait_timeout,
+                                       interval=lease_options.wait_interval):
                 logger.info('Skipping write to "%s": its lease is held by another process', table_name)
+                if self._mart_scope.get() is not None:
+                    from .lease import LeaseBusy
+                    raise LeaseBusy('Tracked mart write skipped because its lease is busy')
                 return (None, None)
         try:
+            if lease_name is not None:
+                lease_handle = self._get_lease().handle(lease_name)
+            if lease_handle is not None:
+                lease_handle.check()
             row_id, started_at = self._begin(table_name, destination_schema, scope)
             try:
                 result = operation()
-                if lease_name is not None and not self._get_lease().still_mine(lease_name):
-                    raise RuntimeError("Lease lost while executing tracked operation")
+                if lease_handle is not None:
+                    lease_handle.check()
                 changed = not (result is False or isinstance(result, Number) and result == 0)
                 finished_at = self._finish(row_id, table_name, changed, None,
                                            destination_schema)
@@ -338,16 +346,14 @@ class MergeTracker:
                 self._release_lease(lease_name)
 
     def exec_merge(self, merge, *, scope: str | None = None,
-                   with_lease: bool | None = None,
-                   wait_lease: bool | None = None, wait_timeout: float | None = None,
-                   wait_interval: float | None = None, **exec_kwargs):
+                   lease_options=None, lease_handle=None, **exec_kwargs):
         """Run a dbmerge instance through :meth:`exec`, returning its original merge result.
 
         Destination is inferred from the merge; change detection uses its inserted, updated and
         deleted row counters, not the truth value of the returned mergeResult. Additional keyword
         arguments are forwarded to ``merge.exec``. There is no ``changed`` override.
-        Bound merges execute without recursive journaling. Omitted lease arguments inherit
-        the merge's LeaseOptions; None for wait_timeout also inherits its configured timeout.
+        Bound merges execute without recursive journaling. Configure lease_options/lease_handle
+        on the merge or adapter, not both. Omitted adapter arguments use merge configuration.
         """
         table_name = getattr(merge, "table_name", None)
         if not table_name or not callable(getattr(merge, "exec", None)):
@@ -357,15 +363,15 @@ class MergeTracker:
         bound_tracker = getattr(merge, 'tracker', None)
         if bound_tracker is not None and bound_tracker is not self:
             raise IncorrectParameter('Merge is configured with a different tracker')
-        lease = getattr(merge, 'lease', None)
-        if with_lease is None:
-            with_lease = lease is not None
-        if wait_lease is None:
-            wait_lease = lease.wait_lease if lease is not None else False
-        if wait_timeout is None and lease is not None:
-            wait_timeout = lease.wait_timeout
-        if wait_interval is None:
-            wait_interval = lease.wait_interval if lease is not None else 30.0
+        bound_options = getattr(merge, 'lease_options', None)
+        bound_handle = getattr(merge, 'lease_handle', None)
+        if lease_options is not None or lease_handle is not None:
+            if bound_options is not None or bound_handle is not None:
+                raise IncorrectParameter('Configure lease_options/lease_handle on merge or adapter, not both')
+        else:
+            lease_options, lease_handle = bound_options, bound_handle
+        from .lease import validate_lease_arguments
+        validate_lease_arguments(lease_options, lease_handle, self)
         if "next_watermark" in exec_kwargs:
             raise IncorrectParameter("Watermarks belong to MartLoop, not individual writes")
         if "changed" in exec_kwargs:
@@ -375,15 +381,25 @@ class MergeTracker:
         def execute_merge():
             nonlocal merge_result
             execute = merge._exec if bound_tracker is not None else merge.exec
-            merge_result = execute(**exec_kwargs)
+            active_handle = lease_handle
+            if lease_options is not None:
+                active_handle = self._get_lease().handle(_lease_name(
+                    getattr(merge, 'schema', None) or '', table_name, lease_options.scope))
+            if hasattr(merge, '_execution_tracker'):
+                merge._execution_tracker = self
+                merge._execution_lease_handle = active_handle
+            try:
+                merge_result = execute(**exec_kwargs)
+            finally:
+                if hasattr(merge, '_execution_tracker'):
+                    merge._execution_tracker = None
+                    merge._execution_lease_handle = None
             return (getattr(merge, "inserted_row_count", 0)
                     + getattr(merge, "updated_row_count", 0)
                     + getattr(merge, "deleted_row_count", 0)) > 0
 
         record, _ = self.exec(execute_merge, destination=(getattr(merge, "schema", None), table_name),
-                              scope=scope, with_lease=with_lease,
-                              wait_lease=wait_lease, wait_timeout=wait_timeout,
-                              wait_interval=wait_interval)
+                              scope=scope, lease_options=lease_options, lease_handle=lease_handle)
         if bound_tracker is not None:
             merge.tracking_record = record
         return record, merge_result
@@ -710,7 +726,7 @@ class MergeTracker:
         return result.rowcount
 
     def mark_watermark(self, table_name: str, watermark: datetime,
-                       schema: str | None = None, *, lease=None, lease_name=None) -> None:
+                       schema: str | None = None, *, lease_handle=None) -> None:
         """Persist consumer progress independently of individual operation rows.
 
         When a lease is supplied, lock/check/renew its row in the same transaction. This guards
@@ -720,13 +736,9 @@ class MergeTracker:
         t = self.table
         with self.engine.begin() as conn:
             now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
-            if lease is not None:
-                held = conn.execute(update(t).where(
-                    t.c.table_name == lease.key(lease_name), t.c.owner == lease.owner,
-                    t.c.heartbeat_at >= now - timedelta(seconds=lease.ttl))
-                    .values(heartbeat_at=now))
-                if not held.rowcount:
-                    raise RuntimeError("Lease lost before committing mart progress")
+            if lease_handle is not None:
+                lease_handle.validate(self)
+                lease_handle.guard_progress(conn)
             previous = conn.scalar(select(t.c.watermark).where(t.c.id == key))
             if previous is not None:
                 stamp = literal(watermark, type_=t.c.watermark.type)
@@ -742,7 +754,7 @@ class MergeTracker:
     # ------------------------------------------------------------------ lease
 
     def _get_lease(self):
-        """The lease behind exec(with_lease=True), created lazily to avoid a circular import."""
+        """The lease manager behind lease_options, created lazily to avoid a circular import."""
         with self._lock:
             if self._lease is None:
                 from .lease import Lease

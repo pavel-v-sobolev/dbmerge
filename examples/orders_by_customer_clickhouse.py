@@ -16,7 +16,7 @@ from datetime import date
 
 from sqlalchemy import and_, text, tuple_
 
-from dbmerge import MartHandler, MergeTracker, dbmerge
+from dbmerge import MartHandler, MergeTracker, LeaseBusy, dbmerge
 
 
 class OrdersByCustomerClickHouse(MartHandler):
@@ -27,7 +27,8 @@ class OrdersByCustomerClickHouse(MartHandler):
         for statement in (
             """CREATE TABLE IF NOT EXISTS orders_by_customer (
                 order_date Date, customer_id UInt64, total_amount Decimal(18, 2),
-                is_deleted UInt8, order_ids Array(Int64), version UInt64
+                is_deleted UInt8, order_ids Array(Int64), version UInt64,
+                merged_on DateTime64(6, 'UTC'), inserted_on DateTime64(6, 'UTC')
             ) ENGINE = ReplacingMergeTree(version) ORDER BY (order_date, customer_id)""",
             """CREATE OR REPLACE VIEW orders_by_customer_rows_view AS
                 SELECT toInt64(assumeNotNull(id)) AS id,
@@ -77,12 +78,15 @@ class OrdersByCustomerClickHouse(MartHandler):
 
     def process_changes(self, ctx):
         groups = text(self.groups_to_handle_sql(ctx)).bindparams(watermark=ctx.watermark)
-        with dbmerge(ctx.engine, tracker=ctx.tracker, table_name='orders_by_customer',
+        with dbmerge(ctx.engine, tracker=ctx.tracker, lease_handle=ctx.lease_handle,
+                     table_name='orders_by_customer',
                      source_table_name='orders_by_customer_view',
-                     key=['order_date', 'customer_id'], delete_mode='no') as merge:
+                     key=['order_date', 'customer_id'], delete_mode='no',
+                     merged_on_field='merged_on', inserted_on_field='inserted_on') as merge:
             key = tuple_(merge.source_table.c.order_date, merge.source_table.c.customer_id)
             # PostgreSQL's lease predicate cannot be evaluated inside ClickHouse SQL.
-            merge.exec(source_condition=key.in_(groups))
+            if merge.exec(source_condition=key.in_(groups)) is None:
+                raise LeaseBusy('Changes were not written')
 
     def rebuild(self, ctx):
         periods = self.query(ctx, """
@@ -98,11 +102,15 @@ class OrdersByCustomerClickHouse(MartHandler):
                 continue
             ends = date(period.year + 1, 1, 1) if period.month == 12 else date(
                 period.year, period.month + 1, 1)
-            with dbmerge(ctx.engine, tracker=ctx.tracker, table_name='orders_by_customer',
+            with dbmerge(ctx.engine, tracker=ctx.tracker, lease_handle=ctx.lease_handle,
+                         table_name='orders_by_customer',
                          source_table_name='orders_by_customer_view',
-                         key=['order_date', 'customer_id'], delete_mode='no') as merge:
+                         key=['order_date', 'customer_id'], delete_mode='no',
+                         merged_on_field='merged_on', inserted_on_field='inserted_on',
+                         use_safe_border=True) as merge:
                 day = merge.source_table.c.order_date
-                merge.exec(source_condition=and_(day >= period, day < ends))
+                if merge.exec(source_condition=and_(day >= period, day < ends)) is None:
+                    raise LeaseBusy('Rebuild block was not written')
             yield label
 
 

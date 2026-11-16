@@ -417,9 +417,9 @@ def test_mart_lease_exclusivity(engine, tracker):
         tracker.exec_merge(merge)
 
     m1 = MartLoop(engine, tracker, (_schema(engine), "mart"), [(_schema(engine), "orders")],
-                  lambda ctx: ran.append("m1"), lease=lease1)
+                  lambda ctx: ran.append("m1"))
     m2 = MartLoop(engine, tracker, (_schema(engine), "mart"), [(_schema(engine), "orders")],
-                  lambda ctx: ran.append("m2"), lease=lease2)
+                  lambda ctx: ran.append("m2"))
 
     assert m1.run_if_pending() is True
     assert m2.run_if_pending() is False
@@ -532,18 +532,18 @@ def test_handler_constructor_no_lease(engine, tracker):
         sources = ['source_without_lease']
 
         def process_changes(self, ctx):
-            with ctx.engine.connect() as conn:
-                assert conn.scalar(select(ctx.lease_is_mine))
-            assert str(ctx.lease_is_mine) == str(true())
+            assert ctx.lease_handle is None
             seen.append(ctx.full_rebuild)
 
-    handler = M(engine, tracker=tracker, with_lease=False)
+    handler = M(engine, tracker=tracker, lease_options=None)
     loop = handler.loop()
     try:
         assert not hasattr(handler, 'scope')
         assert not hasattr(loop, 'scope')
         assert loop._lease is None
         tracker.exec(lambda: 1, destination='source_without_lease', scope='changes')
+        if engine.dialect.name in ('sqlite', 'mysql', 'mariadb', 'oracle'):
+            time.sleep(1.1)
         assert loop.run_if_pending()
         assert seen == [True]
         assert not loop.run_if_pending()
@@ -631,17 +631,95 @@ def test_rebuild_and_changes_use_separate_leases(engine, tracker):
 
 
 def test_handler_rejects_invalid_lease_configuration(engine, tracker):
-    with pytest.raises(IncorrectParameter, match='with_lease'):
-        MartHandler(engine, tracker=tracker, destination='mart', sources=['source'], with_lease='yes')
+    from dbmerge import LeaseOptions
+    with pytest.raises(IncorrectParameter, match='managed internally'):
+        MartHandler(engine, tracker=tracker, destination='mart', sources=['source'],
+                    lease_options=LeaseOptions(scope='custom'))
+    with pytest.raises(IncorrectParameter, match='lease_options'):
+        MartHandler(engine, tracker=tracker, destination='mart', sources=['source'], lease_options='yes')
     with pytest.raises(TypeError, match='scope'):
         MartHandler(engine, tracker=tracker, destination='mart', sources=['source'], scope=' ')
     lease = Lease(engine, tracker.table, 'invalid_combination')
     try:
-        with pytest.raises(IncorrectParameter, match='with_lease=False'):
+        with pytest.raises(IncorrectParameter, match='lease_handle'):
             MartLoop(engine, tracker, 'mart', ['source'], lambda ctx: None,
-                     lease=lease, with_lease=False)
+                     lease_handle=lease, lease_options=None)
     finally:
         lease.close()
+
+
+def test_busy_merge_does_not_advance_mart_progress(engine, tracker):
+    from dbmerge import LeaseOptions
+    from dbmerge.tracking import _lease_name
+    source = 'busy_source'
+    tracker.exec(lambda: 1, destination=source)
+    lease = tracker._get_lease()
+    name = _lease_name(_schema(engine) or '', 'orders', 'changes')
+    lease.ensure(name)
+    assert lease.acquire(name)
+    def process(ctx):
+        with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(scope='changes'),
+                      table_name='orders', key=['id'], data=_rows()) as merge:
+            merge.exec()  # Even an ignored return must not publish progress.
+    loop = MartLoop(engine, tracker, 'busy_mart', [source], process)
+    try:
+        assert not loop.run_if_pending()
+        assert tracker.watermark('busy_mart') is None
+        assert loop._rebuild_cursor() == ''
+        lease.release(name)
+        assert loop.run_if_pending()
+        assert tracker.watermark('busy_mart') is not None
+    finally:
+        loop.close()
+        lease.release(name)
+
+
+@pytest.mark.parametrize('explicit_none', [False, True])
+def test_mart_borrows_explicit_handle_without_releasing_it(engine, tracker, explicit_none):
+    tracker.exec(lambda: 1, destination='borrowed_source')
+    lease = tracker._get_lease()
+    lease.ensure('external_pass')
+    assert lease.acquire('external_pass')
+    handle = lease.handle('external_pass')
+    seen = []
+    loop = MartLoop(engine, tracker, 'borrowed_mart', ['borrowed_source'],
+                    lambda ctx: seen.append(ctx.lease_handle),
+                    lease_handle=handle, **({'lease_options': None} if explicit_none else {}))
+    try:
+        assert loop.run_if_pending()
+        assert seen and all(item is handle for item in seen)
+    finally:
+        loop.close()
+    handle.check()
+    lease.release('external_pass')
+
+
+def test_borrowed_mart_handle_loss_keeps_progress_and_successor(engine, tracker):
+    from dbmerge import LeaseLost
+
+    tracker.exec(lambda: 1, destination='borrowed_source')
+    lease = tracker._get_lease()
+    name = 'borrowed_lost_pass'
+    lease.ensure(name)
+    assert lease.acquire(name)
+    handle = lease.handle(name)
+
+    def process(ctx):
+        assert ctx.lease_handle is handle
+        lease.release(name)
+        assert lease.acquire(name)
+
+    loop = MartLoop(engine, tracker, 'borrowed_lost_mart', ['borrowed_source'],
+                    process, lease_handle=handle)
+    try:
+        with pytest.raises(LeaseLost):
+            loop.run_if_pending()
+        assert tracker.watermark('borrowed_lost_mart') is None
+        assert loop._rebuild_cursor() == ''
+    finally:
+        loop.close()
+    lease.handle(name).check()  # Closing the borrower must not release the successor.
+    lease.release(name)
 
 
 def test_sources_in_multiple_schemas(engine, tracker):
@@ -810,7 +888,7 @@ def test_handler_run_once_rebuild_without_source_changes(engine, tracker, separa
     tracking_schema = None if separate_tracking else tracker.schema
     tracking = MergeTracker(tracking_engine, schema=tracking_schema)
     try:
-        mart = RebuildMart(engine, tracker=tracking, with_lease=False)
+        mart = RebuildMart(engine, tracker=tracking, lease_options=None)
         assert mart.run_once(rebuild=True)
         assert seen == ['first', 'second']
         assert not rebuild_requested(tracking_engine, mart.destination, schema=tracking_schema)

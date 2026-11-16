@@ -15,9 +15,11 @@ so the caller checks ownership before critical steps.
 from __future__ import annotations
 
 import threading
+import uuid
+from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import func, insert, or_, select, update
+from sqlalchemy import exists, func, insert, literal_column, or_, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -30,6 +32,76 @@ LEASE_HEARTBEAT_RETRY_PERIOD = 5.0
 LEASE_JOIN_TIMEOUT = 30.0
 
 LEASE_PREFIX = "lease:"
+_DEFAULT_LEASE_OPTIONS = object()
+
+
+class LeaseLost(RuntimeError):
+    """A supplied lease is no longer owned by this acquisition."""
+
+
+class LeaseBusy(RuntimeError):
+    """A required write was skipped because its lease is busy."""
+
+
+@dataclass(frozen=True)
+class LeaseHandle:
+    """Borrowed reference to one acquisition. It never acquires or releases a lease."""
+
+    _lease: Lease
+    name: str
+    token: str
+
+    def validate(self, tracker):
+        lease = self._lease
+        if (lease.engine is not tracker.engine and lease.engine.url != tracker.engine.url
+                or lease.table.name != tracker.table.name
+                or lease.table.schema != tracker.table.schema):
+            raise IncorrectParameter('lease_handle must use the tracker storage')
+        self.check()
+
+    def check(self):
+        if not self._lease.still_mine(self.name, token=self.token):
+            raise LeaseLost('Lease lost or lease_handle is stale')
+
+    def sql_condition(self):
+        return self._lease.sql_condition(self.name, token=self.token)
+
+    def guard_progress(self, conn):
+        """Check/renew this exact acquisition in the progress transaction."""
+        lease = self._lease
+        t = lease.table
+        now = _coerce_datetime(conn.scalar(select(_now_expr(lease.engine))))
+        result = conn.execute(update(t).where(
+            t.c.table_name == lease.key(self.name), t.c.owner == lease.owner,
+            t.c.scope == self.token,
+            t.c.heartbeat_at >= now - timedelta(seconds=lease.ttl)).values(heartbeat_at=now))
+        if not result.rowcount:
+            raise LeaseLost('Lease lost before committing mart progress')
+
+
+def validate_lease_arguments(lease_options, lease_handle, tracker):
+    from .dbmerge import LeaseOptions
+    if lease_options is not None and not isinstance(lease_options, LeaseOptions):
+        raise IncorrectParameter('lease_options must be LeaseOptions or None')
+    if lease_handle is not None and not isinstance(lease_handle, LeaseHandle):
+        raise IncorrectParameter('lease_handle must be LeaseHandle or None')
+    if lease_options is not None and lease_handle is not None:
+        raise IncorrectParameter('lease_options and lease_handle are mutually exclusive')
+    if (lease_options is not None or lease_handle is not None) and tracker is None:
+        raise IncorrectParameter('lease_options/lease_handle require tracker')
+    if lease_handle is not None:
+        lease_handle.validate(tracker)
+
+
+def _mart_lease_options(lease_options, lease_handle, tracker):
+    from .dbmerge import LeaseOptions
+
+    if lease_options is _DEFAULT_LEASE_OPTIONS:
+        lease_options = LeaseOptions() if lease_handle is None else None
+    validate_lease_arguments(lease_options, lease_handle, tracker)
+    if lease_options is not None and lease_options.scope is not None:
+        raise IncorrectParameter('Mart lease_options.scope is managed internally (rebuild/changes)')
+    return lease_options
 
 
 class Lease:
@@ -50,6 +122,7 @@ class Lease:
         self.retry_period = retry_period
 
         self._held: set[str] = set()
+        self._tokens: dict[str, str] = {}
         self._lock = threading.RLock()
         self._closed = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
@@ -82,17 +155,28 @@ class Lease:
                 return False
             key = self.key(name)
             t = self.table
+            token = uuid.uuid4().hex
             with self.engine.begin() as conn:
                 now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
                 result = conn.execute(update(t).where(
                     t.c.table_name == key,
                     or_(t.c.owner.is_(None), t.c.heartbeat_at < now - timedelta(seconds=self.ttl)))
-                    .values(owner=self.owner, heartbeat_at=now))
+                    .values(owner=self.owner, heartbeat_at=now, scope=token))
             if result.rowcount:
                 self._held.add(name)
+                self._tokens[name] = token
                 self._ensure_heartbeat()
                 return True
             return False
+
+    def handle(self, name: str) -> LeaseHandle:
+        with self._lock:
+            token = self._tokens.get(name)
+            if name not in self._held or token is None:
+                raise LeaseLost('Cannot reference a lease that is not held')
+            handle = LeaseHandle(self, name, token)
+            handle.check()
+            return handle
 
     def renew(self, name: str) -> bool:
         """Extend a fresh hold; never resurrect an expired or replaced hold."""
@@ -104,6 +188,7 @@ class Lease:
                 now = _coerce_datetime(conn.scalar(select(_now_expr(self.heartbeat_engine))))
                 result = conn.execute(update(t).where(
                     t.c.table_name == self.key(name), t.c.owner == self.owner,
+                    t.c.scope == self._tokens.get(name),
                     t.c.heartbeat_at >= now - timedelta(seconds=self.ttl))
                     .values(heartbeat_at=now))
             if not result.rowcount:
@@ -115,17 +200,26 @@ class Lease:
         key = self.key(name)
         with self._lock:
             self._held.discard(name)
+            token = self._tokens.pop(name, None)
+        if token is None:
+            return
         t = self.table
         with self.engine.begin() as conn:
             # Free = owner IS NULL; heartbeat_at stays (it is NOT NULL) and no longer matters.
             conn.execute(update(t)
-                         .where(t.c.table_name == key, t.c.owner == self.owner)
+                         .where(t.c.table_name == key, t.c.owner == self.owner, t.c.scope == token)
                          .values(owner=None))
 
-    def still_mine(self, name: str) -> bool:
+    def still_mine(self, name: str, *, token: str | None = None) -> bool:
         """Whether this process still owns the name with a fresh heartbeat."""
         if self._closed.is_set():
             return False
+        with self._lock:
+            if name not in self._held:
+                return False
+            token = token or self._tokens.get(name)
+            if token != self._tokens.get(name):
+                return False
         key = self.key(name)
         t = self.table
         with self.heartbeat_engine.connect() as conn:
@@ -134,8 +228,30 @@ class Lease:
             found = conn.scalar(
                 select(t.c.id).where(t.c.table_name == key,
                                      t.c.owner == self.owner,
+                                     t.c.scope == token,
                                      t.c.heartbeat_at >= cutoff))
         return found is not None
+
+    def sql_condition(self, name: str, *, token: str | None = None):
+        """Statement-time ownership predicate, only for SQL executed in this database."""
+        dialect = self.engine.dialect.name
+        now = _now_expr(self.engine)
+        if dialect == 'postgresql':
+            now = func.clock_timestamp()
+        if dialect == 'sqlite':
+            cutoff = func.datetime('now', f'-{self.ttl} seconds')
+        elif dialect in ('mysql', 'mariadb'):
+            cutoff = func.timestampadd(literal_column('MICROSECOND'), -int(self.ttl * 1000000), now)
+        elif dialect == 'mssql':
+            cutoff = func.dateadd(literal_column('millisecond'), -int(self.ttl * 1000), now)
+        elif dialect == 'oracle':
+            cutoff = now - func.numtodsinterval(self.ttl, 'SECOND')
+        else:
+            cutoff = now - timedelta(seconds=self.ttl)
+        t = self.table
+        return exists().where(t.c.table_name == self.key(name), t.c.owner == self.owner,
+                              t.c.scope == (token or self._tokens.get(name)),
+                              t.c.heartbeat_at >= cutoff)
 
     # ------------------------------------------------------------------ heartbeat
 

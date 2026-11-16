@@ -11,6 +11,44 @@ from dbmerge import MartLoop, MergeTracker, dbmerge, request_rebuild
 from conftest import all_engine_urls, engines, make_engine
 
 
+def test_clickhouse_tracker_clock_and_safe_border():
+    from datetime import timedelta
+    from unittest.mock import patch
+    from sqlalchemy import select
+    from dbmerge import LeaseOptions
+
+    if 'clickhouse' not in engines:
+        pytest.skip('needs ClickHouse')
+    engine = make_engine('clickhouse')
+    pg = create_engine(all_engine_urls['postgres'])
+    name = 'clock_' + uuid.uuid4().hex[:8]
+    tracker = MergeTracker(pg, table_name='tracking_' + name)
+    try:
+        stamp = tracker._db_now().replace(microsecond=123456)
+        options = dict(tracker=tracker, lease_options=LeaseOptions(scope='changes'),
+                       table_name=name, key=['id'], merged_on_field='merged_on',
+                       inserted_on_field='inserted_on', delete_mark_field='deleted')
+        with dbmerge(engine, data=[{'id': 1, 'value': 10}], **options) as merge:
+            with patch.object(tracker, '_db_now', return_value=stamp):
+                merge.exec()
+            with engine.connect() as conn:
+                row = conn.execute(select(merge.table)).first()
+            assert row.merged_on.replace(tzinfo=None) == stamp.replace(tzinfo=None)
+            assert row.inserted_on.replace(tzinfo=None) == stamp.replace(tzinfo=None)
+        for mode in ('no', 'mark'):
+            with dbmerge(engine, data=[{'id': 1, 'value': 20}, {'id': 2, 'value': 30}],
+                         delete_mode=mode, use_safe_border=True, **options) as merge:
+                with patch.object(tracker, 'safe_boundary', return_value=stamp - timedelta(seconds=1)):
+                    result = merge.exec()
+                assert result.updated_row_count == result.deleted_row_count == 0
+    finally:
+        tracker.close()
+        with engine.connect() as conn:
+            conn.exec_driver_sql(f'DROP TABLE IF EXISTS {name}')
+        tracker.table.drop(pg, checkfirst=True)
+        pg.dispose()
+
+
 def test_clickhouse_mart_with_postgresql_tracker():
     address = os.environ.get("DBMERGE_TEST_CLICKHOUSE_POSTGRES")
     if "clickhouse" not in engines or not address:
@@ -51,8 +89,9 @@ def test_clickhouse_mart_with_postgresql_tracker():
             phases.append(ctx.full_rebuild)
             with dbmerge(engine, schema=destination_schema, table_name="totals",
                          source_schema=destination_schema, source_table_name="totals_view",
-                         key=["customer_id"]) as merge:
-                ctx.tracker.exec_merge(merge)
+                         key=["customer_id"], tracker=ctx.tracker,
+                         lease_handle=ctx.lease_handle) as merge:
+                merge.exec()
 
         loop = MartLoop(engine, tracker, (destination_schema, "totals"),
                         [(source_schema, "orders")], callback)

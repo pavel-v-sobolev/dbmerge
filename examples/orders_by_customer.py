@@ -6,9 +6,9 @@ The loop assigns operation scopes internally. Tombstones protect against stale r
 
 from datetime import date
 
-from sqlalchemy import DateTime, and_, or_, text, tuple_
+from sqlalchemy import DateTime, and_, text, tuple_
 
-from dbmerge import MartHandler, MergeTracker, dbmerge
+from dbmerge import MartHandler, MergeTracker, LeaseBusy, dbmerge
 
 
 class OrdersByCustomer(MartHandler):
@@ -98,16 +98,16 @@ class OrdersByCustomer(MartHandler):
     def process_changes(self, ctx):
         schema = next(iter(self.sources))[0]
         groups_to_handle = text(self.groups_to_handle_sql(ctx)).bindparams(watermark=ctx.watermark)
-        with dbmerge(ctx.engine, tracker=ctx.tracker, table_name='orders_by_customer', schema=schema,
+        with dbmerge(ctx.engine, tracker=ctx.tracker, lease_handle=ctx.lease_handle,
+                     table_name='orders_by_customer', schema=schema,
                      source_table_name='orders_by_customer_view', source_schema=schema,
                      key=['order_date', 'customer_id'], delete_mode='no',
                      data_types={'merged_on': DateTime(timezone=True),
                                  'inserted_on': DateTime(timezone=True)},
                      merged_on_field='merged_on', inserted_on_field='inserted_on') as merge:
             source_key = tuple_(merge.source_table.c.order_date, merge.source_table.c.customer_id)
-            merge.exec(
-                source_condition=source_key.in_(groups_to_handle),
-                update_condition=ctx.lease_is_mine, insert_condition=ctx.lease_is_mine)
+            if merge.exec(source_condition=source_key.in_(groups_to_handle)) is None:
+                raise LeaseBusy('Changes were not written')
 
     def rebuild(self, ctx):
         schema = next(iter(self.sources))[0]
@@ -117,23 +117,22 @@ class OrdersByCustomer(MartHandler):
                 continue
             ends = date(period.year + 1, 1, 1) if period.month == 12 else date(
                 period.year, period.month + 1, 1)
-            boundary = ctx.tracker.safe_boundary('orders_by_customer', schema=schema)
-            with dbmerge(ctx.engine, tracker=ctx.tracker, table_name='orders_by_customer', schema=schema,
+            with dbmerge(ctx.engine, tracker=ctx.tracker, lease_handle=ctx.lease_handle,
+                         table_name='orders_by_customer', schema=schema,
                          source_table_name='orders_by_customer_view', source_schema=schema,
                          key=['order_date', 'customer_id'], delete_mode='no',
                          data_types={'merged_on': DateTime(timezone=True),
                                      'inserted_on': DateTime(timezone=True)},
-                         merged_on_field='merged_on', inserted_on_field='inserted_on') as merge:
+                         merged_on_field='merged_on', inserted_on_field='inserted_on',
+                         use_safe_border=True) as merge:
                 condition = and_(merge.table.c.order_date >= period,
-                                 merge.table.c.order_date < ends,
-                                 or_(merge.table.c.merged_on.is_(None),
-                                     merge.table.c.merged_on < boundary),
-                                 ctx.lease_is_mine)
-                merge.exec(
+                                 merge.table.c.order_date < ends)
+                result = merge.exec(
                     update_condition=condition,
                     source_condition=and_(merge.source_table.c.order_date >= period,
-                                          merge.source_table.c.order_date < ends),
-                    insert_condition=ctx.lease_is_mine)
+                                          merge.source_table.c.order_date < ends))
+                if result is None:
+                    raise LeaseBusy('Rebuild block was not written')
             yield label
 
 if __name__ == '__main__':

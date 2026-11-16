@@ -64,11 +64,13 @@ remain separate.
 Pass conditions and execution options through `tracker.exec_merge`:
 
 ```python
+from dbmerge import LeaseOptions
+
 with dbmerge(engine, table_name="orders", source_table_name="orders_source",
              source_schema="source", key=["id"], merged_on_field="merged_on") as merge:
     record, result = tracker.exec_merge(
         merge, source_condition=merge.source_table.c["Period"] == period,
-        with_lease=True, wait_lease=True, wait_timeout=300, wait_interval=2,
+        lease_options=LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2),
     )
 ```
 
@@ -86,13 +88,41 @@ from dbmerge import dbmerge, MergeTracker, LeaseOptions
 tracker = MergeTracker(engine)
 with dbmerge(engine, table_name="orders", data=orders_rows, key=["id"],
              tracker=tracker,
-             lease=LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2)) as merge:
+             lease_options=LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2)) as merge:
     result = merge.exec()
     record = merge.tracking_record
 ```
 
-`tracker=` enables journaling; `lease=None` does not acquire a lease.
+`tracker=` enables journaling; `lease_options=None` does not acquire a lease.
 The presence of `LeaseOptions` enables a lease automatically and requires a tracker.
+
+`lease_options=LeaseOptions(scope="full")` and `scope="changes"` separate destination
+leases. Lease scope and journal scope are independent. Use `lease_handle=ctx.lease_handle`
+in mart writes: it explicitly borrows the pass lease, which stays held until progress
+is saved. No lease is implicitly inherited through tracker. A supplied handle is
+never reacquired or released by a borrower; its acquisition token prevents reuse
+following release/reacquisition. Both parameters require tracker and are mutually
+exclusive. A lost/stale handle raises `LeaseLost`; incompatible storage is rejected.
+Marts coordinate by default; `lease_options=None` disables coordination. A borrowed
+pass handle can instead be supplied using `lease_handle=...` (omit lease_options).
+Mart lease scopes are assigned internally (`rebuild`/`changes`); a non-None
+`LeaseOptions.scope` on a mart is rejected rather than silently ignored.
+Standalone busy acquisitions return None (or `(None, None)` for tracker methods).
+Within a mart callback a busy tracked write raises `LeaseBusy`; the pass returns
+False without advancing that unprocessed block or watermark.
+Same-database writes include SQL ownership guards; cross-engine checks are external,
+not distributed transactional fencing.
+
+Tracked merges use the tracker engine's clock for `merged_on_field` and
+`inserted_on_field`, sampled before each write phase. Destination timestamp types
+must preserve compatible precision and timezone semantics.
+
+For stale-rebuild protection, set `use_safe_border=True`, `merged_on_field=...`,
+and `delete_mode='no'` or `'mark'`. dbmerge captures the destination's safe boundary
+before staging, then restricts updates and marks to NULL timestamps or timestamps
+strictly below it. Inserts remain allowed. The boundary considers all operation
+scopes, not only the current lease scope. This does not make source reads consistent,
+protect arbitrarily old preloaded snapshots, or resolve ClickHouse version ties.
 Defaults are `wait_lease=False`, `wait_timeout=None`, `wait_interval=30.0`.
 Timeouts must be finite and non-negative (or None); intervals must be finite and positive.
 A busy lease returns `None` from `merge.exec()` and leaves `tracking_record=None`;
@@ -101,8 +131,8 @@ The tracker remains caller-owned. Neither journaling nor the lease covers constr
 DDL/staging preparation, and data and journal commits are not atomic.
 
 `tracker.exec_merge(merge, ...)` remains supported: bound merges are journaled once,
-conflicting trackers are rejected, omitted lease arguments inherit `LeaseOptions`,
-and explicit arguments override them (`wait_timeout=None` inherits the configured timeout).
+conflicting trackers are rejected. Configure lease_options/lease_handle on the merge
+or adapter, not both; omitted adapter arguments use the merge configuration.
 
 ### Tracking other committed writes
 
@@ -223,8 +253,9 @@ class OrdersByCustomer(MartHandler):
         # ctx.next_watermark are processed now and again in the next window.
         rows = build_rows(since=ctx.watermark)   # your SELECT, e.g. ... WHERE merged_on > :watermark
         with dbmerge(ctx.engine, schema=ctx.destination[0], table_name=ctx.destination[1],
-                     data=rows, key=["customer_id"]) as merge:
-            ctx.tracker.exec_merge(merge)
+                     data=rows, key=["customer_id"], tracker=ctx.tracker,
+                     lease_handle=ctx.lease_handle) as merge:
+            merge.exec()
 
     def rebuild(self, ctx):
         # a full rebuild; by default the same as process_changes with full_rebuild=True
@@ -237,7 +268,11 @@ OrdersByCustomer(engine, tracker=tracker).run_forever(poll_interval=60)
 
 The low-level alternative without a class is `MartLoop(engine, tracker, destination=..., sources=..., process_changes=process_changes)`, where `process_changes` is a plain function. `MartHandler` is a convenience wrapper over it.
 
-Important: for `MartLoop` to see source changes, the source merges must also run through `tracker.exec_merge(...)` — as in the Tracking section.
+Important: for `MartLoop` to see source changes, source merges must also be
+journaled using `dbmerge(..., tracker=tracker).exec()` or the alternative
+`tracker.exec_merge(merge)`. Do not run both on the same merge. For the lease
+defaults and the choice between acquiring and borrowing, see the compact
+[configuration table](DOCUMENTATION.md#optional-merge-tracking-and-leases).
 
 ### What MartLoop does
 
@@ -278,7 +313,7 @@ class MartContext:
     watermark: datetime        # where to read changes from
     next_watermark: datetime   # where to move the watermark on success (not a read cap)
     full_rebuild: bool         # True on the first run / after reset
-    lease_is_mine: Any         # SQL condition "the mart name is still ours"
+    lease_handle: LeaseHandle | None  # borrowed pass acquisition
 ```
 
 ## Reliability tests and CI
@@ -332,7 +367,7 @@ dbmerge_tracking
     owner         String(255) NULL      -- NULL for lease rows ("free")
     table_name    String(255) NOT NULL
     schema        String(255) NULL      -- the schema of the merged table ("" when none)
-    scope         String(255) NULL      -- operation category
+    scope         String(255) NULL      -- operation category; acquisition token on lease rows
     changed_at    DateTime(tz) NULL     -- durable mark on change rows only
     started_at    DateTime(tz) NOT NULL
     finished_at   DateTime(tz) NULL
@@ -356,8 +391,8 @@ dbmerge_marts (per-mart rebuild state, created on first use too)
 | member | what it does |
 |---|---|
 | `MergeTracker(engine, table_name=..., schema=..., ...)` | a long-lived journal; one tracker serves many merges. Optionally `with MergeTracker(engine) as tracker:` stops the heartbeat on exit |
-| `exec(operation, *, destination, scope=None, with_lease=False, wait_lease=False, wait_timeout=None, wait_interval=30.0)` | journals a zero-argument callable; returns `(MergeRecord, original_result)`, or `(None, None)` when a requested lease is busy |
-| `exec_merge(merge, *, scope=None, with_lease=False, wait_lease=False, wait_timeout=None, wait_interval=30.0, **exec_kwargs)` | adapts a merge to `exec`, inferring destination and changes from row counters; preserves the merge result |
+| `exec(operation, *, destination, scope=None, lease_options=None, lease_handle=None)` | journals a zero-argument callable; returns `(MergeRecord, original_result)`, or `(None, None)` when a requested lease is busy |
+| `exec_merge(merge, *, scope=None, lease_options=None, lease_handle=None, **exec_kwargs)` | adapts a merge to `exec`, inferring destination and changes from row counters; preserves the merge result |
 | `safe_boundary(table_names, schema=None)` | the safe upper boundary over these tables (`table_names` is one name or a list) |
 | `last_merge(table_name, schema=None)` | the last finished row of one table, or `None` |
 | `watermark(table_names, schema=None)` | the watermark of the last successful merge over these tables, or `None` (`table_names` is one name or a list) |
@@ -454,10 +489,11 @@ This is a breaking API change:
 - Stop old workers before deployment: the lease key is now derived from destination, not old name.
   Existing watermark and cursor identities remain `(schema, identifier)`.
 
-Every loop creates its own lease by default. A supplied lease remains caller-owned; closing one loop
-releases only its own key and does not stop a shared lease's heartbeat. The handler run methods close their loop, not the supplied tracker. For a ClickHouse
+Every loop creates its own lease by default. A borrowed handle remains caller-owned:
+closing the loop neither releases that acquisition nor stops its heartbeat.
+The handler run methods close their loop, not the supplied tracker. For a ClickHouse
 destination, construct the tracker on PostgreSQL. To supply a lease, use
-`handler.loop(lease=lease)`. Rebuild state is stored through `handler.tracker.engine`.
+`MyMart(engine, tracker=tracker, lease_handle=handle)`. Rebuild state is stored through `handler.tracker.engine`.
 
 ## Debugging examples
 
