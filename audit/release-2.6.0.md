@@ -71,7 +71,7 @@ Commit/push разрешены пользователем для серверн�
 | Файл | SHA-256 |
 |---|---|
 | `dbmerge-2.6.0-py3-none-any.whl` | `af9e7f48d98272674151ce518620e51f028b0bebba0c2caad37ebfb4b9e77866` |
-| `dbmerge-2.6.0.tar.gz` | `a0f4a2687b685ef04c0e2bec7c154bf08e311f5df3bae6e8aadd27c221d51c0c` |
+| `dbmerge-2.6.0.tar.gz` | `b6b28e274d2e24ce7abe42ccaeb86d96064660fd6e312ecb4423593ec93c08d7` |
 
 Версия согласована в pyproject.toml, uv.lock, changelog, README и llms.txt.
 Wheel установлен вне checkout без optional dependencies; проверены metadata
@@ -86,8 +86,13 @@ Wheel установлен вне checkout без optional dependencies; про�
 Исправление: один раз прочитать ключи затронутых групп перед merge; агрегаты
 по-прежнему загружаются серверным SELECT. Live 23.8: **3 passed**,
 `/tmp/dbmerge-260-ch238-fixed.log`. Latest до исправления также проходил;
-повторная проверка последует на исправленном коммите. Старые архивы выше
-предшествуют этому исправлению примера, перед публикацией пересобрать из tag.
+повторная проверка последует на исправленном коммите. Архивы выше пересобраны
+после исправления примера; перед публикацией пересобрать из точного tag.
+
+Также CI обнаружил зависимость SQLite rebuild-теста от оставшейся общей
+`dbmerge_marts`: UUID-журналы не изолируют watermark/cursor. Fixture теперь
+очищает mart-state вместе с бизнес-таблицами. Локальный tracking/marts:
+**168 passed, 1 skipped**, `/tmp/dbmerge-260-sqlite-isolated.log`.
 
 - [x] Заменить примеры, ссылки, импорты, runner и связанные тесты.
 - [x] Проверить свёртку магазинов, разные даты, обновления, удаления и rebuild.

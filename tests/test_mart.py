@@ -358,6 +358,9 @@ def engine(request):
     eng = make_engine(request.param)
     drop_table_if_exists(eng, "orders", schema=_schema(eng))
     drop_table_if_exists(eng, "mart", schema=_schema(eng))
+    # Mart state is shared across trackers, unlike their UUID-named journals.
+    # Do not let an earlier test's watermark/cursor suppress the next rebuild.
+    drop_table_if_exists(eng, "dbmerge_marts", schema=_schema(eng))
     return eng
 
 
