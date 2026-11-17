@@ -601,8 +601,11 @@ PostgreSQL reads orders directly; ClickHouse uses a rows view to normalize the
 external PostgreSQL column types once at the source boundary.
 It stores retained order IDs in a `BIGINT[]` column with a GIN index to find previous
 and current groups after updates, moves and deletions. Both methods merge directly
-from the aggregate view using `source_table_name`; no Python records, external snapshot
-tables, placeholder INSERTs, example-owned connections or advisory locks are needed.
+from the aggregate view using `source_table_name`; no Python aggregate records,
+external snapshot tables, placeholder INSERTs or advisory locks are needed.
+The ClickHouse variant reads affected keys into Python once before the merge:
+inlining that nested query can exhaust the external PostgreSQL connection pool
+on ClickHouse 23.8. Aggregate rows are still loaded directly by ClickHouse.
 Rebuild iterates monthly blocks; changes selects only affected composite keys.
 
 The aggregate view retains tombstones and the merge uses `delete_mode="no"`.

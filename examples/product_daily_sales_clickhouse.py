@@ -16,7 +16,7 @@ A single worker processes changes between rebuild blocks, not in a background th
 
 from datetime import date
 
-from sqlalchemy import and_, text, tuple_
+from sqlalchemy import and_, tuple_
 
 from dbmerge import MartHandler, MergeTracker, DBMerge
 
@@ -79,7 +79,11 @@ class ProductDailySalesClickHouse(MartHandler):
         """
 
     def process_changes(self, ctx):
-        groups = text(self.groups_to_handle_sql(ctx)).bindparams(watermark=ctx.watermark)
+        # Materialize affected keys once: embedding this query in the aggregate
+        # SELECT repeatedly opens PostgreSQL reads and exhausts the 23.8 pool.
+        groups = self.query(ctx, self.groups_to_handle_sql(ctx), watermark=ctx.watermark)
+        if not groups:
+            return
         with DBMerge(ctx.engine, tracker=ctx.tracker, lease_handle=ctx.lease_handle,
                      table_name='product_daily_sales',
                      source_table_name='product_daily_sales_view',
