@@ -7,7 +7,8 @@ machinery and leaves only the calculation to a ``process_changes`` callable:
 * it claims the destination through a lease to coordinate competing processes;
 * it reads its watermark (the boundary of its last successful run) and the safe upper boundary of
   its sources;
-* it runs ``process_changes`` only when the sources really changed since the watermark.
+* without a watermark it initializes the mart, even with an empty change journal;
+* after initialization it runs ``process_changes`` when sources changed since the watermark.
 
 The decision is made from durable last-change timestamps, not from an ephemeral signal.
 A later no-op does not erase an earlier change. ``process_changes`` must be
@@ -39,6 +40,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from .dbmerge import IncorrectParameter, LeaseOptions, logger
 from .lease import Lease, LeaseHandle, LeaseBusy, _mart_lease_options, _DEFAULT_LEASE_OPTIONS
 from .tracking import MergeTracker
+from ._validation import validate_interval
 
 # The first run reads from the beginning of time rather than from a missing watermark.
 EPOCH = datetime(1900, 1, 1, tzinfo=timezone.utc)
@@ -81,9 +83,19 @@ def _ensure_marts_table(engine: Engine, schema_name: str | None) -> Table:
     if schema_name is not None and engine.dialect.name != "sqlite":
         with engine.connect() as conn:
             if not engine.dialect.has_schema(conn, schema_name):
-                conn.execute(schema.CreateSchema(schema_name))
-                conn.commit()
-    table.create(engine, checkfirst=False)
+                try:
+                    conn.execute(schema.CreateSchema(schema_name))
+                    conn.commit()
+                except DBAPIError:
+                    conn.rollback()
+                    if not engine.dialect.has_schema(conn, schema_name):
+                        raise
+    try:
+        table.create(engine, checkfirst=False)
+    except DBAPIError:
+        if not inspect(engine).has_table(table.name, table.schema):
+            raise
+        return _ensure_marts_table(engine, schema_name)
     return table
 
 
@@ -142,7 +154,7 @@ class MartContext:
 
 
 class MartLoop:
-    """Polls the tracking table and runs a handler when a mart's sources changed."""
+    """Register a mart, initialize it, then refresh it when its sources change."""
 
     def __init__(self, engine: Engine, tracker: MergeTracker, destination: str | tuple[str | None, str],
                  sources: Iterable[str], process_changes: Callable[[MartContext], None],
@@ -154,8 +166,8 @@ class MartLoop:
                  lease_handle: LeaseHandle | None = None):
         if not isinstance(engine, Engine):
             raise IncorrectParameter("MartLoop requires a SQLAlchemy Engine")
-        if poll_interval <= 0 or min_interval < 0:
-            raise IncorrectParameter("poll_interval must be positive and min_interval non-negative")
+        validate_interval('poll_interval', poll_interval)
+        validate_interval('min_interval', min_interval, allow_zero=True)
         lease_options = _mart_lease_options(lease_options, lease_handle, tracker)
         self.lease_options = lease_options
         self.lease_handle = lease_handle
@@ -191,17 +203,24 @@ class MartLoop:
             period=tracker.heartbeat_period, ttl=tracker.heartbeat_ttl,
             heartbeat_engine=tracker.heartbeat_engine)) if self._owns_lease else (
                 lease_handle._lease if lease_handle is not None else None)
-        if self._owns_lease:
-            self._lease.ensure(self.name)
-            self._lease.ensure(self._lease_prefix + ":changes")
-
         self._stop_signal = threading.Event()
         if _stop_requested.is_set():
             self._stop_signal.set()
-        _all_loops.add(self)
         self._setup_done = False
         self._next_allowed = 0.0
         self._marts_table: Table | None = None
+        try:
+            # Registration preserves durable progress and requests; it never
+            # invokes user code or assumes a physical destination table exists.
+            self._ensure_marts_row()
+            if self._owns_lease:
+                self._lease.ensure(self.name)
+                self._lease.ensure(self._lease_prefix + ":changes")
+        except Exception:
+            if self._owns_lease:
+                self._lease.close()
+            raise
+        _all_loops.add(self)
 
     def run_forever(self) -> None:
         """Blocking poll loop. Stops on request_stop() and then releases the lease."""
@@ -265,8 +284,8 @@ class MartLoop:
         watermark = stored_watermark if stored_watermark is not None else EPOCH
 
         next_watermark = self._safe_boundary()
-        if not explicit_rebuild:
-            if not full_rebuild and next_watermark <= watermark:
+        if not full_rebuild:
+            if next_watermark <= watermark:
                 # A merge that started before our watermark is still running: nothing is settled yet.
                 return False
             if not self._sources_changed(watermark):

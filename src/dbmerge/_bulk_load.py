@@ -20,7 +20,7 @@ import time
 from .dbmerge import logger
 
 if TYPE_CHECKING:
-    from .dbmerge import dbmerge
+    from .dbmerge import DBMerge
 
 
 # The PostgreSQL drivers that take COPY ... FROM STDIN, each in its own way (see _copy).
@@ -31,7 +31,7 @@ COPY_DRIVERS = ('psycopg2', 'psycopg', 'pg8000')
 MSSQL_PYTHON_CHUNK_SIZE = 100_000
 
 
-def loader_for(merge: dbmerge):
+def loader_for(merge: DBMerge):
     """The bulk loader for the engine and the driver of this merge, or None to load row by row."""
     if merge.dialect_name == 'duckdb':
         if _has_pyarrow():
@@ -79,7 +79,7 @@ def _has_pyarrow():
     return importlib.util.find_spec('pyarrow') is not None
 
 
-def _duckdb_from_arrow(merge: dbmerge):
+def _duckdb_from_arrow(merge: DBMerge):
     # DuckDB reads an Arrow table registered on its connection where it lies, without copying it, so each
     # chunk goes into the staging table with a single INSERT ... SELECT.
     from ._chunks import arrow_table
@@ -112,7 +112,7 @@ def _duckdb_from_arrow(merge: dbmerge):
     merge.temp_insert_time = time.perf_counter() - start_time
 
 
-def _postgres_copy(merge: dbmerge):
+def _postgres_copy(merge: DBMerge):
     # COPY ... FROM STDIN through the connection the merge already holds, so the staging table - a TEMPORARY
     # one, seen only by its own session - is there, and the load belongs to the same transaction.
     from sqlalchemy import DateTime, Integer, LargeBinary
@@ -182,14 +182,14 @@ def _postgres_copy(merge: dbmerge):
     merge.temp_insert_time = time.perf_counter() - start_time
 
 
-def _copy_takes_columns(merge: dbmerge):
+def _copy_takes_columns(merge: DBMerge):
     # Types whose text form for COPY the CSV here does not produce: arrays and intervals keep the row by
     # row INSERT.
     from sqlalchemy import ARRAY, Interval
     return not any(isinstance(merge.temp_table.c[f].type, (ARRAY, Interval)) for f in merge.data_fields)
 
 
-def _csv_by_arrow(merge: dbmerge, begin, end, processors, wall_clock):
+def _csv_by_arrow(merge: DBMerge, begin, end, processors, wall_clock):
     import pyarrow.csv as pacsv
     from ._chunks import arrow_table
     buffer = io.BytesIO()
@@ -200,7 +200,7 @@ def _csv_by_arrow(merge: dbmerge, begin, end, processors, wall_clock):
     return buffer.getvalue()
 
 
-def _csv_by_csv_module(merge: dbmerge, begin, end, processors, wall_clock):
+def _csv_by_csv_module(merge: DBMerge, begin, end, processors, wall_clock):
     import csv
     from ._chunks import python_columns
     columns = python_columns(merge, begin, end, processors=processors, wall_clock=wall_clock)
@@ -210,7 +210,7 @@ def _csv_by_csv_module(merge: dbmerge, begin, end, processors, wall_clock):
     return buffer.getvalue().encode()
 
 
-def _copy(merge: dbmerge, sql, data):
+def _copy(merge: DBMerge, sql, data):
     from sqlalchemy.exc import DBAPIError
     dialect = merge.conn.dialect
     driver = dialect.driver
@@ -231,7 +231,7 @@ def _copy(merge: dbmerge, sql, data):
         cursor.close()
 
 
-def _json_processors(merge: dbmerge):
+def _json_processors(merge: DBMerge):
     # A JSON column gets its values through its own bind processor, as the row by row INSERT does: the
     # serializer of the engine, and None as the JSON literal null unless the type says none_as_null.
     from sqlalchemy import JSON
@@ -261,7 +261,7 @@ def _json_processors(merge: dbmerge):
     return processors
 
 
-def _mssql_python_bulkcopy(merge: dbmerge):
+def _mssql_python_bulkcopy(merge: DBMerge):
     # The bulk copy of TDS (what SqlBulkCopy is in .NET): with pyarrow, the Arrow buffers go into the TDS
     # packets directly, without a Python object per value; without it, the rows go as tuples. mssql-python
     # runs it on a connection of its own, opened from the connection string - the staging table, a regular
@@ -309,7 +309,7 @@ def _mssql_python_bulkcopy(merge: dbmerge):
     merge.temp_insert_time = time.perf_counter() - start_time
 
 
-def _datetimeoffset_columns(merge: dbmerge):
+def _datetimeoffset_columns(merge: DBMerge):
     from sqlalchemy import DateTime
     from sqlalchemy.dialects.mssql import DATETIMEOFFSET
     return [f for f in merge.data_fields
@@ -317,7 +317,7 @@ def _datetimeoffset_columns(merge: dbmerge):
             or (isinstance(merge.temp_table.c[f].type, DateTime) and merge.temp_table.c[f].type.timezone)]
 
 
-def _has_non_utc_offsets(merge: dbmerge, begin, end, fields):
+def _has_non_utc_offsets(merge: DBMerge, begin, end, fields):
     from datetime import timedelta
     from ._chunks import column_values
     for f in fields:
@@ -328,7 +328,7 @@ def _has_non_utc_offsets(merge: dbmerge, begin, end, fields):
     return False
 
 
-def _pyodbc_fast_executemany(merge: dbmerge):
+def _pyodbc_fast_executemany(merge: DBMerge):
     # fast_executemany: pyodbc sends a whole chunk as one array of parameters instead of a round trip per
     # row. A chunk that fails goes row by row. The server may have taken the rows before the failing one by
     # then, so every chunk runs in a savepoint and is rolled back to it first: otherwise the row by row
@@ -370,7 +370,7 @@ def _pyodbc_fast_executemany(merge: dbmerge):
     merge.temp_insert_time = time.perf_counter() - start_time
 
 
-def _oracle_executemany(merge: dbmerge):
+def _oracle_executemany(merge: DBMerge):
     # python-oracledb's array DML: a whole chunk goes in one round trip, not one per row. SQLAlchemy's own
     # executemany for Oracle calls the same cursor.executemany, but wraps it in compile, setinputsizes and
     # parameter-processing work on every call, which roughly doubles the load time. Driving the cursor

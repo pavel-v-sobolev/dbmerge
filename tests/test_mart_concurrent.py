@@ -17,21 +17,82 @@ from dbmerge import MergeTracker, request_rebuild, reset_stop
 from conftest import engines, make_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from examples.orders_by_customer import OrdersByCustomer
+from examples.product_daily_sales import ProductDailySales
 
 DAY = date(2026, 1, 15)
 
 
 def test_sql_mart_has_no_public_scope(postgres_engine):
     with MergeTracker(postgres_engine) as tracker:
-        handler = OrdersByCustomer(postgres_engine, tracker=tracker)
+        handler = ProductDailySales(postgres_engine, tracker=tracker)
         assert not hasattr(handler, 'scope')
-        assert handler.destination == OrdersByCustomer.destination
+        assert handler.destination == ProductDailySales.destination
 
 
 @pytest.fixture(params=[name for name in engines if name.startswith('postgres')])
 def postgres_engine(request):
     return make_engine(request.param)
+
+
+def test_two_processes_register_and_initialize_without_change_signal(postgres_engine):
+    """Live DDL/row races and the first-pass lease, not a mocked inspector."""
+    import subprocess
+    import tempfile
+
+    schema = 'startup_' + uuid.uuid4().hex[:12]
+    script = r'''
+import sys, time
+from pathlib import Path
+from sqlalchemy import create_engine, text
+from dbmerge import MergeTracker, MartLoop
+engine = create_engine(sys.argv[1])
+schema, directory, worker = sys.argv[2:]
+directory = Path(directory)
+(directory / ('ready-' + worker)).touch()
+deadline = time.monotonic() + 20
+while len(list(directory.glob('ready-*'))) != 2:
+    if time.monotonic() > deadline:
+        raise RuntimeError('startup barrier timed out')
+    time.sleep(.01)
+with MergeTracker(engine, schema=schema, heartbeat_ttl=30) as tracker:
+    def process(ctx):
+        with engine.begin() as conn:
+            conn.execute(text('INSERT INTO "' + schema + '".calls DEFAULT VALUES'))
+        time.sleep(.3)
+    loop = MartLoop(engine, tracker, ('business', 'logical_mart'), ['untracked_source'], process)
+    try:
+        print('ran=' + str(loop.run_if_pending()), flush=True)
+    finally:
+        loop.close()
+engine.dispose()
+'''
+    with postgres_engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+        conn.execute(text(f'CREATE TABLE "{schema}".calls (id integer GENERATED ALWAYS AS IDENTITY)'))
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            processes = [subprocess.Popen(
+                [sys.executable, '-c', script, postgres_engine.url.render_as_string(hide_password=False),
+                 schema, directory, str(worker)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for worker in range(2)]
+            try:
+                results = [process.communicate(timeout=45) for process in processes]
+                for process, (stdout, stderr) in zip(processes, results):
+                    assert process.returncode == 0, stderr
+                assert sum('ran=True' in stdout for stdout, _ in results) == 1
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate()
+        with postgres_engine.connect() as conn:
+            assert conn.scalar(text(f'SELECT count(*) FROM "{schema}".calls')) == 1
+            assert conn.scalar(text(f'SELECT count(*) FROM "{schema}".dbmerge_marts')) == 1
+        with MergeTracker(postgres_engine, schema=schema) as tracker:
+            assert tracker.watermark('logical_mart', schema='business') is not None
+    finally:
+        with postgres_engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
 
 
 @pytest.fixture
@@ -42,18 +103,19 @@ def concurrent(request, postgres_engine):
     with engine.begin() as conn:
         conn.execute(text(f'CREATE SCHEMA "{schema}"'))
     tracker = MergeTracker(engine, schema=schema)
-    orders = Table('orders', MetaData(), Column('id', Integer, primary_key=True),
-                   Column('order_date', Date, nullable=False),
-                   Column('customer_id', Integer, nullable=False), Column('amount', Numeric),
+    orders = Table('orders', MetaData(), Column('Order', BIGINT, primary_key=True),
+                   Column('Date', Date, nullable=False),
+                   Column('Product', Integer, nullable=False), Column('Amount', Numeric),
+                   Column('Shop', Integer, nullable=False, default=1),
                     Column('is_deleted', Boolean, nullable=False, default=False),
                     Column('merged_on', DateTime(timezone=True), nullable=False,
                            server_default=func.clock_timestamp(), onupdate=func.clock_timestamp()),
                     schema=schema)
     orders.create(engine)
-    changes = OrdersByCustomer(engine, tracker=tracker, sources=[(schema, 'orders')],
-                               destination=(schema, 'orders_by_customer_changes'))
-    full = OrdersByCustomer(engine, tracker=tracker, sources=[(schema, 'orders')],
-                            destination=(schema, 'orders_by_customer_rebuild'))
+    changes = ProductDailySales(engine, tracker=tracker, sources=[(schema, 'orders')],
+                               destination=(schema, 'product_daily_sales_changes'))
+    full = ProductDailySales(engine, tracker=tracker, sources=[(schema, 'orders')],
+                            destination=(schema, 'product_daily_sales_rebuild'))
     change_loop, full_loop = changes.loop(), full.loop()
 
     def write(statement, scope='changes'):
@@ -74,22 +136,61 @@ def concurrent(request, postgres_engine):
 
 
 def totals(handler):
-    if isinstance(handler, OrdersByCustomer):
+    if isinstance(handler, ProductDailySales):
         schema = handler.engine.dialect.identifier_preparer.quote_identifier(next(iter(handler.sources))[0])
         with handler.engine.connect() as conn:
-            return {(row.order_date, row.customer_id): (row.total_amount, row.is_deleted)
-                    for row in conn.execute(text(f'SELECT * FROM {schema}.orders_by_customer'))}
+            return {(row.Date, row.Product): (row.Amount, row.is_deleted)
+                    for row in conn.execute(text(f'SELECT * FROM {schema}.product_daily_sales'))}
     with handler.engine.connect() as conn:
-        return {(row.order_date, row.customer_id): (row.total_amount, row.is_deleted)
+        return {(row.Date, row.Product): (row.Amount, row.is_deleted)
                 for row in conn.execute(select(handler.table))}
+
+
+def test_shop_only_change_does_not_rewrite_aggregate(concurrent):
+    orders, changes, _, loop, _, _, write = concurrent
+    write(insert(orders).values(Order=1, Date=DAY, Product=10, Shop=1, Amount=100))
+    assert loop.run_if_pending()
+    schema = next(iter(changes.sources))[0]
+
+    def stamp():
+        with changes.engine.connect() as conn:
+            return conn.scalar(text(f'SELECT merged_on FROM "{schema}".product_daily_sales'))
+
+    before = stamp()
+    write(update(orders).where(orders.c.Order == 1).values(Shop=2))
+    assert loop.run_if_pending()
+    assert stamp() == before
+    assert totals(changes) == {(DAY, 10): (100, False)}
+    assert 'write_token' not in {column['name'] for column in inspect(changes.engine).get_columns(
+        'product_daily_sales', schema=schema)}
+
+
+def test_product_daily_sales_collapses_shops_and_keeps_dates(concurrent):
+    orders, changes, _, loop, _, _, write = concurrent
+    tomorrow = date(2026, 1, 16)
+    write(insert(orders).values([
+        dict(Order=1, Date=DAY, Product=10, Shop=1, Amount=100),
+        dict(Order=2, Date=DAY, Product=10, Shop=2, Amount=50),
+        dict(Order=3, Date=DAY, Product=20, Shop=1, Amount=30),
+        dict(Order=4, Date=tomorrow, Product=10, Shop=1, Amount=70),
+    ]))
+    assert loop.run_if_pending()
+    assert totals(changes) == {(DAY, 10): (150, False), (DAY, 20): (30, False),
+                               (tomorrow, 10): (70, False)}
+    write(update(orders).where(orders.c.Order == 2).values(Amount=80, Shop=3))
+    assert loop.run_if_pending()
+    assert totals(changes)[DAY, 10] == (180, False)
+    write(delete(orders).where(orders.c.Order == 1))
+    assert loop.run_if_pending()
+    assert totals(changes)[DAY, 10] == (80, False)
 
 
 @pytest.mark.parametrize('action', ['update', 'delete', 'soft_delete', 'move', 'date_move', 'insert'])
 def test_changes_finish_before_full_and_stale_snapshot_is_skipped(concurrent, action):
     orders, changes, full, change_loop, full_loop, tracker, write = concurrent
-    if isinstance(full, OrdersByCustomer):
+    if isinstance(full, ProductDailySales):
         pytest.skip('Direct-view SQL merge has no external snapshot to pause')
-    write(insert(orders).values(id=1, order_date=DAY, customer_id=1, amount=10), 'full_load')
+    write(insert(orders).values(Order=1, Date=DAY, Product=1, Amount=10), 'full_load')
     assert not change_loop.run_if_pending()
     read, release = Event(), Event()
     original = full._read_month
@@ -107,7 +208,7 @@ def test_changes_finish_before_full_and_stale_snapshot_is_skipped(concurrent, ac
                 assert read.wait(15)
                 expected = {(DAY, 1): (10, False)}
                 if action == 'update':
-                    write(update(orders).values(amount=25))
+                    write(update(orders).values(Amount=25))
                     expected[(DAY, 1)] = (25, False)
                 elif action in ('delete', 'soft_delete'):
                     write(delete(orders) if action == 'delete' else
@@ -115,10 +216,10 @@ def test_changes_finish_before_full_and_stale_snapshot_is_skipped(concurrent, ac
                     expected[(DAY, 1)] = (0, True)
                 elif action in ('move', 'date_move'):
                     day, customer = (DAY, 2) if action == 'move' else (date(2026, 2, 15), 1)
-                    write(update(orders).values(order_date=day, customer_id=customer))
+                    write(update(orders).values(Date=day, Product=customer))
                     expected = {(DAY, 1): (0, True), (day, customer): (10, False)}
                 else:
-                    write(insert(orders).values(id=2, order_date=DAY, customer_id=2, amount=7))
+                    write(insert(orders).values(Order=2, Date=DAY, Product=2, Amount=7))
                     expected[(DAY, 2)] = (7, False)
                 assert change_loop.run_if_pending()
                 assert totals(changes) == expected
@@ -131,12 +232,12 @@ def test_changes_finish_before_full_and_stale_snapshot_is_skipped(concurrent, ac
 def test_full_resumes_months_and_preserves_changes_progress(concurrent):
     orders, changes, full, change_loop, full_loop, tracker, write = concurrent
     write(insert(orders).values([
-        dict(id=1, order_date=DAY, customer_id=1, amount=10),
-        dict(id=2, order_date=date(2026, 2, 1), customer_id=1, amount=20)]))
+        dict(Order=1, Date=DAY, Product=1, Amount=10),
+        dict(Order=2, Date=date(2026, 2, 1), Product=1, Amount=20)]))
     assert change_loop.run_if_pending()
     before = tracker.watermark(changes.destination[1], schema=changes.destination[0])
     request_rebuild(full.engine, full.destination, schema=tracker.schema)
-    if isinstance(full, OrdersByCustomer):
+    if isinstance(full, ProductDailySales):
         original = full.query
 
         def fail_second(*args, **kwargs):
@@ -168,15 +269,15 @@ def test_equal_total_renews_protection_against_intermediate_full(concurrent):
     from types import SimpleNamespace
 
     orders, changes, full, change_loop, _, tracker, write = concurrent
-    if isinstance(full, OrdersByCustomer):
+    if isinstance(full, ProductDailySales):
         pytest.skip('SQL full reads the current view directly, not an intermediate external snapshot')
-    write(insert(orders).values(id=1, order_date=DAY, customer_id=1, amount=10))
+    write(insert(orders).values(Order=1, Date=DAY, Product=1, Amount=10))
     assert change_loop.run_if_pending()
-    write(update(orders).values(amount=50), 'full_load')
+    write(update(orders).values(Amount=50), 'full_load')
     ctx = SimpleNamespace(engine=full.engine, tracker=tracker, lease_handle=None)
     full.setup(ctx)
     rows, boundary = full._read_month(ctx, date(2026, 1, 1), date(2026, 2, 1))
-    write(update(orders).values(amount=10))
+    write(update(orders).values(Amount=10))
     assert change_loop.run_if_pending()
     with full.engine.begin() as conn:
         full._lock(conn)
@@ -186,16 +287,16 @@ def test_equal_total_renews_protection_against_intermediate_full(concurrent):
 
 def test_sql_variant_writes_through_dbmerge_with_full_guard(concurrent):
     orders, changes, full, change_loop, full_loop, tracker, write = concurrent
-    if not isinstance(full, OrdersByCustomer):
+    if not isinstance(full, ProductDailySales):
         pytest.skip('SQL-specific conditions contract')
-    write(insert(orders).values(id=1, order_date=DAY, customer_id=1, amount=10), 'full_load')
+    write(insert(orders).values(Order=1, Date=DAY, Product=1, Amount=10), 'full_load')
     with patch.object(tracker, 'exec_merge', wraps=tracker.exec_merge) as execute:
         assert full_loop.run_if_pending()
         assert execute.call_count == 1
         merge = execute.call_args.args[0]
         kwargs = execute.call_args.kwargs
         assert merge.delete_mode == 'no'
-        assert merge.source_table_name == 'orders_by_customer_view'
+        assert merge.source_table_name == 'product_daily_sales_view'
         assert kwargs['source_condition'] is not None
         assert merge.merged_on_field == 'merged_on'
         assert merge.inserted_on_field == 'inserted_on'
@@ -206,7 +307,7 @@ def test_sql_variant_writes_through_dbmerge_with_full_guard(concurrent):
         assert kwargs['insert_condition'] is None
         assert 'EXISTS' in str(merge.insert_condition)
         assert not hasattr(tracker, "_write_leases")
-    write(update(orders).values(amount=20))
+    write(update(orders).values(Amount=20))
     # Initialize this consumer's watermark before testing its incremental path.
     tracker.mark_watermark(changes.destination[1], full_loop.tracker.watermark(
         full.destination[1], schema=full.destination[0]), schema=changes.destination[0])
@@ -224,21 +325,21 @@ def test_sql_variant_writes_through_dbmerge_with_full_guard(concurrent):
 
 def test_sql_changes_do_not_touch_unrelated_groups(concurrent):
     orders, changes, full, change_loop, _, _, write = concurrent
-    if not isinstance(changes, OrdersByCustomer):
+    if not isinstance(changes, ProductDailySales):
         pytest.skip('SQL-specific changed-group selection')
     write(insert(orders).values([
-        dict(id=1, order_date=DAY, customer_id=1, amount=10),
-        dict(id=2, order_date=DAY, customer_id=2, amount=20)]))
+        dict(Order=1, Date=DAY, Product=1, Amount=10),
+        dict(Order=2, Date=DAY, Product=2, Amount=20)]))
     assert change_loop.run_if_pending()
 
     def timestamps():
         schema = changes.engine.dialect.identifier_preparer.quote_identifier(next(iter(changes.sources))[0])
         with changes.engine.connect() as conn:
             return dict(conn.execute(text(
-                f'SELECT customer_id, merged_on FROM {schema}.orders_by_customer')).all())
+                f'SELECT "Product", merged_on FROM {schema}.product_daily_sales')).all())
 
     before = timestamps()
-    write(update(orders).where(orders.c.id == 1).values(amount=15))
+    write(update(orders).where(orders.c.Order == 1).values(Amount=15))
     assert change_loop.run_if_pending()
     after = timestamps()
     assert after[1] > before[1]
@@ -248,17 +349,17 @@ def test_sql_changes_do_not_touch_unrelated_groups(concurrent):
 
 def test_sql_order_ids_are_indexed_arrays(concurrent):
     orders, changes, _, change_loop, _, _, write = concurrent
-    if not isinstance(changes, OrdersByCustomer):
+    if not isinstance(changes, ProductDailySales):
         pytest.skip('SQL-specific array contract')
-    write(insert(orders).values(id=1, order_date=DAY, customer_id=1, amount=10))
+    write(insert(orders).values(Order=1, Date=DAY, Product=1, Amount=10))
     assert change_loop.run_if_pending()
     schema = next(iter(changes.sources))[0]
     inspector = inspect(changes.engine)
     columns = {column['name']: column['type'] for column in inspector.get_columns(
-        'orders_by_customer', schema=schema)}
+        'product_daily_sales', schema=schema)}
     assert isinstance(columns['order_ids'], ARRAY)
     assert isinstance(columns['order_ids'].item_type, BIGINT)
-    indexes = inspector.get_indexes('orders_by_customer', schema=schema)
+    indexes = inspector.get_indexes('product_daily_sales', schema=schema)
     assert any(index['column_names'] == ['order_ids']
                and index['dialect_options'].get('postgresql_using') == 'gin'
                for index in indexes)
@@ -267,22 +368,22 @@ def test_sql_order_ids_are_indexed_arrays(concurrent):
 @pytest.mark.parametrize('action', ['update', 'delete', 'soft_delete', 'move', 'date_move', 'insert'])
 def test_sql_direct_view_rebuild_preserves_applied_changes(concurrent, action):
     orders, changes, full, change_loop, full_loop, tracker, write = concurrent
-    if not isinstance(full, OrdersByCustomer):
+    if not isinstance(full, ProductDailySales):
         pytest.skip('SQL-specific direct-view rebuild')
-    write(insert(orders).values(id=1, order_date=DAY, customer_id=1, amount=10))
+    write(insert(orders).values(Order=1, Date=DAY, Product=1, Amount=10))
     assert change_loop.run_if_pending()
     if action == 'update':
-        statement = update(orders).values(amount=25)
+        statement = update(orders).values(Amount=25)
     elif action == 'delete':
         statement = delete(orders)
     elif action == 'soft_delete':
         statement = update(orders).values(is_deleted=True)
     elif action == 'move':
-        statement = update(orders).values(customer_id=2)
+        statement = update(orders).values(Product=2)
     elif action == 'date_move':
-        statement = update(orders).values(order_date=date(2026, 2, 15))
+        statement = update(orders).values(Date=date(2026, 2, 15))
     else:
-        statement = insert(orders).values(id=2, order_date=DAY, customer_id=2, amount=7)
+        statement = insert(orders).values(Order=2, Date=DAY, Product=2, Amount=7)
     write(statement)
     assert change_loop.run_if_pending()
     expected = totals(changes)

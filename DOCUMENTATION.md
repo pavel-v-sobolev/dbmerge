@@ -1,10 +1,14 @@
 # DBMerge API Documentation
 
-The `dbmerge` module provides a simple, robust interface for merging data into SQL database tables. The core functionality is encapsulated within the `dbmerge` class, which is designed to be used as a context manager to ensure safe resource handling and connection closure.
+The `dbmerge` module provides a simple, robust interface for merging data into SQL database tables. The core functionality is encapsulated within the `DBMerge` class, which is designed to be used as a context manager to ensure safe resource handling and connection closure.
 
 ---
 
-## Class: `dbmerge`
+## Class: `DBMerge`
+
+`DBMerge` is the canonical class name. The legacy `dbmerge` import remains an alias
+of the same class, from both `dbmerge` and `dbmerge.dbmerge`; existing code needs
+no changes.
 
 ### Initialization: `__init__`
 
@@ -17,14 +21,18 @@ The initialization method prepares the database and internal structures before t
 
 **Recommended Usage (Context Manager):**
 ```python
-from dbmerge import dbmerge
+from dbmerge import DBMerge
 
-with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
+with DBMerge(engine=engine, data=data, table_name="YourTable") as merge:
     result = merge.exec()
 ```
 
 #### Arguments
 
+- **`tracker`** *(MergeTracker | None, optional)*: Caller-owned journal. `None` disables tracking. Construct and close it with a context manager; see [tracking and leases](#optional-merge-tracking-and-leases).
+- **`lease_options`** *(LeaseOptions | None, optional)*: Enable an execution lease; requires `tracker`. A busy lease or acquisition timeout raises `LeaseBusy` from `exec()`. Constructor DDL is outside this lease.
+- **`lease_handle`** *(LeaseHandle | None, optional)*: Borrow an existing acquisition, usually `ctx.lease_handle` in a mart callback. Requires `tracker`; do not also supply `lease_options`.
+- **`use_safe_border`** *(bool, optional)*: Default `False`. Protect target rows at/after the destination's safe boundary from updates and marks. Requires `tracker`, a timestamp `merged_on_field`, and `delete_mode='no'` or `'mark'`; missing keys can still be inserted. See [tracking and marts](TRACKING_AND_MARTS.md).
 - **`engine`** *(sqlalchemy.engine.Engine | clickhouse_connect client)*: The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, MS SQL, CockroachDB, DuckDB, ClickHouse and Oracle — [COMPATIBILITY.md](COMPATIBILITY.md) lists the drivers and versions. For ClickHouse it may also be a clickhouse-connect client — see [ClickHouse](#clickhouse). Oracle support has limitations — see [ORACLE.md](ORACLE.md).
 - **`table_name`** *(str)*: The name of the target table where data will be merged.
 - **`data`** *(list[dict] | dict[str, list] | pd.DataFrame | pl.DataFrame | None, optional)*: The source data to merge. Accepts a list of dictionaries (e.g., `[{'col1': 'val1'}, ...]`), a dict of lists (e.g., `{'col1': ['val1', ...], ...}`) or a Pandas/Polars DataFrame. For a list of dictionaries, every row must have the same keys as the first one, and a DataFrame must not have two columns of one name: otherwise the values of a column would be lost, so either raises `IncorrectDataError`. A column the target computes itself (`GENERATED ALWAYS AS …`) can not be written, and raises `IncorrectParameter` when it comes in `data` (on DuckDB the database refuses it itself).
@@ -103,7 +111,7 @@ If you load data in chunks (e.g., monthly snapshots), you can restrict the delet
 ```python
 from datetime import date
 
-with dbmerge(data=data, engine=engine, table_name="YourTable", delete_mode='delete') as merge:
+with DBMerge(data=data, engine=engine, table_name="YourTable", delete_mode='delete') as merge:
     # Restrict deletion scope to January 2025
     condition = merge.table.c['Date'].between(date(2025, 1, 1), date(2025, 1, 31))
     result = merge.exec(delete_condition=condition)
@@ -113,7 +121,7 @@ with dbmerge(data=data, engine=engine, table_name="YourTable", delete_mode='dele
 By default the update phase overwrites a target row whenever any field differs from the source. Pass an `update_condition` to restrict which rows may be overwritten. For example, keep rows a user has marked as protected and refresh everything else:
 
 ```python
-with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
+with DBMerge(data=data, engine=engine, table_name="YourTable") as merge:
     # Never overwrite rows flagged as protected in the target table.
     result = merge.exec(update_condition=merge.table.c['is_protected'] == False)
 ```
@@ -124,7 +132,7 @@ Rows that fail the condition are simply filtered out of the set of rows to updat
 By default the insert phase adds every source row that is missing from the target. Pass an `insert_condition` to restrict which of those rows are inserted:
 
 ```python
-with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
+with DBMerge(data=data, engine=engine, table_name="YourTable") as merge:
     # Insert only rows with a positive amount.
     result = merge.exec(insert_condition=merge.temp_table.c['amount'] > 0)
 ```
@@ -134,7 +142,7 @@ Build the condition on `merge.temp_table` (the row being inserted). Do **not** r
 ```python
 from sqlalchemy import exists
 
-with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
+with DBMerge(data=data, engine=engine, table_name="YourTable") as merge:
     # Skip inserting into a category that already has a locked row.
     g = merge.table.alias()
     guard = ~exists().where((g.c['category'] == merge.temp_table.c['category']) & (g.c['locked'] == True))
@@ -144,6 +152,12 @@ with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
 #### Arguments
 - **`delete_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used in the `WHERE` clause during the delete/mark phase. Essential for chunked or partitioned data syncs.
 - **`source_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used to filter the `SELECT` statement when loading data from a `source_table_name`.
+  Build it on `merge.source_table`, not `merge.table` (the destination). A disconnected
+  outer `FROM`, such as a destination-only filter that silently creates a cross join,
+  raises `IncorrectParameter` before staging INSERT or destination DML. Linked JOINs,
+  aliases and nested `IN`/`EXISTS` queries remain supported. Use `delete_condition`
+  with `merge.table` to limit destination deletions. Staging DDL may already have
+  occurred in the constructor. This validation is not a guarantee of correct filter semantics.
 - **`update_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression added to the `WHERE` clause of the update phase. A target row is updated only when it differs from the source **and** satisfies this condition. Build it on `merge.table` (target) and `merge.temp_table` (staging).
 - **`insert_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression added to the `WHERE` clause of the insert phase. A source row missing from the target is inserted only when it also satisfies this condition. Build it on `merge.temp_table` (the row being inserted); to inspect other target rows use a correlated `EXISTS` over `merge.table.alias()`.
 - **`commit_all_steps`** *(bool, optional)*: Defaults to `True`. If `True`, every step (temp insert, target insert, update, delete) is committed immediately. If `False`, a single commit is issued after all steps complete successfully. Must be a real boolean — a string such as `'false'` is rejected rather than silently treated as truthy.
@@ -176,7 +190,7 @@ Fields of the returned `mergeResult` (and matching instance attributes):
 They exist for consumers that maintain a derived dataset incrementally from a `merged_on_field` watermark. Such a consumer can not notice a new column on its own: the watermark only moves on rows whose **values** changed, and adding a column changes no values — every row already in the table keeps its old timestamp and stays outside the increment. `added_fields` is that missing signal, and is typically used to flag the derived dataset for a full recalculation:
 
 ```python
-with dbmerge(engine=engine, data=data, table_name="Facts", merged_on_field='merged_on') as merge:
+with DBMerge(engine=engine, data=data, table_name="Facts", merged_on_field='merged_on') as merge:
     result = merge.exec()
 
 if result.added_fields:
@@ -252,7 +266,7 @@ You can change it by giving the column a timezone-aware type instead — either 
 ```python
 from sqlalchemy import DateTime
 
-with dbmerge(engine=engine, data=data, table_name="Facts", key=['id'],
+with DBMerge(engine=engine, data=data, table_name="Facts", key=['id'],
              merged_on_field='Merged On',
              data_types={'Merged On': DateTime(timezone=True)}) as merge:
     result = merge.exec()
@@ -289,12 +303,12 @@ ClickHouse has no `UPDATE` suited to merging and no transactions, so DBMerge mer
 ```python
 import clickhouse_connect
 from sqlalchemy import create_engine
-from dbmerge import dbmerge
+from dbmerge import DBMerge
 
 engine = create_engine("clickhousedb://default:@localhost:8123/default")   # a SQLAlchemy engine,
 engine = clickhouse_connect.get_client(host="localhost")                     # or a clickhouse-connect client
 
-with dbmerge(engine=engine, data=data, table_name="Facts", key=['Shop', 'Product', 'Date']) as merge:
+with DBMerge(engine=engine, data=data, table_name="Facts", key=['Shop', 'Product', 'Date']) as merge:
     result = merge.exec()
 ```
 
@@ -351,7 +365,7 @@ DBMerge itself needs nothing beyond ClickHouse 23.8: its own statements use only
 ```python
 from sqlalchemy import select
 
-with dbmerge(data=data, engine=engine, table_name="YourTable") as merge:
+with DBMerge(data=data, engine=engine, table_name="YourTable") as merge:
     # The guard above, without a correlated subquery: ClickHouse 23.8 runs it.
     locked = select(merge.table.c['category']).where(merge.table.c['locked'] == True)
     result = merge.exec(insert_condition=merge.temp_table.c['category'].not_in(locked))
@@ -390,7 +404,7 @@ A regular staging table can be left over by a process killed mid-merge; its name
 # Once, in ClickHouse:
 #   CREATE DATABASE shop_pg ENGINE = PostgreSQL('pg-host:5432', 'shop', 'reader', 'password', 'public')
 
-with dbmerge(engine=engine, source_table_name='facts', source_schema='shop_pg',
+with DBMerge(engine=engine, source_table_name='facts', source_schema='shop_pg',
              table_name='Facts', key=['shop', 'product', 'day'], delete_mode='delete') as merge:
     result = merge.exec(source_condition=merge.source_table.c['day'] >= date(2025, 1, 1),
                         delete_condition=merge.table.c['day'] >= date(2025, 1, 1))
@@ -401,7 +415,7 @@ with dbmerge(engine=engine, source_table_name='facts', source_schema='shop_pg',
 - ClickHouse sends to PostgreSQL or MySQL only the part of `source_condition` that compares columns with constants, and applies the rest itself, after reading the whole source. An `IN` or `NOT IN` of one column over a subquery is therefore run by DBMerge first, and its rows go into the condition as constants: a merge of the rows changed since the last run reads only those rows from PostgreSQL. An `IN` of several columns (`tuple_(…).in_(…)`) is left to ClickHouse, as PostgreSQL fails on a list of some thousands of tuples, and so is a subquery correlated with the source, which names it along with other tables.
 
   ```python
-  with dbmerge(engine=engine, source_table_name='orders_view', source_schema='shop_pg',
+  with DBMerge(engine=engine, source_table_name='orders_view', source_schema='shop_pg',
                table_name='Orders', key=['id']) as merge:
       view = merge.source_table
       changed = select(view.c['id']).where(view.c['changed_on'] > last_run)
@@ -438,7 +452,7 @@ With `delete_mode='delete'` or `'mark'`, **every** target row that is not presen
 Scope the deletion whenever the source is partial:
 
 ```python
-with dbmerge(data=january_data, engine=engine, table_name="Facts", delete_mode='delete') as merge:
+with DBMerge(data=january_data, engine=engine, table_name="Facts", delete_mode='delete') as merge:
     # Only January rows may be deleted, whatever else the table contains.
     result = merge.exec(delete_condition=merge.table.c['Date'].between(date(2025, 1, 1), date(2025, 1, 31)))
 ```
@@ -477,7 +491,7 @@ The resulting generic type is then resolved by each backend's own defaults, so t
 ```python
 from sqlalchemy import String, Numeric, Double, DateTime
 
-with dbmerge(engine=engine, data=data, table_name="Facts", key=['id'],
+with DBMerge(engine=engine, data=data, table_name="Facts", key=['id'],
              data_types={'Name': String(100),
                          'Price': Numeric(12, 2),
                          'Ratio': Double(),
@@ -500,7 +514,7 @@ The cost is that a failure leaves everything committed before it in place. Becau
 For an all-or-nothing merge, use a single transaction:
 
 ```python
-with dbmerge(engine=engine, data=data, table_name="Facts", delete_mode='delete') as merge:
+with DBMerge(engine=engine, data=data, table_name="Facts", delete_mode='delete') as merge:
     result = merge.exec(commit_all_steps=False)
 ```
 
@@ -521,14 +535,14 @@ Choose one execution style: normally bind `tracker=` to the merge and call
 merge. These are alternatives, not two steps to perform on the same merge.
 
 ```python
-from dbmerge import dbmerge, MergeTracker, LeaseOptions
+from dbmerge import DBMerge, MergeTracker, LeaseOptions
 
-tracker = MergeTracker(engine)
-with dbmerge(engine, table_name="orders", data=rows, key=["id"],
-             tracker=tracker,
-             lease_options=LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2)) as merge:
-    result = merge.exec()
-    record = merge.tracking_record
+with MergeTracker(engine) as tracker:
+    with DBMerge(engine, table_name="orders", data=rows, key=["id"],
+                 tracker=tracker,
+                 lease_options=LeaseOptions(wait_lease=True, wait_timeout=300, wait_interval=2)) as merge:
+        result = merge.exec()
+        record = merge.tracking_record
 ```
 
 `tracker=` journals execution. Without it, `merge.exec()` remains untracked.
@@ -549,8 +563,9 @@ write configuration is `tracker=ctx.tracker, lease_handle=ctx.lease_handle`;
 do not create another lease for that write. If coordination was disabled on the
 mart, `ctx.lease_handle` is None and the same callback remains valid.
 
-`exec()` returns the usual `mergeResult`, or `None` if the lease cannot be acquired;
-`tracking_record` is also `None` for a skipped operation. Acquisition happens at
+`exec()` returns the usual `mergeResult`, including a successful no-op. If the lease
+cannot be acquired or waiting times out, it raises `LeaseBusy` without running the
+write; `tracking_record` stays `None` and the open merge can be retried. Acquisition happens at
 execution, not during constructor DDL/staging preparation. Heartbeat renews the
 lease; completion or failure releases it. Data and journal commits are separate.
 The explicit `tracker.exec_merge(merge, ...)` API remains supported and avoids
@@ -570,8 +585,8 @@ The acquisition owner remains responsible for heartbeat and release. A borrowed
 handle does not need to match the merge's destination: it can protect a whole
 multi-write pass. The caller must ensure competing passes use the same lease key;
 unrelated handles do not coordinate merely because their writes share a destination.
-`LeaseLost` indicates stale/lost ownership. A standalone busy acquisition returns
-None; in a mart callback it raises `LeaseBusy` and the pass returns False without
+`LeaseLost` indicates stale/lost ownership. A busy write raises `LeaseBusy` both
+standalone and inside a mart callback; MartLoop catches it and returns False without
 advancing the unprocessed block/watermark.
 
 Mart passes retain their lease until progress is saved. There is no implicit lease

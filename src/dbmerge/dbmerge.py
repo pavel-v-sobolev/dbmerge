@@ -250,7 +250,7 @@ class LeaseOptions:
                                          + ('positive' if name == 'wait_interval' else 'non-negative or None'))
 
 
-class dbmerge:
+class DBMerge:
     def __init__(self,
                  engine: Engine, 
                  table_name: str, 
@@ -288,7 +288,7 @@ class dbmerge:
 
         Preferable usage (Context Manager):
         ```python
-        with dbmerge(engine=engine, data=data, table_name="YourTable") as merge:
+        with DBMerge(engine=engine, data=data, table_name="YourTable") as merge:
             result = merge.exec()
         ```
 
@@ -301,7 +301,7 @@ class dbmerge:
             tracker (MergeTracker, optional): Caller-owned journal for exec(). The result remains
                 mergeResult; tracking_record holds the journal record. None disables tracking.
             lease_options (LeaseOptions, optional): Enables a new destination lease and requires
-                tracker. A busy lease returns None from exec(). The lease covers execution only,
+                tracker. A busy lease raises LeaseBusy from exec(). The lease covers execution only,
                 not constructor DDL/staging preparation. None disables automatic leasing.
             lease_handle (LeaseHandle, optional): Borrow an already acquired lease without
                 reacquiring or releasing it. Requires tracker; mutually exclusive with lease_options.
@@ -730,7 +730,7 @@ class dbmerge:
         If your data comes in portions (e.g., monthly snapshots), you can set a delete_condition argument 
         to restrict the deletion scope so that it only affects the relevant timeframe.
         E.g.:
-            with dbmerge(data=data, engine=engine, table_name="YourTable", delete_mode='delete') as merge:
+            with DBMerge(data=data, engine=engine, table_name="YourTable", delete_mode='delete') as merge:
                 merge.exec(delete_condition=merge.table.c['Date'].between(date(2025,1,1),date(2025,1,31)))
 
         Args:
@@ -776,6 +776,11 @@ class dbmerge:
             mergeResult: A dataclass object containing execution statistics (e.g., inserted_row_count, total_time)
                 and the schema changes this merge made to the target table (table_created, added_fields:
                 a {column name: SQLAlchemy type} mapping of the columns that were added).
+
+        Raises:
+            LeaseBusy: The configured lease could not be acquired, including a wait timeout.
+            LeaseLost: Lease ownership was lost before or during execution.
+            Database and validation errors propagate; a successful no-op returns mergeResult.
         """
         
         if self.tracker is not None:
@@ -1929,6 +1934,8 @@ class dbmerge:
         else:
             select_stmt = select(*source_fields).where(self.source_condition)
 
+        from ._source_select import validate_source_select
+        validate_source_select(select_stmt)
         insert_stmt = insert(self.temp_table).from_select(target_fields,select_stmt)
         self.total_row_count = self._execute_dml(insert_stmt)
 
@@ -1956,6 +1963,11 @@ class dbmerge:
                 # transaction.
                 self.temp_table.drop(self.engine, checkfirst=False)
             self.temp_table = None
+
+
+# Backwards-compatible public name. Keep an alias, not a subclass, so identity,
+# isinstance checks and imports from dbmerge.dbmerge retain the same behavior.
+dbmerge = DBMerge
 
 
 def drop_table_if_exists(engine,table_name,schema=None):

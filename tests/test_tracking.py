@@ -97,7 +97,7 @@ def test_inline_tracker_supplies_audit_clock(engine, tracker):
 
 
 def test_inline_lease_scopes_are_independent(engine, tracker):
-    from dbmerge import LeaseOptions
+    from dbmerge import LeaseOptions, LeaseBusy
     from dbmerge.tracking import _lease_name
     lease = tracker._get_lease()
     name = _lease_name(_schema(engine) or '', 'orders', 'full')
@@ -107,10 +107,12 @@ def test_inline_lease_scopes_are_independent(engine, tracker):
         for scope, expected in [('full', False), ('changes', True)]:
             with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(scope=scope),
                           table_name='orders', key=['id'], data=_rows()) as merge:
-                result = merge.exec()
-                assert (result is not None) is expected
                 if expected:
+                    assert merge.exec() is not None
                     assert merge.tracking_record.scope is None
+                else:
+                    with pytest.raises(LeaseBusy):
+                        merge.exec()
     finally:
         lease.release(name)
 
@@ -569,7 +571,8 @@ def test_schema_filter(engine, tracker):
     assert tracker.last_merge("orders", schema="other") is None
 
 
-def test_exec_with_lease_skips_and_waits(engine):
+def test_exec_with_lease_raises_and_waits(engine):
+    from dbmerge import LeaseBusy
     table_name = f"tracking_{uuid.uuid4().hex[:8]}"
     schema = _schema(engine)
     tracker_a = MergeTracker(engine, table_name=table_name, schema=schema,
@@ -604,9 +607,9 @@ def test_exec_with_lease_skips_and_waits(engine):
     thread.start()
     assert a_started.wait(timeout=5)
 
-    # Without wait_lease the held lease skips the merge entirely.
-    record, result = tracker_b.exec_merge(FastMerge(), lease_options=LeaseOptions())
-    assert record is None and result is None
+    # Without waiting the held lease fails explicitly, without running the merge.
+    with pytest.raises(LeaseBusy):
+        tracker_b.exec_merge(FastMerge(), lease_options=LeaseOptions())
 
     # With wait_lease it polls until the holder releases it, then runs.
     record, result = tracker_b.exec_merge(FastMerge(), lease_options=LeaseOptions(wait_lease=True,
@@ -770,13 +773,17 @@ def test_dbmerge_inline_tracker(engine, tracker, leased):
 
 
 def test_dbmerge_lease_busy_and_adapter(engine, tracker):
-    from dbmerge import LeaseOptions
+    from dbmerge import LeaseOptions, LeaseBusy
     from unittest.mock import patch
 
+    # This checks busy/retry delegation, not expiry. Oracle's coarse clock can
+    # exhaust the fixture's one-second TTL before the guarded INSERT runs.
+    tracker.heartbeat_ttl = 30.0
     with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(wait_lease=True, wait_timeout=0),
                   table_name='orders', data=_rows(), key=['id']) as merge:
         with patch.object(tracker, '_acquire_lease', return_value=False) as acquire:
-            assert merge.exec() is None
+            with pytest.raises(LeaseBusy):
+                merge.exec()
             assert merge.tracking_record is None and not merge.merge_finished
             assert acquire.call_args.kwargs == dict(wait=True, timeout=0, interval=30.0)
         with patch.object(tracker, 'exec', wraps=tracker.exec) as execute:
@@ -784,6 +791,25 @@ def test_dbmerge_lease_busy_and_adapter(engine, tracker):
         execute.assert_called_once()
         assert record is merge.tracking_record
         assert record.changed and result.inserted_row_count == 2
+
+
+@pytest.mark.parametrize('wait', [False, True])
+def test_busy_callable_raises_without_write_or_journal(engine, tracker, wait):
+    from dbmerge import LeaseBusy
+    from unittest.mock import Mock, patch
+
+    operation = Mock(return_value=1)
+    options = LeaseOptions(wait_lease=wait, wait_timeout=0)
+    with patch.object(tracker, '_acquire_lease', return_value=False), \
+            patch.object(tracker, '_begin', wraps=tracker._begin) as begin:
+        with pytest.raises(LeaseBusy):
+            tracker.exec(operation, destination='busy_callable', lease_options=options)
+        operation.assert_not_called()
+        begin.assert_not_called()
+    assert tracker.last_merge('busy_callable') is None
+    assert not tracker._in_flight
+    record, result = tracker.exec(operation, destination='busy_callable')
+    assert record.changed and result == 1
 
 
 def test_dbmerge_tracker_validation_and_failure(engine, tracker):

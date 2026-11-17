@@ -10,7 +10,7 @@
 
 ```python
 from sqlalchemy import create_engine
-from dbmerge import dbmerge
+from dbmerge import DBMerge
 
 engine = create_engine("clickhousedb://default:@localhost:8123/default")
 
@@ -19,7 +19,7 @@ rows = [
     {"id": 2, "name": "товар B"},
 ]
 
-with dbmerge(
+with DBMerge(
     engine=engine,
     data=rows,
     table_name="Products",
@@ -56,9 +56,9 @@ ENGINE = PostgreSQL('pg-host:5432', 'shop', 'reader', 'password', 'public');
 Затем PostgreSQL-таблицу можно использовать как источник `dbmerge`:
 
 ```python
-from dbmerge import dbmerge
+from dbmerge import DBMerge
 
-with dbmerge(
+with DBMerge(
     engine=engine,                 # соединение с ClickHouse через clickhouse-connect
     source_table_name="facts",   # таблица PostgreSQL, видимая в ClickHouse
     source_schema="shop_pg",     # подключённая база ClickHouse
@@ -107,6 +107,13 @@ ClickHouse загружает данные в staging пакетно.
 ## Фильтрация и удаления
 
 Для частичной синхронизации передавайте `source_condition`. При необходимости ограничить затрагиваемые при удалении строки укажите соответствующий `delete_condition`.
+
+Фильтр источника стройте по `merge.source_table`, а фильтр назначения в
+`delete_condition` — по `merge.table`. Несвязанные внешние FROM отклоняются до
+INSERT в staging, чтобы случайно не размножить строки источника. Подзапросы
+и явно связанные JOIN разрешены. `total_row_count` использует серверный
+`written_rows`; при materialized views серверные метрики могут включать побочные
+записи и не обязаны совпадать с физическим размером staging.
 
 > **Важно:** при `delete_mode="delete"` или `delete_mode="mark"` строки целевой таблицы, которых нет в источнике текущего запуска, считаются отсутствующими. Если источник содержит только часть данных, без подходящего `delete_condition` удаление или пометка может затронуть строки за пределами этой части. Пустой источник при неограниченном удалении может очистить целевую таблицу.
 

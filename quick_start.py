@@ -1,6 +1,6 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from datetime import date
-from dbmerge import dbmerge
+from dbmerge import DBMerge
 
 # 1. Initialize DB engine
 engine = create_engine("sqlite://")
@@ -13,6 +13,11 @@ data = [
 
 # 3. Execute the merge operation
 # The table will be created automatically if it doesn't exist.
-with dbmerge(engine=engine, data=data, table_name="Facts",
+with DBMerge(engine=engine, data=data, table_name="Facts",
              key=['Shop', 'Product', 'Date']) as merge:
     result = merge.exec()
+
+print(f'Inserted: {result.inserted_row_count}; updated: {result.updated_row_count}')
+with engine.connect() as connection:
+    print(f'Target rows: {connection.execute(text("SELECT COUNT(*) FROM Facts")).scalar_one()}')
+engine.dispose()

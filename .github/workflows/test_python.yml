@@ -67,6 +67,13 @@ jobs:
       - name: Create data directory
         run: mkdir -p data
 
+      - name: Public API, documentation, and startup regression checks
+        if: matrix.suite == 'tracking'
+        env:
+          DBMERGE_TEST_ENGINES: sqlite
+        run: |
+          uv run --no-sync pytest tests/test_public_api.py tests/test_validation.py tests/test_startup.py tests/test_lease_keys.py tests/test_documentation.py tests/test_optional_dependencies.py tests/test_db_hooks.py tests/test_mart_runner.py tests/test_source_condition.py -v --tb=short
+
       - name: Initialize sample data
         run: |
           uv run --no-sync python tests/sample_data_in_sqlite.py

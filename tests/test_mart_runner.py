@@ -29,12 +29,16 @@ def test_runner_stops_workers_before_closing_tracker(monkeypatch, failure):
     engine.dispose.side_effect = lambda: events.append('engine.dispose')
     main.__globals__.update(create_engine=Mock(return_value=engine),
                             MergeTracker=Mock(return_value=tracker),
-                            OrdersByCustomer=Mock(return_value=handler),
+                            ProductDailySales=Mock(return_value=handler),
                             request_stop=lambda: events.append('stop'))
-    with patch('signal.signal'):
+    with patch('signal.signal') as register:
         if failure is None:
             main()
         else:
             with pytest.raises(type(failure)):
                 main()
+        import signal
+        assert register.call_count == 4
+        assert register.call_args_list[2].args == (signal.SIGTERM, register.return_value)
+        assert register.call_args_list[3].args == (signal.SIGINT, register.return_value)
     assert events == ['worker', 'stop', 'tracker.close', 'engine.dispose']

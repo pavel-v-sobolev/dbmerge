@@ -236,6 +236,7 @@ def test_rebuild_request_during_active_empty_cursor_is_retained(engine, tracker)
 def test_lease_loss_does_not_commit_watermark(engine, tracker):
     from datetime import datetime
     from sqlalchemy import update
+    from dbmerge import LeaseLost
     destination = (None, f"lost_{uuid.uuid4().hex[:8]}")
     tracker.mark_watermark(destination[1], datetime(2000, 1, 1))
     tracker.exec(lambda: 1, destination="source")
@@ -247,7 +248,9 @@ def test_lease_loss_does_not_commit_watermark(engine, tracker):
 
     loop = MartLoop(engine, tracker, destination, ["source"], process_changes)
     try:
-        with pytest.raises(RuntimeError, match="Lease lost"):
+        # The heartbeat can notice the successor before the foreground guard,
+        # so assert the public exception type rather than a timing-specific text.
+        with pytest.raises(LeaseLost):
             loop.run_if_pending()
         assert tracker.watermark(destination[1]).year == 2000
     finally:
@@ -370,6 +373,145 @@ def _rows(name="a"):
     return [{"id": 1, "name": name}, {"id": 2, "name": name}]
 
 
+@pytest.mark.parametrize('empty_source', [False, True])
+def test_first_pass_without_source_journal(engine, tracker, empty_source):
+    from sqlalchemy import select, func
+    tracker.heartbeat_ttl = 30.0
+    # The initial data exists, but was loaded outside the journal.
+    with _dbmerge(engine, table_name='orders', data=_rows(), key=['id']) as merge:
+        merge.exec()
+        table = merge.table
+    if empty_source:
+        with engine.begin() as conn:
+            conn.execute(table.delete())
+    seen = []
+
+    def process(ctx):
+        with engine.connect() as conn:
+            seen.append((ctx.full_rebuild, conn.scalar(select(func.count()).select_from(table))))
+
+    destination = f'initial_{uuid.uuid4().hex[:8]}'
+    loop = MartLoop(engine, tracker, destination, [(_schema(engine), 'orders')], process)
+    try:
+        assert not seen  # Registration is not calculation.
+        assert loop.run_if_pending()
+        assert seen == [(True, 0 if empty_source else 2)]
+        watermark = tracker.watermark(destination)
+        assert watermark is not None
+        assert not loop.run_if_pending()
+    finally:
+        loop.close()
+    restarted = MartLoop(engine, tracker, destination, [(_schema(engine), 'orders')], process)
+    try:
+        assert not restarted.run_if_pending()
+        assert tracker.watermark(destination) == watermark
+    finally:
+        restarted.close()
+
+
+def test_initial_failure_does_not_publish_watermark(engine, tracker):
+    tracker.heartbeat_ttl = 30.0
+    destination = f'initial_fail_{uuid.uuid4().hex[:8]}'
+    attempts = []
+
+    def process(ctx):
+        attempts.append(ctx.full_rebuild)
+        if len(attempts) == 1:
+            raise RuntimeError('source not ready')
+
+    loop = MartLoop(engine, tracker, destination, ['unready_source'], process)
+    try:
+        with pytest.raises(RuntimeError, match='source not ready'):
+            loop.run_if_pending()
+        assert tracker.watermark(destination) is None
+        assert loop.run_if_pending()
+        assert attempts == [True, True]
+        assert tracker.watermark(destination) is not None
+    finally:
+        loop.close()
+
+
+@pytest.mark.parametrize('disabled', [False, True])
+def test_loop_registers_without_resetting_existing_state(engine, tracker, disabled):
+    from datetime import datetime
+    from sqlalchemy import select, update
+    from dbmerge.mart import _ensure_marts_table, _marts_row_where
+    destination = ('logical_schema', f'registered_{uuid.uuid4().hex[:8]}')
+    table = _ensure_marts_table(tracker.engine, tracker.schema)
+    where = _marts_row_where(table, *destination)
+    callback = lambda ctx: pytest.fail('registration must not calculate data')
+    loop = MartLoop(engine, tracker, destination, ['source'], callback, enabled=not disabled)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(select(table).where(where)).one()
+        assert not row.full_rebuild_is_required
+        assert row.rebuild_request is None and row.rebuild_cursor is None
+        assert tracker.watermark(destination[1], schema=destination[0]) is None
+        if disabled:
+            assert not loop.run_if_pending()
+        else:
+            loop.request_stop()
+            assert not loop.run_if_pending()
+    finally:
+        loop.close()
+    boundary = datetime(2000, 1, 1)
+    with engine.begin() as conn:
+        conn.execute(update(table).where(where).values(full_rebuild_is_required=True,
+                     rebuild_request='existing-token', rebuild_cursor='block-1', rebuild_boundary=boundary))
+    tracker.mark_watermark(destination[1], boundary, schema=destination[0])
+    second = MartLoop(engine, tracker, destination, ['source'], callback, enabled=False)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(select(table).where(where)).one()
+        assert row.full_rebuild_is_required
+        assert row.rebuild_request == 'existing-token' and row.rebuild_cursor == 'block-1'
+        assert row.rebuild_boundary.replace(tzinfo=None) == boundary
+        assert tracker.watermark(destination[1], schema=destination[0]).replace(tzinfo=None) == boundary
+    finally:
+        second.close()
+
+
+def test_registration_with_existing_watermark_does_not_rebuild(engine, tracker):
+    from datetime import datetime
+    destination = f'existing_{uuid.uuid4().hex[:8]}'
+    tracker.mark_watermark(destination, datetime(2000, 1, 1))
+    loop = MartLoop(engine, tracker, destination, ['unchanged'], lambda ctx: pytest.fail('unexpected rebuild'))
+    try:
+        assert not loop.run_if_pending()
+        assert tracker.watermark(destination).year == 2000
+    finally:
+        loop.close()
+
+
+def test_failed_loop_constructor_closes_only_owned_resources(engine, tracker, monkeypatch):
+    from unittest.mock import patch
+    from dbmerge.mart import _all_loops
+    before = set(_all_loops)
+
+    def fail(self):
+        raise RuntimeError('registration failed')
+
+    monkeypatch.setattr(MartLoop, '_ensure_marts_row', fail)
+    with patch.object(Lease, 'close', autospec=True) as close:
+        with pytest.raises(RuntimeError, match='registration failed'):
+            MartLoop(engine, tracker, 'failed', ['source'], lambda ctx: None)
+        close.assert_called_once()
+    assert set(_all_loops) == before
+    lease = tracker._get_lease()
+    lease.ensure('borrowed_initialization')
+    assert lease.acquire('borrowed_initialization')
+    try:
+        handle = lease.handle('borrowed_initialization')
+        with patch.object(lease, 'close') as close:
+            with pytest.raises(RuntimeError, match='registration failed'):
+                MartLoop(engine, tracker, 'failed', ['source'], lambda ctx: None, lease_handle=handle)
+            close.assert_not_called()
+        handle.check()
+    finally:
+        lease.release('borrowed_initialization')
+    assert set(_all_loops) == before
+
+
 def test_mart_runs_when_source_changed(engine, tracker):
     seen = []
 
@@ -382,17 +524,18 @@ def test_mart_runs_when_source_changed(engine, tracker):
     mart = MartLoop(engine, tracker, destination=(_schema(engine), "mart"),
                     sources=[(_schema(engine), "orders")], process_changes=process_changes)
 
-    assert mart.run_if_pending() is False          # no source change yet
-    assert seen == []
+    assert mart.run_if_pending() is True           # initialize even without a journal signal
+    assert len(seen) == 1 and seen[0].full_rebuild is True
 
+    time.sleep(1.1)  # Keep the next change beyond a coarse-clock initial watermark.
     with _dbmerge(engine, table_name="orders", data=_rows(), key=["id"]) as merge:
         tracker.exec_merge(merge)
     time.sleep(1.1)
-    assert mart.run_if_pending() is True           # first run: full rebuild
-    assert len(seen) == 1 and seen[0].full_rebuild is True
+    assert mart.run_if_pending() is True           # initialized consumer: incremental
+    assert len(seen) == 2 and seen[1].full_rebuild is False
 
     assert mart.run_if_pending() is False          # nothing new since
-    assert len(seen) == 1
+    assert len(seen) == 2
 
     time.sleep(1.1)
     with _dbmerge(engine, table_name="orders", data=_rows("changed"), key=["id"]) as merge:
@@ -403,7 +546,7 @@ def test_mart_runs_when_source_changed(engine, tracker):
     assert not record.changed
     time.sleep(1.1)
     assert mart.run_if_pending() is True           # a real change: incremental
-    assert len(seen) == 2 and seen[1].full_rebuild is False
+    assert len(seen) == 3 and seen[2].full_rebuild is False
 
     mart.close()
 
@@ -557,6 +700,9 @@ def test_handler_constructor_no_lease(engine, tracker):
 
 
 def test_operation_scopes_follow_callbacks_and_restore_on_failure(engine, tracker):
+    # Scope propagation is independent of expiry; the callback deliberately
+    # sleeps across a coarse-clock tick and must retain its lease under load.
+    tracker.heartbeat_ttl = 30.0
     records = []
 
     class M(MartHandler):
@@ -915,7 +1061,7 @@ def test_handler_rebuild_busy_lease_keeps_request(engine, tracker):
         loop.close()
 
 
-@pytest.mark.parametrize("example", ["orders_by_customer", "orders_by_customer_clickhouse", "rebuild_mart"])
+@pytest.mark.parametrize("example", ["product_daily_sales", "product_daily_sales_clickhouse", "rebuild_mart"])
 def test_example_entry_point_one_pass(example, tmp_path, monkeypatch):
     import runpy
     from pathlib import Path
@@ -937,7 +1083,7 @@ def test_example_entry_point_one_pass(example, tmp_path, monkeypatch):
             run.assert_called_once()
             assert run.call_args.args[0].engine is destination_engine
             if example == 'rebuild_mart':
-                assert rebuild_requested(destination_engine, ('target', 'orders_by_customer'))
+                assert rebuild_requested(destination_engine, ('target', 'product_daily_sales'))
     finally:
         for engine in example_engines:
             engine.dispose()

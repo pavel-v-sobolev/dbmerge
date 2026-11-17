@@ -12,12 +12,12 @@ pip install 'dbmerge[oracle]'
 
 ```python
 from sqlalchemy import create_engine, String
-from dbmerge import dbmerge
+from dbmerge import DBMerge
 
 engine = create_engine(
     'oracle+oracledb://dbmerge_test:oracle@localhost:1521/?service_name=XEPDB1'
 )
-with dbmerge(engine=engine, table_name='facts', key=['code'],
+with DBMerge(engine=engine, table_name='facts', key=['code'],
              data=[{'code': 'A', 'description': 'new value'}],
              data_types={'code': String(100)}) as merge:
     result = merge.exec()

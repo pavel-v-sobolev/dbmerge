@@ -4,6 +4,53 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-11-17
+
+Tracking, leases and marts remain **beta**. Stop existing workers before rollout;
+ensure sources are ready and plan capacity for initial rebuilds on destinations
+without a saved watermark. Existing untracked merge calls retain their behavior.
+
+### Added
+- `DBMerge` is the canonical class name, exported from both `dbmerge` and
+  `dbmerge.dbmerge`. The legacy `dbmerge` name remains an alias of the same class
+  for backwards compatibility. Examples and documentation use `DBMerge`.
+
+### Changed
+- **Tracking/lease API:** `DBMerge.exec()`, `MergeTracker.exec()` and `exec_merge()`
+  now raise `LeaseBusy` when lease acquisition fails or times out, instead of
+  returning `None` / `(None, None)`. Catch `LeaseBusy` for standalone retry/skip
+  handling. MartLoop already catches it without advancing progress; callbacks
+  simply call `merge.exec()`. Successful no-ops still return normal results.
+
+### Fixed
+- Reject disconnected outer source SELECTs before staging INSERT, including the
+  ClickHouse path; preserve linked joins and scoped subqueries.
+- Initialize marts without a source-change journal signal when no watermark exists.
+- Register logical mart destinations when creating loops without resetting durable
+  progress or requests; close owned resources on constructor failure.
+- Avoid truncated primary-key collisions for long lease names with a common prefix.
+  Existing short lease IDs and lease lookup names remain unchanged.
+- Tolerate concurrent creation of tracking/mart service tables and schemas, while
+  preserving unrelated database errors.
+- Reject non-finite, boolean and invalid heartbeat/polling intervals before starting workers.
+- Restore previous signal handlers when the continuous mart runner exits.
+- Include both ClickHouse guides in the source distribution.
+
+### Documentation
+- Replace the customer-total mart examples with `product_daily_sales`: source
+  `Order`, `Date`, `Product`, `Shop`, `Amount`; result `Date`, `Product`, `SUM(Amount)`
+  across shops. Include a journaled source seeder, PostgreSQL/ClickHouse handlers,
+  and updated runner/rebuild entry points.
+- Describe every tracking and mart-state field, row kinds and nullable-state semantics.
+- Use absolute GitHub documentation/example links in the README for PyPI rendering.
+- Explain initial mart load/readiness, registration, source-filter validation and
+  ClickHouse materialized-view row-count limitations.
+- Add a version-aware migration note, observable SQLite quick start, guide navigation,
+  and the missing tracker/lease/safe-border constructor arguments.
+- Correct journal creation timing and execution defaults; show explicit tracker cleanup.
+- Add CI checks for API documentation coverage, Python snippet syntax, local file links,
+  quick-start execution and startup/lease regressions.
+
 ## [2.5.0] - 2026-11-16
 
 Tracking, leases and marts remain **beta**. Existing untracked merge calls retain their behavior.

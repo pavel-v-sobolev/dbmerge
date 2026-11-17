@@ -13,10 +13,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
-    from .dbmerge import dbmerge
+    from .dbmerge import DBMerge
 
 
-def arrow_table(merge: dbmerge, begin, end, nested_as_json=(), processors=None, wall_clock=None):
+def arrow_table(merge: DBMerge, begin, end, nested_as_json=(), processors=None, wall_clock=None):
     """
     Rows begin..end of the incoming data as an Arrow table of its data fields.
 
@@ -105,7 +105,7 @@ def _arrow_value_error(columns, begin, error):
     return IncorrectDataError(f'The data could not be put in an Arrow table: {error}')
 
 
-def python_columns(merge: dbmerge, begin, end, nested_as_json=(), processors=None, wall_clock=None):
+def python_columns(merge: DBMerge, begin, end, nested_as_json=(), processors=None, wall_clock=None):
     """
     Rows begin..end of the incoming data as {field: list of values}, with None for every missing value.
     The arguments are those of arrow_table.
@@ -147,7 +147,7 @@ def python_columns(merge: dbmerge, begin, end, nested_as_json=(), processors=Non
     return columns
 
 
-def column_values(merge: dbmerge, field, begin, end):
+def column_values(merge: DBMerge, field, begin, end):
     """The values of one field in rows begin..end of the incoming data, as Python objects."""
     data = merge.data
     if merge.type_of_data == 'list of dict':

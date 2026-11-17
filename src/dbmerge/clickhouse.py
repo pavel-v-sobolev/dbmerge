@@ -58,7 +58,7 @@ from ._chunks import arrow_table, python_columns
 from ._bulk_load import warn_without_pyarrow
 
 if TYPE_CHECKING:
-    from .dbmerge import dbmerge
+    from .dbmerge import DBMerge
 
 
 # The oldest server the merge works on: lightweight DELETE, Date32, Bool and FINAL in a subquery are all
@@ -115,7 +115,7 @@ class _ClientConnection:
         self.closed = True
 
 
-def open_session(merge: dbmerge):
+def open_session(merge: DBMerge):
     if isinstance(merge.engine, Engine):
         # A pooled connection of the engine is held for the whole merge, so that closing it gives it back
         # to the pool. The statements themselves run through the clickhouse-connect client inside it.
@@ -132,7 +132,7 @@ def open_session(merge: dbmerge):
 
     server_version = _query(merge, 'SELECT version()')[0][0]
     if tuple(int(part) for part in server_version.split('.')[:2]) < MIN_SERVER_VERSION:
-        raise IncorrectParameter(f'ClickHouse {server_version} is not supported: dbmerge needs '
+        raise IncorrectParameter(f'ClickHouse {server_version} is not supported: DBMerge needs '
                                  f'{".".join(map(str, MIN_SERVER_VERSION))} or newer.')
 
     # A schema is a database in ClickHouse. The current one is written out, so that the catalog can be
@@ -153,7 +153,7 @@ def open_session(merge: dbmerge):
         merge.temp_schema = merge.schema
 
 
-def create_schema_if_not_exists(merge: dbmerge, schema_name):
+def create_schema_if_not_exists(merge: DBMerge, schema_name):
     exists = _query(merge, 'SELECT count() FROM system.databases WHERE name = {name:String}',
                     name=schema_name)[0][0]
     if exists:
@@ -164,7 +164,7 @@ def create_schema_if_not_exists(merge: dbmerge, schema_name):
     merge.client.command(f'CREATE DATABASE IF NOT EXISTS {_quote(merge, schema_name)}')
 
 
-def reflect_table(merge: dbmerge, table_name, schema):
+def reflect_table(merge: DBMerge, table_name, schema):
     rows = _query(merge, 'SELECT engine, engine_full, sorting_key FROM system.tables '
                          'WHERE database = {db:String} AND name = {name:String}', db=schema, name=table_name)
     if rows:
@@ -212,7 +212,7 @@ def reflect_table(merge: dbmerge, table_name, schema):
     return table
 
 
-def _external_view(merge: dbmerge, table_name, schema):
+def _external_view(merge: DBMerge, table_name, schema):
     """
     The engine and the columns (as system.columns gives them) of a view in a PostgreSQL or MySQL database
     attached to ClickHouse, or (None, None) when there is none. system.tables lists only the tables of such a
@@ -229,7 +229,7 @@ def _external_view(merge: dbmerge, table_name, schema):
                             for name, type_name, default_kind, *_ in described]
 
 
-def check_table(merge: dbmerge):
+def check_table(merge: DBMerge):
     # A table dbmerge is about to create gets the right layout by construction.
     if merge.table is None:
         return
@@ -286,7 +286,7 @@ def check_table(merge: dbmerge):
                                  f'(MATERIALIZED, ALIAS or EPHEMERAL) and can not be written.')
 
 
-def adapt_types(merge: dbmerge):
+def adapt_types(merge: DBMerge):
     for f in merge.new_fields:
         field_type = merge.new_fields[f]
         if isinstance(field_type, ChSqlaType):
@@ -305,7 +305,7 @@ def adapt_types(merge: dbmerge):
         merge._set_new_field_type(f, sqla_type_from_name(type_name))
 
 
-def create_table(merge: dbmerge):
+def create_table(merge: DBMerge):
     fields = dict(merge.data_fields)
     fields.update({f: t for f, t in merge.new_fields.items() if f not in merge.data_fields})
 
@@ -323,7 +323,7 @@ def create_table(merge: dbmerge):
     merge.table = reflect_table(merge, merge.table_name, merge.schema)
 
 
-def add_column(merge: dbmerge, field_name, field_type):
+def add_column(merge: DBMerge, field_name, field_type):
     # Only the table metadata changes, the existing parts are not rewritten: the rows already in the table
     # read the new column as NULL.
     merge.client.command(f'ALTER TABLE {_table_name(merge, merge.schema, merge.table_name)} '
@@ -335,11 +335,11 @@ def now():
     return func.now64(literal_column('6'))
 
 
-def database_time(merge: dbmerge):
+def database_time(merge: DBMerge):
     return _scalar(merge, select(now()))
 
 
-def create_temp_table(merge: dbmerge, temp_table_name):
+def create_temp_table(merge: DBMerge, temp_table_name):
     # A TEMPORARY table lives in the session of the clickhouse-connect client, which runs every statement
     # here. It is in no database, so nobody else sees it, and the server drops it with the session, so a
     # crashed process leaves nothing behind. (Through SQLAlchemy it would not live: clickhouse-connect
@@ -364,7 +364,7 @@ def create_temp_table(merge: dbmerge, temp_table_name):
     merge.temp_table = Table(temp_table_name, merge.metadata, *columns, schema=merge.temp_schema)
 
 
-def insert_data_to_temp(merge: dbmerge):
+def insert_data_to_temp(merge: DBMerge):
     start_time = time.perf_counter()
     fields = list(merge.data_fields)
     # dicts and lists headed for a string column go there as JSON text
@@ -390,7 +390,7 @@ def insert_data_to_temp(merge: dbmerge):
     merge.temp_insert_time = time.perf_counter() - start_time
 
 
-def insert_source_table_to_temp(merge: dbmerge):
+def insert_source_table_to_temp(merge: DBMerge):
     # The source is any table or view ClickHouse can read, a table of a PostgreSQL or MySQL database engine
     # among them: the server copies it into the staging table itself.
     start_time = time.perf_counter()
@@ -406,6 +406,8 @@ def insert_source_table_to_temp(merge: dbmerge):
     # only the current one is read.
     if engine in REPLACING_ENGINES:
         rows = final(rows, source)
+    from ._source_select import validate_source_select
+    validate_source_select(rows)
     statement = insert(merge.temp_table).from_select(list(merge.data_fields), rows)
     # insert_null_as_default=0: a NULL for a column that is not Nullable is refused, as it is in data
     # (LOAD_SETTINGS); INSERT ... SELECT would store 0, '' or 1970-01-01 in its place otherwise.
@@ -413,7 +415,7 @@ def insert_source_table_to_temp(merge: dbmerge):
     merge.temp_insert_time = time.perf_counter() - start_time
 
 
-def _subqueries_as_values(merge: dbmerge, condition):
+def _subqueries_as_values(merge: DBMerge, condition):
     """
     The condition with every IN and NOT IN of one column over a subquery replaced by the rows of that subquery.
 
@@ -456,7 +458,7 @@ def _correlated(subquery, source):
     return not (isinstance(subquery, Select) and subquery.get_final_froms() == [source])
 
 
-def drop_table(merge: dbmerge, table):
+def drop_table(merge: DBMerge, table):
     if table.schema is None:
         merge.client.command(f'DROP TEMPORARY TABLE IF EXISTS {_quote(merge, table.name)}')
     else:
@@ -465,7 +467,7 @@ def drop_table(merge: dbmerge, table):
         merge.client.command(f'DROP TABLE IF EXISTS {_table_name(merge, table.schema, table.name)} SYNC')
 
 
-def insert_changed_rows(merge: dbmerge):
+def insert_changed_rows(merge: DBMerge):
     # Stands in for the UPDATE of the generic flow. ClickHouse has no UPDATE fit for this: a changed row is
     # written as a new version of itself, and ReplacingMergeTree keeps only the last version of a key.
     # It is an insert, so its time is counted as insert time (insert_new_rows adds its own to it).
@@ -514,7 +516,7 @@ def insert_changed_rows(merge: dbmerge):
     merge.insert_time = time.perf_counter() - start_time
 
 
-def insert_new_rows(merge: dbmerge):
+def insert_new_rows(merge: DBMerge):
     start_time = time.perf_counter()
     staging = merge.temp_table.alias('s')
 
@@ -544,7 +546,7 @@ def insert_new_rows(merge: dbmerge):
     merge.insert_time += time.perf_counter() - start_time
 
 
-def insert_marked_rows(merge: dbmerge):
+def insert_marked_rows(merge: DBMerge):
     # Marking is an insert too: the current version of a row missing from the source is written again with
     # the mark set, and replaces the unmarked one.
     start_time = time.perf_counter()
@@ -577,7 +579,7 @@ def insert_marked_rows(merge: dbmerge):
     merge.delete_time = time.perf_counter() - start_time
 
 
-def delete_rows_missing_in_source(merge: dbmerge):
+def delete_rows_missing_in_source(merge: DBMerge):
     # A lightweight DELETE: it masks the rows at once, and they are gone physically with the next merges
     # of the parts. Being a mutation, it does not see temporary tables, which is why the staging table is a
     # regular one in this mode (see create_temp_table).
@@ -600,7 +602,7 @@ def delete_rows_missing_in_source(merge: dbmerge):
     merge.delete_time = time.perf_counter() - start_time
 
 
-def _current_rows(merge: dbmerge):
+def _current_rows(merge: DBMerge):
     """The current version (FINAL) of every target row whose key is in the staging table, as a subquery."""
     # FINAL goes into a subquery: on servers before 24.x it is silently ignored on the right side of a JOIN.
     target = merge.table.alias('tf')
@@ -608,16 +610,16 @@ def _current_rows(merge: dbmerge):
     return final(rows, target).subquery('t')
 
 
-def _staging_keys(merge: dbmerge):
+def _staging_keys(merge: DBMerge):
     staging = merge.temp_table.alias('sk')
     return select(*[staging.c[k] for k in merge.key])
 
 
-def _key(merge: dbmerge, table):
+def _key(merge: DBMerge, table):
     return tuple_(*[table.c[k] for k in merge.key])
 
 
-def _same_key(merge: dbmerge, left, right):
+def _same_key(merge: DBMerge, left, right):
     return and_(*[left.c[k] == right.c[k] for k in merge.key])
 
 
@@ -637,27 +639,27 @@ def _adapt(condition, target, staging):
     return condition
 
 
-def _compile(merge: dbmerge, statement):
+def _compile(merge: DBMerge, statement):
     # render_postcompile: the value list of an in_() in a condition is expanded into its parameters only when
     # SQLAlchemy executes a statement itself; the client here would get a __[POSTCOMPILE_...] placeholder.
     return statement.compile(dialect=merge.ch_dialect, compile_kwargs={'render_postcompile': True})
 
 
-def _execute(merge: dbmerge, statement, settings=None):
+def _execute(merge: DBMerge, statement, settings=None):
     sql, parameters, settings = _prepared(merge, statement, settings)
     return sql, merge.client.command(sql, parameters=parameters, settings=settings)
 
 
-def _scalar(merge: dbmerge, statement):
+def _scalar(merge: DBMerge, statement):
     return _rows(merge, statement)[0][0]
 
 
-def _rows(merge: dbmerge, statement):
+def _rows(merge: DBMerge, statement):
     sql, parameters, settings = _prepared(merge, statement)
     return merge.client.query(sql, parameters=parameters, settings=settings).result_rows
 
 
-def _prepared(merge: dbmerge, statement, settings=None):
+def _prepared(merge: DBMerge, statement, settings=None):
     """The text of a statement, with the parameters and settings to run it through the client."""
     compiled = _compile(merge, statement)
     sql = str(compiled)
@@ -685,7 +687,7 @@ def _prepared(merge: dbmerge, statement, settings=None):
 # t.Deleted of the condition and fail.
 
 
-def _insert(merge: dbmerge, statement, settings=None):
+def _insert(merge: DBMerge, statement, settings=None):
     # A token of its own for every insert: a Replicated or Shared table drops an insert whose data repeats
     # one of the recent ones, which would lose a value that returned to what it once was.
     settings = {**(settings or {}), 'insert_deduplication_token': uuid.uuid4().hex}
@@ -693,15 +695,15 @@ def _insert(merge: dbmerge, statement, settings=None):
     return sql, summary.written_rows
 
 
-def _query(merge: dbmerge, sql, **parameters):
+def _query(merge: DBMerge, sql, **parameters):
     return merge.client.query(sql, parameters=parameters).result_rows
 
 
-def _quote(merge: dbmerge, name):
+def _quote(merge: DBMerge, name):
     return merge.ch_dialect.identifier_preparer.quote_identifier(name)
 
 
-def _table_name(merge: dbmerge, schema, name):
+def _table_name(merge: DBMerge, schema, name):
     return f'{_quote(merge, schema)}.{_quote(merge, name)}'
 
 
@@ -772,7 +774,7 @@ def _base_type_name(type_name):
     return type_name
 
 
-def _naive_time_zones(merge: dbmerge):
+def _naive_time_zones(merge: DBMerge):
     """The time zone a datetime without one means, for every date and time column of the staging table."""
     zones = {}
     session_zone = None
@@ -791,7 +793,7 @@ def _naive_time_zones(merge: dbmerge):
     return zones
 
 
-def _nulls_without_nan(merge: dbmerge, table):
+def _nulls_without_nan(merge: DBMerge, table):
     # pandas keeps a missing integer as NaN in a float column. Arrow marks it null, but the NaN stays in the
     # data buffer under the mark, and servers before 25.x convert that buffer to the integer column without
     # looking at the marks: "Unexpected inf or nan to integer conversion". Such a column is cast to the

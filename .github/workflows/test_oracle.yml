@@ -49,10 +49,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --extra dev
-          uv pip install oracledb
+          uv venv --python 3.13
+          # Do not install the broad dev extra: unrelated native drivers (notably
+          # mariadb) require system libraries that this Oracle runner does not have.
+          uv pip install -e ".[oracle]" "sqlalchemy~=2.0.0" pytest pandas polars numpy pyarrow
 
-      # uv.lock pins SQLAlchemy 2.0; "uv run --no-sync" below keeps the upgrade.
+      # "uv run --no-sync" below preserves the selected SQLAlchemy version.
       - name: Install SQLAlchemy 2.1
         if: matrix.sqlalchemy == '2.1'
         run: uv pip install "sqlalchemy~=2.1.0"
@@ -106,3 +108,10 @@ jobs:
           DBMERGE_TEST_URL_ORACLE: 'oracle+oracledb://dbmerge_test:oracle@localhost:1521/?service_name=XEPDB1'
         run: |
           uv run --no-sync pytest tests/test_oracle.py -v --tb=short
+
+      - name: Oracle diagnostics on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs oracle || true
+          df -h /

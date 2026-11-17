@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+import hashlib
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -25,6 +26,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .tracking import _coerce_datetime, _now_expr, _heartbeat_engine
 from .dbmerge import IncorrectParameter
+from ._validation import validate_interval
 
 LEASE_HEARTBEAT_PERIOD = 20.0
 LEASE_TTL = 900.0
@@ -112,6 +114,8 @@ class Lease:
                  ttl: float = LEASE_TTL,
                  retry_period: float = LEASE_HEARTBEAT_RETRY_PERIOD,
                  heartbeat_engine: Engine | None = None):
+        for name, value in (('period', period), ('ttl', ttl), ('retry_period', retry_period)):
+            validate_interval(name, value)
         self._owns_heartbeat_engine = heartbeat_engine is None
         self.heartbeat_engine = heartbeat_engine or _heartbeat_engine(engine)
         self.engine = engine
@@ -135,10 +139,15 @@ class Lease:
         """Create the lease row for a name if it does not exist yet. Idempotent."""
         key = self.key(name)
         t = self.table
+        # Keep existing short IDs, but do not truncate distinct long names to one PK.
+        row_id = key if len(key) <= 64 else 'lease:' + hashlib.sha256(key.encode()).hexdigest()[:58]
         with self.engine.connect() as conn:
+            if len(key) > 64 and conn.scalar(select(t.c.id).where(t.c.table_name == key)) is not None:
+                # A pre-upgrade row may use the truncated ID. Reuse it, even while held.
+                return
             try:
                 conn.execute(insert(t).values(
-                    id=key[:64], row_kind="lease", owner=None, table_name=key,
+                    id=row_id, row_kind="lease", owner=None, table_name=key,
                     started_at=func.now(), heartbeat_at=func.now()))
                 conn.commit()
             except IntegrityError:

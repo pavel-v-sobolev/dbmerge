@@ -66,4 +66,4 @@ jobs:
         env:
           DBMERGE_TEST_ENGINES: clickhouse
         run: |
-          uv run --no-sync pytest tests/test_all.py -v --tb=short
+          uv run --no-sync pytest tests/test_all.py tests/test_source_condition.py -v --tb=short

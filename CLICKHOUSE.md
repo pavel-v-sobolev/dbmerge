@@ -10,7 +10,7 @@ Use the `clickhouse-connect` driver: either the SQLAlchemy URL `clickhousedb://`
 
 ```python
 from sqlalchemy import create_engine
-from dbmerge import dbmerge
+from dbmerge import DBMerge
 
 engine = create_engine("clickhousedb://default:@localhost:8123/default")
 
@@ -19,7 +19,7 @@ rows = [
     {"id": 2, "name": "item B"},
 ]
 
-with dbmerge(
+with DBMerge(
     engine=engine,
     data=rows,
     table_name="Products",
@@ -56,9 +56,9 @@ ENGINE = PostgreSQL('pg-host:5432', 'shop', 'reader', 'password', 'public');
 The PostgreSQL table can then be used as a `dbmerge` source:
 
 ```python
-from dbmerge import dbmerge
+from dbmerge import DBMerge
 
-with dbmerge(
+with DBMerge(
     engine=engine,                 # ClickHouse connection via clickhouse-connect
     source_table_name="facts",   # PostgreSQL table exposed in ClickHouse
     source_schema="shop_pg",     # attached ClickHouse database
@@ -107,6 +107,13 @@ ClickHouse loads data into staging in batches.
 ## Filtering and deletions
 
 Use `source_condition` for a partial sync. Set `delete_condition` as needed to scope rows affected by deletion.
+
+Build source filters on `merge.source_table`; destination filters belong in
+`delete_condition` and use `merge.table`. Disconnected outer FROM elements are
+rejected before the staging INSERT, rather than silently multiplying source rows.
+Nested subqueries and explicitly linked joins are allowed. `total_row_count`
+reports the server's `written_rows`; materialized-view side effects can affect
+server metrics, so do not infer physical staging size from them in that case.
 
 > **Important:** With `delete_mode="delete"` or `delete_mode="mark"`, target rows absent from the current source are considered missing. If the source contains only a subset, deletion or marking without a matching `delete_condition` may affect rows outside that subset. An unscoped delete with an empty source can clear the target table.
 

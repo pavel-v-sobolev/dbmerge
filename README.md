@@ -39,7 +39,7 @@ To ensure optimal performance, the library loads your data into a temporary tabl
 
 Optional change tracking, leases and resumable derived-table processing are **beta**:
 their APIs may change as the functionality matures. See
-[Tracking and Marts](TRACKING_AND_MARTS.md) for usage and examples.
+[Tracking and Marts](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TRACKING_AND_MARTS.md) for usage and examples.
 The core merge API is unchanged and is not part of this beta designation.
 
 ## Supported Databases
@@ -72,10 +72,16 @@ pip install 'dbmerge[clickhouse]'  # clickhouse-connect + pyarrow
 
 The library uses a context manager to handle database connections and ensure resources are safely released.
 
+**Version note:** Starting with **2.6.0**, `DBMerge` is the preferred class name.
+Released versions through 2.5.0 use `from dbmerge import dbmerge`; when trying
+these examples with 2.5.0, use `from dbmerge import dbmerge as DBMerge`.
+Version 2.6.0 supports both names as aliases of the same class. The package
+name (`pip install dbmerge`) and logger (`logging.getLogger('dbmerge')`) do not change.
+
 ```python
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from datetime import date
-from dbmerge import dbmerge
+from dbmerge import DBMerge
 
 # 1. Initialize DB engine
 engine = create_engine("sqlite://")
@@ -88,10 +94,33 @@ data = [
 
 # 3. Execute the merge operation
 # The table will be created automatically if it doesn't exist.
-with dbmerge(engine=engine, data=data, table_name="Facts", 
+with DBMerge(engine=engine, data=data, table_name="Facts",
              key=['Shop', 'Product', 'Date']) as merge:
     result = merge.exec()
+
+print(result.inserted_row_count)  # 2 on this fresh in-memory database
+with engine.connect() as connection:
+    print(connection.execute(text('SELECT COUNT(*) FROM "Facts"')).scalar_one())  # 2
+engine.dispose()
 ```
+
+This example uses only SQLite and SQLAlchemy: no database server, pandas or
+polars is required. Run `python quick_start.py` from a source checkout after
+installing the project with `pip install -e .`. The first merge creates `Facts`;
+repeating the same data against a persistent database makes no row changes.
+The default `delete_mode='no'` keeps target rows absent from the input. Do not
+enable deletion for a partial snapshot without a `delete_condition`.
+
+### Choose the guide for your task
+
+| Task | Start here |
+|---|---|
+| Insert/update Python data | Quick start above, then [input and options](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#class-dbmerge) |
+| Synchronize one period or partition | [Scoped deletion and risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#data-loss-risks) |
+| Merge from a table or view | [API reference](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md) (`source_table_name`) |
+| Coordinate writers or refresh marts | [Tracking and marts](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TRACKING_AND_MARTS.md) (**beta**) |
+| Select a database driver | [Compatibility matrix](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md) |
+| Use ClickHouse or Oracle | [ClickHouse guide](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CLICKHOUSE.md), [Oracle guide](https://github.com/pavel-v-sobolev/dbmerge/blob/main/ORACLE.md) |
 
 ## Key Features
 
@@ -158,16 +187,17 @@ Read [Data Loss Risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCU
 Beyond a single merge, DBMerge ships two optional layers that turn merges into a coordinated pipeline:
 
 - **`MergeTracker`** (`dbmerge.tracking`) journals every merge into one table, so a downstream consumer can ask when a table last changed (`is_changed_since`, `last_merge`), up to which moment the data is settled (`safe_boundary`), and whether a merge is running right now.
-- **`MartLoop`** (`dbmerge.mart`) polls that journal and rebuilds a derived table (a *mart*) only when its declared sources really changed since the mart's watermark.
+- **`MartLoop`** (`dbmerge.mart`) registers a derived table (a *mart*), performs an initial rebuild without requiring a journal change, then refreshes it when its declared sources change. Sources must be ready before enabling the loop.
 
-See [Tracking and Marts](TRACKING_AND_MARTS.md) for the full reference and [examples/orders_by_customer.py](examples/orders_by_customer.py) for a ready-to-run template.
+See [Tracking and Marts](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TRACKING_AND_MARTS.md) for the full reference and [examples/product_daily_sales.py](https://github.com/pavel-v-sobolev/dbmerge/blob/main/examples/product_daily_sales.py) for a ready-to-run template.
 
 ## Documentation
 
 - [Full Module Documentation](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md)
 - [Advanced Examples (Python)](https://github.com/pavel-v-sobolev/dbmerge/blob/main/user_guide.py)
-- [Compatibility matrix](COMPATIBILITY.md)
-- [Oracle support](ORACLE.md)
-- [ClickHouse: overview and PostgreSQL integration](CLICKHOUSE.md)
-- [Tracking and Marts](TRACKING_AND_MARTS.md)
-- [Описание ClickHouse на русском](CLICKHOUSE_RU.md)
+- [Compatibility matrix](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md)
+- [Oracle support](https://github.com/pavel-v-sobolev/dbmerge/blob/main/ORACLE.md)
+- [ClickHouse: overview and PostgreSQL integration](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CLICKHOUSE.md)
+- [Tracking and Marts](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TRACKING_AND_MARTS.md)
+- [Описание ClickHouse на русском](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CLICKHOUSE_RU.md)
+- [Development, tests and release checks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CONTRIBUTING.md)

@@ -19,7 +19,7 @@ it changed so marts that missed it wake up. Dedicated change-state rows in the s
 monotonic last-change timestamp per destination and scope. Completion and change publication
 commit together; a later no-op cannot erase an earlier change signal.
 
-The tracking table is created on first use, so a project that never opts into tracking gets no extra
+The tracking table is prepared when MergeTracker is constructed; importing the package creates no
 tables. The feature is built around timezone-aware timestamps and is meant for engines that support
 them (PostgreSQL/CockroachDB first); on other engines recording works, and the heartbeat/boundary
 semantics follow the engine's datetime handling.
@@ -47,8 +47,9 @@ from sqlalchemy import (Boolean, Column, DateTime, Engine, MetaData, String, Tab
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from .dbmerge import IncorrectParameter, logger
+from ._validation import validate_interval
 
-# The default name of the tracking table. Overridable; created lazily on first use.
+# The default name of the tracking table. Overridable; prepared by the constructor.
 TRACKING_TABLE = "dbmerge_tracking"
 
 # How often a running merge refreshes the heartbeat of its row, and how long a heartbeat may stay
@@ -173,7 +174,7 @@ class MergeTracker:
     merge itself is the standard dbmerge context::
 
         with MergeTracker(engine) as tracker:
-            with dbmerge(engine, table_name="orders", data=rows, key=["id"]) as merge:
+            with DBMerge(engine, table_name="orders", data=rows, key=["id"]) as merge:
                 record, result = tracker.exec_merge(merge)
 
     ``exec`` inserts a row before the callable, runs it, and marks the row
@@ -192,8 +193,8 @@ class MergeTracker:
             engine: A SQLAlchemy ``Engine`` for the transactional database that holds the journal.
                 ClickHouse and DuckDB are rejected — they have no cross-process transactional
                 store; track merges into them by passing a PostgreSQL/CockroachDB engine here.
-            table_name: The name of the journal table. It is created lazily on first use, so a
-                project that never opts into tracking gets no extra table.
+            table_name: The name of the journal table, prepared by this constructor.
+                Importing the package alone creates no table.
             schema: The schema (or database on MySQL/MariaDB) holding the journal table. Created if
                 it does not exist; ignored on SQLite, which has no schemas.
             owner: A string identifying this process in the journal's ``owner`` column, for
@@ -209,6 +210,8 @@ class MergeTracker:
             raise IncorrectParameter(f"MergeTracker can not journal on \"{engine.dialect.name}\": it has no "
                                      f"transactional shared store. Track through PostgreSQL/CockroachDB "
                                      f"and pass that engine here.")
+        validate_interval('heartbeat_period', heartbeat_period)
+        validate_interval('heartbeat_ttl', heartbeat_ttl)
         self.engine = engine
         self.owner = owner or _instance_owner("merge")
         self.heartbeat_period = heartbeat_period
@@ -256,7 +259,8 @@ class MergeTracker:
              lease_options=None, lease_handle=None):
         """Track a committed zero-argument write; only False/numeric zero means no change.
 
-        Returns (record, original_result). Consumer watermarks belong to MartLoop, not writes.
+        Returns (record, original_result); raises LeaseBusy if acquisition fails or times out.
+        Consumer watermarks belong to MartLoop, not writes.
         New operations are rejected once close() starts; close waits for active operations.
         """
         with self._idle:
@@ -281,7 +285,7 @@ class MergeTracker:
         The callable receives no arguments and must commit its data before returning. Only an
         explicit ``False`` or numeric zero means no change; None and empty containers mean change.
         ``scope`` is an optional operation category, not a source table or destination identity.
-        Returns ``(MergeRecord, original_result)`` or ``(None, None)`` if a requested lease is busy.
+        Returns ``(MergeRecord, original_result)``; a busy requested lease raises ``LeaseBusy``.
         Exceptions propagate and leave an unfinished operation for ``recover_abandoned``.
         """
         if not callable(operation):
@@ -317,11 +321,8 @@ class MergeTracker:
             if not self._acquire_lease(lease_name, wait=lease_options.wait_lease,
                                        timeout=lease_options.wait_timeout,
                                        interval=lease_options.wait_interval):
-                logger.info('Skipping write to "%s": its lease is held by another process', table_name)
-                if self._mart_scope.get() is not None:
-                    from .lease import LeaseBusy
-                    raise LeaseBusy('Tracked mart write skipped because its lease is busy')
-                return (None, None)
+                from .lease import LeaseBusy
+                raise LeaseBusy('Cannot execute tracked write: its lease is busy or acquisition timed out')
         try:
             if lease_name is not None:
                 lease_handle = self._get_lease().handle(lease_name)
@@ -813,8 +814,13 @@ class MergeTracker:
             exists = self.engine.dialect.has_schema(conn, self.schema)
             conn.commit()
             if not exists:
-                conn.execute(schema.CreateSchema(self.schema))
-                conn.commit()
+                try:
+                    conn.execute(schema.CreateSchema(self.schema))
+                    conn.commit()
+                except DBAPIError:
+                    conn.rollback()
+                    if not self.engine.dialect.has_schema(conn, self.schema):
+                        raise
 
     def _ensure_table(self) -> None:
         inspector = inspect(self.engine)
@@ -839,7 +845,13 @@ class MergeTracker:
             return
         # The existence check and the CREATE stay in separate transactions: the table is known to be
         # missing, and a CREATE alone in its transaction is what CockroachDB requires.
-        self.table.create(self.engine, checkfirst=False)
+        try:
+            self.table.create(self.engine, checkfirst=False)
+        except DBAPIError:
+            if not inspect(self.engine).has_table(self.table.name, self.table.schema):
+                raise
+            # Re-run column migration against the table created by the other process.
+            self._ensure_table()
 
     def _db_now(self) -> datetime:
         with self.engine.connect() as conn:
