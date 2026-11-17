@@ -15,6 +15,7 @@ A single worker processes changes between rebuild blocks, not in a background th
 """
 
 from datetime import date
+from time import time_ns
 
 from sqlalchemy import and_, tuple_
 
@@ -28,7 +29,7 @@ class ProductDailySalesClickHouse(MartHandler):
     def setup(self, ctx):
         for statement in (
             """CREATE TABLE IF NOT EXISTS product_daily_sales (
-                "Date" Date, "Product" UInt64, "Amount" Decimal(18, 2),
+                "Date" Date, "Product" UInt64, "Amount" Nullable(Decimal(18, 2)),
                 is_deleted UInt8, order_ids Array(Int64), version UInt64,
                 merged_on DateTime64(6, 'UTC'), inserted_on DateTime64(6, 'UTC')
             ) ENGINE = ReplacingMergeTree(version) ORDER BY ("Date", "Product")""",
@@ -41,23 +42,13 @@ class ProductDailySalesClickHouse(MartHandler):
                        assumeNotNull(merged_on) AS merged_on
                 FROM source_pg.orders""",
             """CREATE OR REPLACE VIEW product_daily_sales_view AS
-                WITH groups AS (
-                    SELECT "Date", "Product" FROM product_daily_sales_rows_view
-                    UNION DISTINCT
-                    SELECT "Date", "Product" FROM product_daily_sales FINAL
-                ), totals AS (
-                    SELECT "Date", "Product",
-                           sumIf("Amount", NOT is_deleted) AS "Amount",
-                           countIf(NOT is_deleted) AS active_count,
-                            arraySort(groupArray("Order")) AS order_ids
-                    FROM product_daily_sales_rows_view GROUP BY "Date", "Product"
-                )
-                SELECT g."Date", g."Product",
-                       CAST(ifNull(t."Amount", 0) AS Decimal(18, 2)) AS "Amount",
-                       toUInt8(ifNull(t.active_count, 0) = 0) AS is_deleted,
-                       ifNull(t.order_ids, CAST([] AS Array(Int64))) AS order_ids,
+                SELECT "Date", "Product", sum("Amount") AS "Amount",
+                       toUInt8(0) AS is_deleted,
+                       arraySort(groupArray("Order")) AS order_ids,
                        toUInt64(toUnixTimestamp64Micro(now64(6))) AS version
-                FROM groups g LEFT JOIN totals t USING ("Date", "Product")""",
+                FROM product_daily_sales_rows_view
+                WHERE NOT is_deleted GROUP BY "Date", "Product"
+            """,
         ):
             self.execute(ctx, statement)
 
@@ -87,11 +78,13 @@ class ProductDailySalesClickHouse(MartHandler):
         with DBMerge(ctx.engine, tracker=ctx.tracker, lease_handle=ctx.lease_handle,
                      table_name='product_daily_sales',
                      source_table_name='product_daily_sales_view',
-                     key=['Date', 'Product'], delete_mode='no',
+                     key=['Date', 'Product'], delete_mode='mark', delete_mark_field='is_deleted',
+                     delete_mark_values={'Amount': None, 'version': time_ns() // 1000},
                      merged_on_field='merged_on', inserted_on_field='inserted_on') as merge:
             key = tuple_(merge.source_table.c.Date, merge.source_table.c.Product)
             # PostgreSQL's lease predicate cannot be evaluated inside ClickHouse SQL.
-            merge.exec(source_condition=key.in_(groups))
+            target_key = tuple_(merge.table.c.Date, merge.table.c.Product)
+            merge.exec(source_condition=key.in_(groups), delete_condition=target_key.in_(groups))
 
     def rebuild(self, ctx):
         periods = self.query(ctx, """
@@ -110,11 +103,14 @@ class ProductDailySalesClickHouse(MartHandler):
             with DBMerge(ctx.engine, tracker=ctx.tracker, lease_handle=ctx.lease_handle,
                          table_name='product_daily_sales',
                          source_table_name='product_daily_sales_view',
-                         key=['Date', 'Product'], delete_mode='no',
+                         key=['Date', 'Product'], delete_mode='mark', delete_mark_field='is_deleted',
+                         delete_mark_values={'Amount': None, 'version': time_ns() // 1000},
                          merged_on_field='merged_on', inserted_on_field='inserted_on',
                          use_safe_border=True) as merge:
                 day = merge.source_table.c.Date
-                merge.exec(source_condition=and_(day >= period, day < ends))
+                merge.exec(source_condition=and_(day >= period, day < ends),
+                           delete_condition=and_(merge.table.c.Date >= period,
+                                                 merge.table.c.Date < ends))
             yield label
 
 

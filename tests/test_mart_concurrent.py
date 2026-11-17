@@ -295,7 +295,8 @@ def test_sql_variant_writes_through_dbmerge_with_full_guard(concurrent):
         assert execute.call_count == 1
         merge = execute.call_args.args[0]
         kwargs = execute.call_args.kwargs
-        assert merge.delete_mode == 'no'
+        assert merge.delete_mode == 'mark'
+        assert merge.delete_mark_values == {'Amount': None}
         assert merge.source_table_name == 'product_daily_sales_view'
         assert kwargs['source_condition'] is not None
         assert merge.merged_on_field == 'merged_on'
@@ -387,6 +388,9 @@ def test_sql_direct_view_rebuild_preserves_applied_changes(concurrent, action):
     write(statement)
     assert change_loop.run_if_pending()
     expected = totals(changes)
+    deleted = [amount for amount, is_deleted in expected.values() if is_deleted]
+    assert all(amount is None for amount in deleted)
+    assert bool(deleted) == (action in ('delete', 'soft_delete', 'move', 'date_move'))
     request_rebuild(full.engine, full.destination, schema=tracker.schema)
     assert full_loop.run_if_pending()
     assert totals(full) == expected

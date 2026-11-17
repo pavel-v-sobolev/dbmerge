@@ -127,9 +127,15 @@ def test_product_daily_sales_example():
         change(f'DELETE FROM {source}.orders WHERE "Order" IN (1, 2)')
         assert loop.run_if_pending()
         assert read() == [(date(2026, 11, 16), 20, 30), (date(2026, 11, 17), 10, 70)]
+        with engine.connect() as conn:
+            assert conn.exec_driver_sql('''SELECT "Amount" FROM product_daily_sales FINAL
+                                          WHERE is_deleted''').all() == [(None,)]
         request_rebuild(pg, handler.destination, schema=state)
         assert loop.run_if_pending()
         assert read() == [(date(2026, 11, 16), 20, 30), (date(2026, 11, 17), 10, 70)]
+        with engine.connect() as conn:
+            assert conn.exec_driver_sql('''SELECT "Amount" FROM product_daily_sales FINAL
+                                          WHERE is_deleted''').all() == [(None,)]
     finally:
         if loop is not None:
             loop.close()

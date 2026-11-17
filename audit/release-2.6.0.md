@@ -81,6 +81,14 @@ Wheel установлен вне checkout без optional dependencies; про�
 
 ## Чек-лист выпуска
 
+По запросу пользователя оба примера переведены на `delete_mode='mark'` и
+`delete_mark_values={'Amount': None}`. View выдаёт только активные группы;
+delete_condition ограничивает затронутые ключи/месяц rebuild. Amount nullable,
+ClickHouse дополнительно обновляет version tombstone. Проверены PostgreSQL
+concurrency (**14 passed, 7 skipped**) и mart-тесты ClickHouse 23.8/25.8
+(**3 passed** каждый), включая NULL в удалённой строке после rebuild.
+Архивы выше предшествуют этому изменению и должны быть пересобраны.
+
 Первый push: `ced0239`. Серверный CI выявил исчерпание PostgreSQL connection pool
 на ClickHouse 23.8 из-за многократного раскрытия вложенного changed-groups SELECT.
 Исправление: один раз прочитать ключи затронутых групп перед merge; агрегаты

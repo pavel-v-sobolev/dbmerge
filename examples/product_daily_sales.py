@@ -26,7 +26,7 @@ class ProductDailySales(MartHandler):
             CREATE TABLE IF NOT EXISTS {schema}.product_daily_sales (
                 "Date" DATE NOT NULL,
                 "Product" INTEGER NOT NULL,
-                "Amount" NUMERIC NOT NULL,
+                "Amount" NUMERIC,
                 is_deleted BOOLEAN NOT NULL,
                 merged_on TIMESTAMPTZ,
                 inserted_on TIMESTAMPTZ,
@@ -40,23 +40,11 @@ class ProductDailySales(MartHandler):
             CREATE INDEX IF NOT EXISTS ix_orders_merged_on ON {schema}.orders (merged_on);
 
             CREATE OR REPLACE VIEW {schema}.product_daily_sales_view AS
-            WITH groups AS (
-                SELECT "Date", "Product" FROM {schema}.orders
-                UNION
-                SELECT "Date", "Product" FROM {schema}.product_daily_sales
-            ), totals AS (
-                SELECT "Date", "Product",
-                       SUM("Amount") FILTER (WHERE NOT is_deleted) AS "Amount",
-                       COUNT(*) FILTER (WHERE NOT is_deleted) AS active_count,
-                       array_agg("Order" ORDER BY "Order") AS order_ids
-                  FROM {schema}.orders
-                 GROUP BY "Date", "Product"
-            )
-            SELECT g."Date", g."Product",
-                   COALESCE(t."Amount", 0) AS "Amount",
-                   COALESCE(t.active_count, 0) = 0 AS is_deleted,
-                   COALESCE(t.order_ids, ARRAY[]::bigint[]) AS order_ids
-              FROM groups g LEFT JOIN totals t USING ("Date", "Product");
+            SELECT "Date", "Product", SUM("Amount") AS "Amount",
+                   false AS is_deleted, array_agg("Order" ORDER BY "Order") AS order_ids
+              FROM {schema}.orders
+             WHERE NOT is_deleted
+             GROUP BY "Date", "Product";
         """
 
     def groups_to_handle_sql(self, ctx):
@@ -99,12 +87,15 @@ class ProductDailySales(MartHandler):
         with DBMerge(ctx.engine, tracker=ctx.tracker, lease_handle=ctx.lease_handle,
                      table_name='product_daily_sales', schema=schema,
                      source_table_name='product_daily_sales_view', source_schema=schema,
-                     key=['Date', 'Product'], delete_mode='no',
+                     key=['Date', 'Product'], delete_mode='mark',
+                     delete_mark_field='is_deleted', delete_mark_values={'Amount': None},
                      data_types={'merged_on': DateTime(timezone=True),
                                  'inserted_on': DateTime(timezone=True)},
                      merged_on_field='merged_on', inserted_on_field='inserted_on') as merge:
             source_key = tuple_(merge.source_table.c.Date, merge.source_table.c.Product)
-            merge.exec(source_condition=source_key.in_(groups_to_handle))
+            target_key = tuple_(merge.table.c.Date, merge.table.c.Product)
+            merge.exec(source_condition=source_key.in_(groups_to_handle),
+                       delete_condition=target_key.in_(groups_to_handle))
 
     def rebuild(self, ctx):
         schema = next(iter(self.sources))[0]
@@ -117,7 +108,8 @@ class ProductDailySales(MartHandler):
             with DBMerge(ctx.engine, tracker=ctx.tracker, lease_handle=ctx.lease_handle,
                          table_name='product_daily_sales', schema=schema,
                          source_table_name='product_daily_sales_view', source_schema=schema,
-                         key=['Date', 'Product'], delete_mode='no',
+                         key=['Date', 'Product'], delete_mode='mark',
+                         delete_mark_field='is_deleted', delete_mark_values={'Amount': None},
                          data_types={'merged_on': DateTime(timezone=True),
                                      'inserted_on': DateTime(timezone=True)},
                          merged_on_field='merged_on', inserted_on_field='inserted_on',
@@ -125,7 +117,7 @@ class ProductDailySales(MartHandler):
                 condition = and_(merge.table.c.Date >= period,
                                  merge.table.c.Date < ends)
                 merge.exec(
-                    update_condition=condition,
+                    update_condition=condition, delete_condition=condition,
                     source_condition=and_(merge.source_table.c.Date >= period,
                                           merge.source_table.c.Date < ends))
             yield label

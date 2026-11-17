@@ -608,7 +608,12 @@ inlining that nested query can exhaust the external PostgreSQL connection pool
 on ClickHouse 23.8. Aggregate rows are still loaded directly by ClickHouse.
 Rebuild iterates monthly blocks; changes selects only affected composite keys.
 
-The aggregate view retains tombstones and the merge uses `delete_mode="no"`.
+The aggregate view contains active groups only. Both refresh paths use
+`delete_mode="mark"`, `delete_mark_field="is_deleted"` and
+`delete_mark_values={"Amount": None}` (plus a new tombstone version in ClickHouse).
+Missing groups retain their keys and order IDs, but their `Amount` becomes SQL
+`NULL`, not zero. Deletion is limited to affected keys, or the current rebuild
+month, so unrelated groups remain untouched. The destination `Amount` is nullable.
 Rebuild guards existing rows by timestamps and lease ownership; changes uses the
 lease guard. These guards do not fence concurrent missing-row insertion races.
 Hard deletion before a group's first publication leaves no retained ID; use soft
