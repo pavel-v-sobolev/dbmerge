@@ -366,8 +366,10 @@ def engine(request):
 
 @pytest.fixture()
 def tracker(engine):
+    # Functional mart tests must tolerate CI scheduling pauses. Expiry contracts
+    # are tested separately with explicitly aged heartbeats in test_tracking.py.
     tr = MergeTracker(engine, table_name=f"tracking_{uuid.uuid4().hex[:8]}",
-                      schema=_schema(engine), heartbeat_period=0.05, heartbeat_ttl=1.0)
+                      schema=_schema(engine), heartbeat_period=0.05, heartbeat_ttl=30.0)
     yield tr
     tr.close()
 
@@ -949,9 +951,7 @@ def test_shared_tracker_parallel_marts_keep_scopes_and_ownership(engine, tracker
     barrier = Barrier(2)
     seen = []
 
-    # This checks shared ownership/scope isolation, not lease expiry. SQL Server
-    # deadlock detection alone can outlast the fixture's one-second test TTL.
-    tracker.heartbeat_ttl = 30.0
+    # This checks shared ownership/scope isolation, not lease expiry.
 
     class M(MartHandler):
         sources = ['shared_source']
