@@ -98,10 +98,6 @@ with DBMerge(engine=engine, data=data, table_name="Facts",
              key=['Shop', 'Product', 'Date']) as merge:
     result = merge.exec()
 
-print(result.inserted_row_count)  # 2 on this fresh in-memory database
-with engine.connect() as connection:
-    print(connection.execute(text('SELECT COUNT(*) FROM "Facts"')).scalar_one())  # 2
-engine.dispose()
 ```
 
 This example uses only SQLite and SQLAlchemy: no database server, pandas or
