@@ -26,10 +26,10 @@ DBMERGE_TEST_ENGINES=sqlite .venv/bin/python -m pytest \
   tests/test_documentation.py tests/test_mart_runner.py tests/test_db_hooks.py -q
 ```
 
-Documentation checks compile Python snippets and check local file links, API
-parameter coverage and source-distribution inclusion. They execute the SQLite
-quick start and user guide. They do **not** execute all server-dependent snippets,
-check remote URLs or validate Markdown anchor fragments.
+Documentation checks parse Python snippets, check local file links and Markdown
+heading anchors, and verify API parameter coverage and source-distribution
+inclusion. They execute the SQLite quick start, user guide and merge recipes.
+They do not fetch external URLs or execute server-dependent examples.
 
 ## Full SQLite checks
 
@@ -69,6 +69,6 @@ git diff --check
 
 Before publishing: review the changelog and version, run the server CI matrix,
 install the built wheel in a clean environment, and verify both `DBMerge` and
-the legacy `dbmerge` alias. Keep the logger name `dbmerge`. Review version notes
-in the README and `llms.txt` when the new export becomes a released API.
-Do not publish an audit build carrying an already released version number.
+the legacy `dbmerge` alias. Keep the logger name `dbmerge`. Update feature-version
+notes in the README and `llms.txt` when moving changes out of `Unreleased`.
+Do not publish a build carrying an already released version number.

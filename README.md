@@ -6,8 +6,7 @@
   </picture>
 </p>
 
-**DBMerge** is a Python library that provides a simplified interface for performing `UPSERT` (Insert/Update/Delete) operations. \
-Built on top of SQLAlchemy, it abstracts away engine-specific SQL `MERGE` or `ON CONFLICT` statements.
+**DBMerge** is a Python library for bulk **UPSERT** across SQL databases: it inserts new rows and updates existing rows only when their values change. For snapshot synchronization, it can also delete or mark target rows missing from the source. The same Python API works across supported databases without dialect-specific merge statements in your code.
 
 [![PyPI version](https://img.shields.io/pypi/v/dbmerge.svg)](https://pypi.org/project/dbmerge/)
 [![Python versions](https://img.shields.io/pypi/pyversions/dbmerge.svg)](https://pypi.org/project/dbmerge/)
@@ -25,7 +24,7 @@ Built on top of SQLAlchemy, it abstracts away engine-specific SQL `MERGE` or `ON
 **DBMerge accepts multiple data sources as input:**
 - Pandas/Polars DataFrame
 - Lists of dictionaries / Dictionary of Lists
-- Database table or view
+- Database table, view, or SQL query (`source_query`, since 2.7.0)
 
 DBMerge automates data update process by comparing your source data against the target table and automatically performing the required operations.
 
@@ -111,17 +110,18 @@ enable deletion for a partial snapshot without a `delete_condition`.
 
 | Task | Start here |
 |---|---|
-| Insert/update Python data | Quick start above, then [input and options](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#class-dbmerge) |
-| Synchronize one period or partition | [Scoped deletion and risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#data-loss-risks) |
-| Merge from a table or view | [API reference](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md) (`source_table_name`) |
-| Coordinate writers or refresh marts | [Tracking and marts](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TRACKING_AND_MARTS.md) (**beta**) |
-| Select a database driver | [Compatibility matrix](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md) |
-| Use ClickHouse or Oracle | [ClickHouse guide](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CLICKHOUSE.md), [Oracle guide](https://github.com/pavel-v-sobolev/dbmerge/blob/main/ORACLE.md) |
+| Load new and changed rows without deleting anything | Quick start above |
+| Make a target table match a full snapshot | [Full snapshot](https://github.com/pavel-v-sobolev/dbmerge/blob/main/GUIDES.md#full-snapshot) |
+| Reconcile one month, shop, or tenant from a complete snapshot | [Scoped snapshot](https://github.com/pavel-v-sobolev/dbmerge/blob/main/GUIDES.md#scoped-snapshot) |
+| Refresh a table from a SQL table, view, or query | [SQL sources](https://github.com/pavel-v-sobolev/dbmerge/blob/main/GUIDES.md#sql-sources) |
+| Load PostgreSQL data directly into ClickHouse | [PostgreSQL to ClickHouse](https://github.com/pavel-v-sobolev/dbmerge/blob/main/POSTGRESQL_TO_CLICKHOUSE.md) |
+| Refresh a derived table when its sources change (**beta**) | [Marts](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TRACKING_AND_MARTS.md#marts) |
+| Track merges and coordinate concurrent writers (**beta**) | [Tracking and leases](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TRACKING_AND_MARTS.md#tracking) |
 
 ## Key Features
 
-- **Database Agnostic:** Write your synchronization logic once and run it across different SQL databases without modifying the code.
-- **High Performance:** Uses temporary staging tables for fast bulk operations rather than slow row-by-row changes.
+- **Portable API:** The same merge workflow runs across supported backends. Column types, transaction guarantees and native loaders vary by database.
+- **Set-based writes:** Loads a staging table and reconciles rows in bulk; the loader and staging lifetime depend on the backend.
 - **Smart Deletion:** Supports scoped deletion. You can pass a SQLAlchemy logical expression to delete missing data only within a specific timeframe or subset (e.g., updating only a single month).
 - **Auto-Schema Management:** Automatically creates missing tables or columns in the database.
 - **Audit:** Optional parameters to automatically add `merged_on` and `inserted_on` timestamps to track when rows were created or modified.
@@ -164,15 +164,15 @@ The staging table is loaded in bulk where the driver allows it: `COPY FROM STDIN
 - **SQLite:** Does not support schemas. If a schema setting is provided, it is automatically reset to `None` with a warning.
 - **MS SQL Server:** Use `pyodbc` or `mssql-python` for a fast staging load. `pymssql` loads row by row and keeps milliseconds only.
 - **CockroachDB:** Uses the official `sqlalchemy-cockroachdb` dialect (over `psycopg2` or `psycopg`); speaks the PostgreSQL wire protocol.
-  - `exec(commit_all_steps=False)` is noticeably faster here. On a single-node instance, merging 200 000 rows took ~6s against ~16s with the default, because one commit costs a consensus round regardless of how much it carries. The update phase showed no difference. It also makes the merge all-or-nothing; the trade-off is one larger transaction, which raises the chance of a serialization retry.
-- **Oracle:** Through `python-oracledb` (`pip install dbmerge[oracle]`), tested on XE 21c in Thin mode. The staging table is a `GLOBAL TEMPORARY` table loaded with array DML; `bulk_load=True` drives the cursor directly. Inferred strings become `CLOB` (a string key needs an explicit `String(length)`), inferred datetimes become `TIMESTAMP` to keep microseconds, and inferred floats become `BINARY_DOUBLE`. Native JSON and `LONG` columns are not supported, and schemas are existing Oracle users — dbmerge never creates them. See [Oracle support](https://github.com/pavel-v-sobolev/dbmerge/blob/main/ORACLE.md).
+  - `exec(commit_all_steps=False)` groups data writes in one transaction, not DDL. On a single-node benchmark, merging 200,000 rows took ~6s versus ~16s with step commits; the update phase showed no difference. A larger transaction can require a serialization retry.
+- **Oracle:** Through `python-oracledb` (`pip install dbmerge[oracle]`), tested on XE 21c in Thin mode. Staging uses a `GLOBAL TEMPORARY` table and array DML. Inferred strings become `CLOB` (a string key needs an explicit `String(length)`), datetimes become `TIMESTAMP`, and floats become `BINARY_DOUBLE`. DBMerge does not create Oracle users. See [Oracle support](https://github.com/pavel-v-sobolev/dbmerge/blob/main/ORACLE.md) for JSON, LOB and other type limitations.
 - **DuckDB:** Use a database file: with `duckdb:///:memory:` every connection gets a database of its own.
 - **ClickHouse:** Through `clickhouse-connect` (`pip install dbmerge[clickhouse]`). The target must be a `ReplacingMergeTree` ordered by the merge key; a changed row is written as a new version, so read the table with `FINAL`. See [ClickHouse](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#clickhouse).
 
 ## Data Loss Risks
 
 DBMerge modifies your target table in bulk, and three deliberate design trade-offs that may have negative effects on your data:
-- `delete_mode='delete'` without `delete_condition` treats the source as a **complete** snapshot (an empty source wipes the table).
+- `delete_mode='delete'` or `'mark'` without `delete_condition` treats the source as a **complete** snapshot. An accepted empty source affects every target row.
 - automatic schema creation with default `can_create_table=True` and `can_create_columns=True` infers column types from a sample of your data.
 - default `commit_all_steps=True` commits each phase separately, so a failure leaves a partial result.
 
@@ -182,7 +182,7 @@ Read [Data Loss Risks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCU
 
 Beyond a single merge, DBMerge ships two optional layers that turn merges into a coordinated pipeline:
 
-- **`MergeTracker`** (`dbmerge.tracking`) journals every merge into one table, so a downstream consumer can ask when a table last changed (`is_changed_since`, `last_merge`), up to which moment the data is settled (`safe_boundary`), and whether a merge is running right now.
+- **`MergeTracker`** (`dbmerge.tracking`) journals opted-in writes. Consumers can ask whether a table changed since a timestamp (`is_changed_since`), inspect its last finished operation (`last_merge`), or bound their progress while a tracked writer is active (`safe_boundary`).
 - **`MartLoop`** (`dbmerge.mart`) registers a derived table (a *mart*), performs an initial rebuild without requiring a journal change, then refreshes it when its declared sources change. Sources must be ready before enabling the loop.
 
 See [Tracking and Marts](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TRACKING_AND_MARTS.md) for the full reference and [examples/product_daily_sales.py](https://github.com/pavel-v-sobolev/dbmerge/blob/main/examples/product_daily_sales.py) for a ready-to-run template.
@@ -190,10 +190,10 @@ See [Tracking and Marts](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TR
 ## Documentation
 
 - [Full Module Documentation](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md)
+- [Merge recipes](https://github.com/pavel-v-sobolev/dbmerge/blob/main/GUIDES.md)
 - [Advanced Examples (Python)](https://github.com/pavel-v-sobolev/dbmerge/blob/main/user_guide.py)
 - [Compatibility matrix](https://github.com/pavel-v-sobolev/dbmerge/blob/main/COMPATIBILITY.md)
 - [Oracle support](https://github.com/pavel-v-sobolev/dbmerge/blob/main/ORACLE.md)
-- [ClickHouse: overview and PostgreSQL integration](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CLICKHOUSE.md)
+- [ClickHouse guide](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CLICKHOUSE.md) ([RU](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CLICKHOUSE_RU.md))
 - [Tracking and Marts](https://github.com/pavel-v-sobolev/dbmerge/blob/main/TRACKING_AND_MARTS.md)
-- [Описание ClickHouse на русском](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CLICKHOUSE_RU.md)
 - [Development, tests and release checks](https://github.com/pavel-v-sobolev/dbmerge/blob/main/CONTRIBUTING.md)

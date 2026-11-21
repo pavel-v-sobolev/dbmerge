@@ -3,13 +3,12 @@
 from sqlalchemy.sql import COLLECT_CARTESIAN_PRODUCTS
 
 
-def validate_source_select(statement):
+def validate_source_select(statement, dialect=None):
     # Use SQLAlchemy's own FROM graph: it understands aliases, explicit JOINs,
     # WHERE links and correlation. Collect only: warning filters must not disable
     # the check, and unrelated cartesian products inside subqueries are not ours
-    # to reject. Compile with the standard dialect, including for ClickHouse's
-    # custom execution path, so no driver or connection is needed.
-    compiled = statement.compile(linting=COLLECT_CARTESIAN_PRODUCTS)
+    # to reject. A caller-supplied query may need its dialect to compile.
+    compiled = statement.compile(dialect=dialect, linting=COLLECT_CARTESIAN_PRODUCTS)
     disconnected, _ = compiled.from_linter.lint()
     if disconnected:
         from .dbmerge import IncorrectParameter

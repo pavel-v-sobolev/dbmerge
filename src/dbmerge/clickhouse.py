@@ -361,7 +361,8 @@ def create_temp_table(merge: DBMerge, temp_table_name):
     else:
         merge.client.command(f'CREATE TABLE {_table_name(merge, merge.temp_schema, temp_table_name)} '
                              f'({columns_sql}) ENGINE = MergeTree ORDER BY tuple()')
-    merge.temp_table = Table(temp_table_name, merge.metadata, *columns, schema=merge.temp_schema)
+    merge.temp_table = Table(temp_table_name, merge.metadata, *columns, schema=merge.temp_schema,
+                             info={'session_temporary': merge.temp_schema is None})
 
 
 def insert_data_to_temp(merge: DBMerge):
@@ -370,7 +371,10 @@ def insert_data_to_temp(merge: DBMerge):
     # dicts and lists headed for a string column go there as JSON text
     json_fields = {f for f in fields if _base_type_name(merge.temp_table.c[f].type.name) == 'String'}
 
-    if pa is not None:
+    # Arrow serializes a Python Point pair as a list; ClickHouse cannot cast
+    # that Array to Point (a Tuple). The native protocol writes the pair directly.
+    has_point = any(merge.temp_table.c[f].type.name == 'Point' for f in fields)
+    if pa is not None and not has_point:
         time_zones = _naive_time_zones(merge)
         for begin in range(0, merge.total_row_count, merge.chunk_size):
             end = min(begin + merge.chunk_size, merge.total_row_count)
@@ -380,7 +384,8 @@ def insert_data_to_temp(merge: DBMerge):
     else:
         # The native protocol refuses a None for a non-nullable column on the client side. A naive datetime it
         # converts by the time zone of the client, so it is pinned to that of the column first, as above.
-        warn_without_pyarrow(merge.dialect_name)
+        if pa is None:
+            warn_without_pyarrow(merge.dialect_name)
         processors = {f: _localizer(zone) for f, zone in _naive_time_zones(merge).items()}
         for begin in range(0, merge.total_row_count, merge.chunk_size):
             end = min(begin + merge.chunk_size, merge.total_row_count)
@@ -390,10 +395,30 @@ def insert_data_to_temp(merge: DBMerge):
     merge.temp_insert_time = time.perf_counter() - start_time
 
 
+def describe_source_query(merge: DBMerge, statement):
+    # Unlike a zero-row native SELECT, DESCRIBE returns types even for an empty query.
+    sql, parameters, settings = _prepared(merge, statement)
+    result = merge.client.query(f'DESCRIBE TABLE ({sql})', parameters=parameters, settings=settings)
+    return [(name, sqla_type_from_name(type_name)) for name, type_name, *_ in result.result_rows]
+
+
 def insert_source_table_to_temp(merge: DBMerge):
     # The source is any table or view ClickHouse can read, a table of a PostgreSQL or MySQL database engine
     # among them: the server copies it into the staging table itself.
     start_time = time.perf_counter()
+    if getattr(merge, 'source_query', None) is not None:
+        from ._source_query import select_rows
+        rows = select_rows(merge)
+    else:
+        rows = _source_table_select(merge)
+    statement = insert(merge.temp_table).from_select(list(merge.data_fields), rows)
+    # insert_null_as_default=0: a NULL for a column that is not Nullable is refused, as it is in data
+    # (LOAD_SETTINGS); INSERT ... SELECT would store 0, '' or 1970-01-01 in its place otherwise.
+    _, merge.total_row_count = _insert(merge, statement, settings={'insert_null_as_default': 0})
+    merge.temp_insert_time = time.perf_counter() - start_time
+
+
+def _source_table_select(merge):
     source = merge.source_table
     engine = source.info['clickhouse']['engine']
     rows = select(*[source.c[f] for f in merge.data_fields])
@@ -408,11 +433,7 @@ def insert_source_table_to_temp(merge: DBMerge):
         rows = final(rows, source)
     from ._source_select import validate_source_select
     validate_source_select(rows)
-    statement = insert(merge.temp_table).from_select(list(merge.data_fields), rows)
-    # insert_null_as_default=0: a NULL for a column that is not Nullable is refused, as it is in data
-    # (LOAD_SETTINGS); INSERT ... SELECT would store 0, '' or 1970-01-01 in its place otherwise.
-    _, merge.total_row_count = _insert(merge, statement, settings={'insert_null_as_default': 0})
-    merge.temp_insert_time = time.perf_counter() - start_time
+    return rows
 
 
 def _subqueries_as_values(merge: DBMerge, condition):

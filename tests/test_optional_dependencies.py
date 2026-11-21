@@ -31,3 +31,30 @@ assert not {'pandas', 'polars', 'pyarrow'} & set(sys.modules)
     completed = subprocess.run([sys.executable, '-c', script], capture_output=True,
                                text=True, timeout=30)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_import_filters_only_the_clickhouse_alias_warning():
+    script = '''
+import sys
+import warnings
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter('always')
+    import dbmerge
+
+    alias_warning = (
+        "The 'clickhouse://' URL remains registered to another SQLAlchemy dialect. "
+        "ClickHouse Connect is available through 'clickhousedb://' or 'clickhousedb+connect://'."
+    )
+    warnings.warn(alias_warning, UserWarning)
+    warnings.warn('Unrelated ClickHouse warning', UserWarning)
+    warnings.warn(alias_warning, RuntimeWarning)
+
+assert [(str(item.message), item.category) for item in caught] == [
+    ('Unrelated ClickHouse warning', UserWarning), (alias_warning, RuntimeWarning),
+], caught
+assert not any(name == 'clickhouse_connect' or name.startswith('clickhouse_connect.') for name in sys.modules)
+'''
+    completed = subprocess.run([sys.executable, '-c', script], capture_output=True,
+                               text=True, timeout=30)
+    assert completed.returncode == 0, completed.stdout + completed.stderr

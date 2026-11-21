@@ -1,6 +1,6 @@
 # DBMerge API Documentation
 
-The `dbmerge` module provides a simple, robust interface for merging data into SQL database tables. The core functionality is encapsulated within the `DBMerge` class, which is designed to be used as a context manager to ensure safe resource handling and connection closure.
+`DBMerge` performs bulk UPSERT by key: it inserts new rows and updates changed rows. It can also delete or mark missing rows when explicitly configured. Use it as a context manager so staging and connection resources are cleaned up. For runnable examples, see [DBMerge recipes](GUIDES.md).
 
 ---
 
@@ -15,19 +15,21 @@ no changes.
 The initialization method prepares the database and internal structures before the actual merge operation occurs. 
 
 **Key Preparation Steps:**
-1. Verifies the existence of the target table. If it does not exist, it is automatically created.
-2. Inspects existing table fields. Missing columns are automatically created based on the provided or auto-detected data types.
-3. Creates a temporary table to ensure the merge operation is executed with optimal performance. The temporary table is safely dropped when the context manager exits.
+1. Inspects the target table and creates it if missing and `can_create_table=True`.
+2. Adds missing columns if `can_create_columns=True`, using supplied or inferred types.
+3. Creates a staging table. Preparation may commit DDL before `exec()` is called, even if execution later fails or cannot acquire a lease.
 
 **Recommended Usage (Context Manager):**
 ```python
 from dbmerge import DBMerge
 
-with DBMerge(engine=engine, data=data, table_name="YourTable") as merge:
+with DBMerge(engine=engine, data=data, table_name="YourTable", key=["id"]) as merge:
     result = merge.exec()
 ```
 
 #### Arguments
+
+Supply exactly one input: `data`, `source_table_name`, or `source_query`.
 
 - **`tracker`** *(MergeTracker | None, optional)*: Caller-owned journal. `None` disables tracking. Construct and close it with a context manager; see [tracking and leases](#optional-merge-tracking-and-leases).
 - **`lease_options`** *(LeaseOptions | None, optional)*: Enable an execution lease; requires `tracker`. A busy lease or acquisition timeout raises `LeaseBusy` from `exec()`. Constructor DDL is outside this lease.
@@ -41,7 +43,7 @@ with DBMerge(engine=engine, data=data, table_name="YourTable") as merge:
   - `'delete'`: Hard delete rows from the target table.
   - `'mark'`: Soft delete rows by setting a flag in `delete_mark_field`.
   
-  > ⚠️ With `'delete'` or `'mark'`, **every** target row missing from the source is affected. If the source covers only part of the table (or is empty), restrict the scope with the `delete_condition` argument of `exec()` — otherwise an empty source with `delete_mode='delete'` wipes the entire table.
+  > Use `'delete'` or `'mark'` only for a complete snapshot of the intended scope. For a complete slice, pass `delete_condition` to `exec()`. For an incremental batch, leave `delete_mode='no'`.
 - **`delete_mark_field`** *(str, optional)*: The column used to flag a record as deleted. Must be a **Boolean** or **Integer** column. A row missing from the source is set to `True`/`1`; inserted or resurrected (reappeared) rows are set to `False`/`0`, so a flag DBMerge manages is never `NULL`. If this column is present in the incoming `data`, the supplied value is used as-is, `NULL` included. It must be a column of its own: it cannot be part of `key`, nor the same column as `merged_on_field` or `inserted_on_field`. On MySQL/MariaDB a `BOOLEAN` column is really `TINYINT(1)` and is read back as an integer, so the flag there is `0`/`1` rather than `False`/`True`.
 - **`delete_mark_values`** *(dict[str, Any] | None, optional)*: Extra columns to write when a row is marked as deleted, as `{column name: value}`. Requires `delete_mode='mark'`. Without it, a marked row keeps the values of the last load that still contained it; with it, you can also record something about the marking itself — for example `delete_mark_values={'load_id': 42}` writes `42` into the `load_id` column of every row that disappeared from the source. The columns must exist in the target table. They cannot be part of `key` (that would rewrite the identity of the row being marked), and `delete_mark_field`, `merged_on_field` and `inserted_on_field` are managed automatically and cannot be listed here either.
 - **`merged_on_field`** *(str | None, optional)*: The name of a timestamp column. Automatically updated to the current datetime whenever a row is inserted, updated, or marked as deleted. This column is always managed automatically: if present in the incoming `data`, the supplied values are ignored.
@@ -56,7 +58,7 @@ with DBMerge(engine=engine, data=data, table_name="YourTable") as merge:
   ```
 
   The difference from `skip_update_fields` is what happens when the row does change: skipped-update columns are still not written and keep their inserted value, skipped-compare columns are written.
-- **`key`** *(list | None, optional)*: A list of column names serving as the unique key to compare source and target tables. If omitted, the module attempts to use the target table's Primary Key. *Note: If the table does not exist yet, this parameter is required to create the Primary Key.*
+- **`key`** *(list | None, optional)*: Column names that uniquely identify each source and target row. If omitted, DBMerge uses the existing target's primary key (`ORDER BY` on ClickHouse). Supply it when creating a target, even if the source table has a key of its own.
 
   The key is always supplied by your data, so a key column DBMerge creates is never a generated one: no `AUTO_INCREMENT`, `SERIAL` or `IDENTITY`. If you want the database to generate surrogate ids, add that column to your schema yourself — it is not part of the merge key.
 - **`data_types`** *(dict[str, types.TypeEngine] | None, optional)*: A dictionary mapping column names to SQLAlchemy data types (e.g., `{'Name': String(100)}`). Used when creating missing tables or columns. If omitted, data types are auto-detected from the source data.
@@ -67,10 +69,12 @@ with DBMerge(engine=engine, data=data, table_name="YourTable") as merge:
 - **`schema`** *(str | None, optional)*: The database schema of the target table. Defaults to `None` (uses the database default schema, e.g., `public` in PostgreSQL). Ignored by SQLite. **Required** for MariaDB/MySQL (must be set to your database name). On ClickHouse it is a database, and defaults to the current database of the connection.
 - **`temp_schema`** *(str | None, optional)*: The schema where the temporary staging table will be created. Defaults to `schema`. The table is named `tmp_<yymmddHHMMSS>_<table>_<hex8>` and dropped when the context manager exits — see [The Staging Table](#the-staging-table) for the naming rules and for how it is created on each engine. Quietly ignored on PostgreSQL and DuckDB, which keep temporary tables in a schema of their own, and on ClickHouse whenever the staging table is a temporary one there.
 - **`source_table_name`** *(str | None, optional)*: If provided, data will be sourced directly from another existing database table or view instead of Python memory. Mutually exclusive with `data` — passing both raises `IncorrectParameter`. A column the target computes itself (`GENERATED ALWAYS AS …`) is left out: the target computes it anyway. On ClickHouse it can also be a table of a PostgreSQL or MySQL database attached to ClickHouse — see [Source tables on ClickHouse](#source-tables-on-clickhouse).
-- **`source_schema`** *(str | None, optional)*: The database schema of the source table or view.
+- **`source_schema`** *(str | None, optional)*: The database schema of the source table or view (only with `source_table_name`).
+- **`source_query`** *(str | SelectBase | TextClause | None, keyword-only)*: Load from a query instead of `data` or `source_table_name`. Do not pass `source_schema` with a query; qualify input tables in the query itself. See [Source queries](#source-queries).
 - **`can_create_table`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target table if it does not exist.
 - **`can_create_columns`** *(bool, optional)*: Defaults to `True`. Allows the module to append missing columns to the target table.
 - **`can_create_schemas`** *(bool, optional)*: Defaults to `True`. Allows the module to automatically create the target schema in the database if it does not exist.
+- **`commit_all_steps`**, **`chunk_size`**, **`bulk_load`**: Constructor defaults for [`exec()`](#execution-exec). For each option, an explicit execution value overrides the constructor; `None` uses the constructor setting. The constructor defaults are `True`, `None` (select the backend/loader default), and `True`, respectively.
 
 #### Exceptions
 
@@ -89,19 +93,19 @@ from dbmerge import IncorrectParameter, IncorrectDataError, NoKeyError, TableNot
 #### Instance Attributes (Available after initialization)
 - **`table`**: The SQLAlchemy `Table` object representing your target table.
 - **`temp_table`**: The SQLAlchemy `Table` object representing the temporary staging table.
-- **`source_table`**: The SQLAlchemy `Table` object representing the source table (only populated if `source_table_name` was provided).
+- **`source_table`**: The source table/view for `source_table_name`, the query subquery for `source_query`, or `None` for Python `data`. Use its `.c` collection for `source_condition`.
 
 ---
 
 ### Execution: `exec()`
 
-This method triggers the actual merge operation based on the configurations passed during initialization.
+Call `exec()` once per merge. After execution completes or fails during the merge phases, open a new instance to run again. If lease acquisition raises `LeaseBusy` before execution starts, the still-open instance can be retried.
 
 **Execution Workflow:**
 1. Inserts the source data into the temporary staging table.
 2. **Update:** Updates existing rows in the target table where field values differ from the temporary table.
 3. **Insert:** Copies rows from the temporary table to the target table that do not currently exist.
-4. **Delete / Mark:** Deletes or marks rows in the target table that are entirely missing from the temporary staging data.
+4. **Delete / Mark (opt-in):** Deletes or marks target rows whose keys are absent from staging, subject to `delete_condition` if supplied.
 
 Because updates run before deletes, a `UNIQUE` constraint on columns other than the key can stop a valid snapshot. When a value moves to another row while the row that holds it now leaves the source — code `'B'` goes from row 2, which is deleted, to row 1 — the update meets the old row 2 still in place and fails with an `IntegrityError`. Such a change takes two merges, or the constraint has to be checked differently.
 
@@ -151,7 +155,8 @@ with DBMerge(data=data, engine=engine, table_name="YourTable") as merge:
 
 #### Arguments
 - **`delete_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used in the `WHERE` clause during the delete/mark phase. Essential for chunked or partitioned data syncs.
-- **`source_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression used to filter the `SELECT` statement when loading data from a `source_table_name`.
+- **`source_condition`** *(ColumnElement, optional)*: Filter the rows from `source_table_name` or the output of `source_query`, using `merge.source_table.c`.
+  For Python `data`, filter the input before constructing the merge.
   Build it on `merge.source_table`, not `merge.table` (the destination). A disconnected
   outer `FROM`, such as a destination-only filter that silently creates a cross join,
   raises `IncorrectParameter` before staging INSERT or destination DML. Linked JOINs,
@@ -160,7 +165,7 @@ with DBMerge(data=data, engine=engine, table_name="YourTable") as merge:
   occurred in the constructor. This validation is not a guarantee of correct filter semantics.
 - **`update_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression added to the `WHERE` clause of the update phase. A target row is updated only when it differs from the source **and** satisfies this condition. Build it on `merge.table` (target) and `merge.temp_table` (staging).
 - **`insert_condition`** *(ColumnElement, optional)*: An SQLAlchemy binary expression added to the `WHERE` clause of the insert phase. A source row missing from the target is inserted only when it also satisfies this condition. Build it on `merge.temp_table` (the row being inserted); to inspect other target rows use a correlated `EXISTS` over `merge.table.alias()`.
-- **`commit_all_steps`** *(bool, optional)*: Defaults to `True`. If `True`, every step (temp insert, target insert, update, delete) is committed immediately. If `False`, a single commit is issued after all steps complete successfully. Must be a real boolean — a string such as `'false'` is rejected rather than silently treated as truthy.
+- **`commit_all_steps`** *(bool | None, optional)*: `None` uses the constructor setting (normally `True`). If `True`, the staging load and each target phase commit separately. If `False`, a transactional backend commits the data once after all phases complete. Pass a boolean, not a string such as `'false'`.
 
   It applies to the **data only**. Schema changes — creating the target table, adding columns, creating and dropping the staging table — are always committed on their own and are never part of the merge transaction, so `commit_all_steps=False` does not make them roll back with the data.
 
@@ -207,7 +212,7 @@ The executed SQL statements are exposed only on the `dbmerge` instance (not in `
 
 ## The Staging Table
 
-Every merge loads its data into a staging table first, and drops it when the context manager exits. The name follows a fixed shape:
+Every merge loads its input into a staging table. DBMerge attempts to drop it after execution or on context exit if execution did not run. The name follows a fixed shape:
 
 ```
 tmp_260823224826_Facts_0472030e
@@ -217,11 +222,11 @@ tmp_260823224826_Facts_0472030e
 └─ fixed prefix marking the table as disposable
 ```
 
-Each part earns its place. The prefix says the table may be deleted; the timestamp says how old it is; the hex suffix means two processes merging into the same table never collide. The timestamp comes **before** the table name deliberately, so that an ordinary listing of the schema sorts by age — which is what anyone cleaning up by hand goes by.
+The prefix identifies staging tables, the timestamp helps estimate their age, and the random suffix reduces collisions between concurrent merges. The timestamp comes **before** the table name so a listing sorted by name groups tables by creation time.
 
 **Why the name carries a timestamp at all:** PostgreSQL records no creation time for a table, so the name is the only place it can live. That is what makes a leftover recognizable — see below.
 
-The timestamp is read from the **database** clock, the same one that fills `merged_on_field`, because the processes reading these names need not share a clock with each other. It therefore follows the same timezone rules as the audit timestamps in the next section: UTC on SQLite, server-local elsewhere.
+The timestamp normally comes from the destination database clock and follows its time zone rules; DBMerge falls back to the local clock if no usable database timestamp is returned. It is independent of the tracking clock used for audit columns during a tracked merge.
 
 **Length.** The whole name is kept within 58 bytes, leaving room under PostgreSQL's 63-byte identifier limit for the `_pkey` suffix it adds to the primary key. Only the middle part — the target table name — is shortened, so the prefix, timestamp and suffix always stay intact and the name stays parsable. Truncation counts bytes, not characters, and never splits a multibyte character:
 
@@ -236,7 +241,7 @@ On PostgreSQL this also keeps the staging data out of `shared_buffers` entirely;
 
 Because PostgreSQL keeps temporary tables in its own per-session schema, `temp_schema` does not apply there and is quietly ignored. The same holds for DuckDB, which keeps them in its `temp` catalog.
 
-**Leftovers** are therefore only possible where the staging table is a regular one — MS SQL Server, CockroachDB, MySQL, and ClickHouse in the cases listed under its section. MySQL gets a regular table because it can not refer to one temporary table twice in a statement (`Can't reopen table`), which an `update_condition` or `insert_condition` built on `merge.temp_table` needs. There the name is what lets you find them:
+**Leftovers** can outlive the session on MS SQL Server, CockroachDB, MySQL, or ClickHouse when staging is a regular table. Oracle's [global temporary table](ORACLE.md#implementation) also leaves a definition if cleanup cannot run, but its rows are session-private. MySQL uses a regular table so statements can reference staging more than once (`Can't reopen table` otherwise). The name helps identify candidates for cleanup. For example, on a backend with PostgreSQL-style catalog and date functions:
 
 ```sql
 -- staging tables older than a day, in creation order
@@ -249,7 +254,7 @@ ORDER BY table_name;
 
 Do not drop a staging table just because it looks old: a long-running merge is still using it. Compare against the age of the merges you actually run.
 
-Should the staging table fail to drop when the merge ends, DBMerge logs a warning with its name rather than raising: the data of a merge that succeeded is committed already, and the error of a merge that failed must not be replaced.
+Should the staging table fail to drop when the merge ends, DBMerge logs a warning with its name only if the table can outlive the database session. A session-scoped `TEMPORARY` table is cleaned up when the session ends. A drop failure does not raise: the data of a merge that succeeded is committed already, and the error of a merge that failed must not be replaced.
 
 ---
 
@@ -257,7 +262,7 @@ Should the staging table fail to drop when the merge ends, DBMerge logs a warnin
 
 Without a tracker, `merged_on_field` and `inserted_on_field` are filled by the destination database's current-time function. With a tracker (including `tracker.exec_merge(merge)`), DBMerge reads the **tracker engine's clock before each write phase** and binds that timestamp into the destination SQL. This avoids using different clocks for the journal and audit columns when, for example, PostgreSQL tracks a ClickHouse merge. Destination column precision/timezone rules still apply; use compatible timestamp types and UTC sessions across engines. `inserted_on_field` remains unchanged on updates.
 
-This is deliberate. The timestamp then reflects the moment the database applied the change, is immune to clock skew between application hosts, and stays consistent with any other column your schema fills with a database default. The cost is that the exact meaning of the value is engine-specific:
+These are database-clock timestamps, not commit timestamps. A transaction can commit after its audit timestamp. The exact time zone and resolution depend on the clock and column type.
 
 When DBMerge creates the audit column itself, it creates a **naive** timestamp (`DATETIME`, or `timestamp without time zone` on PostgreSQL), so the offset the clock function carried is dropped at write time. The table below describes that default.
 
@@ -287,14 +292,65 @@ This does not help everywhere: MySQL/MariaDB have no type that stores an offset,
 
 Two consequences worth planning around:
 
-- **With the default naive column, the same code stores a different wall-clock value on different engines.** SQLite records UTC; every other engine records its server's local time, and nothing in the column says which. Moving a pipeline between engines shifts these columns by the server's UTC offset, silently. On PostgreSQL/CockroachDB use a `timezone=True` column as shown above; elsewhere, run the servers in UTC.
-- **Resolution limits incremental reads.** A consumer polling `WHERE merged_on > :watermark` cannot distinguish rows written within the same tick — one second on SQLite, about 3 ms on MS SQL. Either accept re-reading the boundary tick (make the consumer idempotent) or advance the watermark by row key as well as by timestamp.
+- **Do not assume a naive timestamp means UTC.** SQLite's clock is UTC; other backends follow the clock and storage rules above. Use compatible UTC settings, or a timezone-aware column where the engine preserves the instant.
+- **Resolution limits incremental reads.** `WHERE merged_on > :watermark` can miss rows written in the same tick or committed after a read with an earlier audit timestamp. Re-read an overlapping window with an idempotent consumer, or use a change cursor that reflects commit order. Adding a row key is useful for paging a stable result, not for detecting later writes with the same timestamp.
 
-On PostgreSQL and CockroachDB, `now()` returns the *transaction* start time. With the default `commit_all_steps=True` each phase is its own transaction, so rows touched by the update phase and rows added by the insert phase get slightly different timestamps; with `commit_all_steps=False` the whole merge shares one.
+For untracked PostgreSQL and CockroachDB merges, `now()` returns the *transaction* start time. Separate phase commits can produce different update and insert timestamps; a single data transaction shares one timestamp. Tracked merges sample the tracking database clock separately before each write phase.
 
 If you need a single timestamp with guaranteed semantics across every engine, do not use these parameters — pass your own column in `data` with a value you computed (e.g. `datetime.now(timezone.utc)`), and it will be stored as an ordinary field.
 
 ---
+
+## Geographic coordinates
+
+For portable storage, use separate `longitude` and `latitude` columns. This works across the DBMerge database matrix and supports missing coordinates. `Numeric(11, 8)` with Python `Decimal` values is one option; SQLite uses numeric affinity and does not enforce decimal precision or scale. Coordinate bounds and the coordinate reference system are the application's responsibility.
+
+```python
+from decimal import Decimal
+from sqlalchemy import Numeric
+from dbmerge import DBMerge
+
+with DBMerge(
+    engine, "places", key=["id"],
+    data=[{"id": 1, "longitude": Decimal("-122.4194"), "latitude": Decimal("37.7749")}],
+    data_types={"longitude": Numeric(11, 8), "latitude": Numeric(11, 8)},
+) as merge:
+    merge.exec()
+```
+
+DBMerge also supports native point columns on PostgreSQL and ClickHouse. For both, use `(longitude, latitude)` if storing GPS coordinates by convention; neither column type stores a CRS or validates latitude and longitude. Use an ordinary column such as `id` as the merge key.
+
+```python
+from dbmerge import DBMerge
+from dbmerge.postgresql import Point
+
+with DBMerge(
+    postgres_engine, "places", key=["id"],
+    data=[{"id": 1, "location": (-122.4194, 37.7749)}],
+    data_types={"location": Point()},
+) as merge:
+    merge.exec()
+```
+
+- **PostgreSQL:** `Point()` is the built-in planar `point`, not PostGIS `geometry` or `geography`. It accepts `(x, y)` pairs, PostgreSQL point text and `None`. DBMerge reflects existing `point` columns and compares their binary coordinates without a tolerance, including NULL transitions. `source_table_name` preserves the type. For `source_query` creating a new point column, use typed SQLAlchemy output or specify `Point()` in `data_types`.
+- **ClickHouse:** use `sqla_type_from_name('Point')` from `clickhouse_connect.cc_sqlalchemy.datatypes.base` in `data_types`. `Point` stores two `Float64` coordinates; use two nullable scalar columns if missing points are needed. For Python input, a staging load containing `Point` uses the native client protocol instead of Arrow. For a custom `source_query` reading a `ReplacingMergeTree` source, include `FINAL` when only the current versions should be loaded; DBMerge adds it automatically only for `source_table_name`.
+
+See [compatibility by database](COMPATIBILITY.md#geographic-coordinates) for the distinction between coordinate storage and native GIS types.
+
+## Source queries
+
+Pass SQL text or a SQLAlchemy `select()`, `union_all()` or `text()` statement. The query runs on the merge connection and loads staging via `INSERT … SELECT`. Use a query valid as a subquery on your database, with unique output names matching the target. For raw SQL, use trusted text; bind runtime values rather than interpolating them. Setup may describe or sample the query before `exec()`; `source_condition` filters the staging load, not that sample. For a ClickHouse query over `ReplacingMergeTree`, write `FINAL` explicitly if it should read only current versions.
+
+```python
+from sqlalchemy import text
+from dbmerge import DBMerge
+
+query = text("SELECT id, amount FROM sales WHERE amount >= :minimum").bindparams(minimum=100)
+with DBMerge(engine, "sales_summary", source_query=query, key=["id"]) as merge:
+    result = merge.exec()
+```
+
+An existing target supplies types for matching columns. For new columns, DBMerge uses SQLAlchemy output types, `data_types` overrides, or query metadata when available. If metadata lacks types, DBMerge samples up to 100 rows; for an empty result, all-NULL values or types that cannot be inferred (such as decimal precision), pass explicit `data_types` or typed SQLAlchemy columns. An empty query is an empty source: `delete_mode='delete'` or `'mark'` can still affect target rows in scope.
 
 ## ClickHouse
 
@@ -325,7 +381,7 @@ It has to be a `ReplacingMergeTree` — plain, `Replicated` or `Shared`. Before 
 
 A table that fails a check raises `NoKeyError` or `IncorrectParameter`.
 
-A table DBMerge creates is `ENGINE = ReplacingMergeTree ORDER BY (<key>)`, with no version column and no partitioning. The key columns are not nullable, since `ORDER BY` refuses nullable columns; every other column is `Nullable`. Types are chosen so that no value changes on the way in:
+A table DBMerge creates is `ENGINE = ReplacingMergeTree ORDER BY (<key>)`, with no version column or partitioning. Key columns are non-nullable. Auto-mapped non-key types are usually nullable; native types use their declared nullability, and types such as `Point` cannot be wrapped in `Nullable`. The table below shows the default mappings:
 
 | SQLAlchemy type | Detected from the data | Given in `data_types` |
 |---|---|---|
@@ -352,7 +408,7 @@ A `NULL` arriving for a column that is not `Nullable` fails the load. It is not 
 
 ### How the merge runs
 
-1. The data goes into the staging table in Arrow format, in chunks of 1,000,000 rows by default. Without pyarrow it goes through the native protocol of clickhouse-connect, a few times slower, and DBMerge logs a warning once.
+1. Python data loads into staging in chunks of 1,000,000 rows by default. It uses Arrow when available, or clickhouse-connect's native loader when pyarrow is missing or staging contains a `Point`. SQL sources load with `INSERT … SELECT` instead.
 2. **Changed rows** are compared with the current version of the target rows and written anew as `INSERT … SELECT`. Columns the merge does not write keep their current value in the new version: `skip_update_fields`, `inserted_on_field`, and columns the data does not have.
 3. **New rows** are inserted when the target has no version of their key at all.
 4. **Mark** writes a new version of each row missing from the source, with `delete_mark_field` set.
@@ -398,17 +454,7 @@ A regular staging table can be left over by a process killed mid-merge; its name
 
 ### Source tables on ClickHouse
 
-`source_table_name` takes any table or view ClickHouse can read, and the server copies it into the staging table itself, without the data passing through Python. That includes a PostgreSQL or MySQL database attached to ClickHouse with its database engine — a common way to keep a ClickHouse table in step with an operational database:
-
-```python
-# Once, in ClickHouse:
-#   CREATE DATABASE shop_pg ENGINE = PostgreSQL('pg-host:5432', 'shop', 'reader', 'password', 'public')
-
-with DBMerge(engine=engine, source_table_name='facts', source_schema='shop_pg',
-             table_name='Facts', key=['shop', 'product', 'day'], delete_mode='delete') as merge:
-    result = merge.exec(source_condition=merge.source_table.c['day'] >= date(2025, 1, 1),
-                        delete_condition=merge.table.c['day'] >= date(2025, 1, 1))
-```
+`source_table_name` takes any table or view ClickHouse can read, and the server copies it into the staging table itself, without the data passing through Python. That includes a PostgreSQL or MySQL database attached to ClickHouse with its database engine. See [PostgreSQL to ClickHouse](POSTGRESQL_TO_CLICKHOUSE.md) for setup and a complete merge example.
 
 - `source_schema` is a ClickHouse database and defaults to the current one.
 - A view of the attached database is a source as well, though `system.tables` lists only its tables.
@@ -440,16 +486,16 @@ The staging table on ClickHouse has no primary key, so duplicate keys in the sou
 
 ## Data Loss Risks
 
-DBMerge rewrites your target table with bulk `UPDATE`/`INSERT`/`DELETE` statements. Three properties of that design can destroy data if you rely on the defaults without thinking about them. They are deliberate trade-offs, not defects — none of them will be "fixed" in a later release, so plan around them.
+Review these three behaviors before running a merge against an existing dataset: deletion scope, inferred schema, and transaction boundaries.
 
 ### 1. The source is treated as a complete snapshot
 
-With `delete_mode='delete'` or `'mark'`, **every** target row that is not present in the source is deleted or flagged. That is the point of the feature, and it makes accidents easy:
+The default `delete_mode='no'` keeps missing rows. With `'delete'` or `'mark'` and no `delete_condition`, every target row whose key is absent from the source is deleted or flagged:
 
 - An **empty** source with `delete_mode='delete'` wipes the entire table.
 - A source covering only part of the table (one shop, one month, one partition) removes everything else.
 
-Scope the deletion whenever the source is partial:
+For a complete snapshot of one slice, scope the deletion to that slice. For a batch of changes that does not contain every row in its slice, leave deletion disabled:
 
 ```python
 with DBMerge(data=january_data, engine=engine, table_name="Facts", delete_mode='delete') as merge:
@@ -457,7 +503,7 @@ with DBMerge(data=january_data, engine=engine, table_name="Facts", delete_mode='
     result = merge.exec(delete_condition=merge.table.c['Date'].between(date(2025, 1, 1), date(2025, 1, 31)))
 ```
 
-DBMerge logs a warning for empty input but still performs the delete — if an empty source is possible in your pipeline, guard the call yourself.
+A successfully loaded empty source still participates in deletion or marking. For example, `data=[]` is accepted for an existing target but cannot create one; an empty dict (`{}`) is rejected. Verify the snapshot completed before enabling deletion; do not use an empty export as a fallback for upstream failure.
 
 #### The merge key must be unique in the target table
 
@@ -479,7 +525,7 @@ SELECT id, COUNT(*) FROM your_table GROUP BY id HAVING COUNT(*) > 1;
 
 ### 2. Automatic schema creation infers types from a sample of your data
 
-With `can_create_table` or `can_create_columns` enabled and no `data_types`, DBMerge picks a column type by looking at the first non-null Python value it finds. Inference from values is a guess, and it is structurally unable to recover the things that matter most:
+When DBMerge adds a table or column, SQL sources can provide types and Python inputs can supply types through their schema or sampled values. Inference from values cannot reliably recover the intended schema:
 
 - **Precision and scale** of a decimal — a sample of `1.75` says nothing about whether the column must hold four decimal places.
 - **Length** of a string — the widest value in the sample is not the widest value the column will ever see.
@@ -507,18 +553,16 @@ Automatic DDL is a convenience for development and ad-hoc loads. For production,
 
 It covers the data and nothing else. Every schema change is committed as it happens, whichever value you pass: the target table, any column added to it, and the staging table are already permanent by the time the first row is written. `commit_all_steps=False` therefore makes the *rows* all-or-nothing, not the schema.
 
-The cost is that a failure leaves everything committed before it in place. Because the order is update → insert → delete:
+The order is update → insert → delete. If a phase fails, DBMerge attempts to roll back uncommitted work, but earlier commits remain. Inspect the target and retry only when the source and merge options are safe to replay.
 
-`exec()` rolls back only the phase that failed; it cannot undo earlier commits, and there is no compensating logic. Treat a raised exception as "the target is in an unknown intermediate state", then re-run the full merge once the cause is fixed — repeating the same complete snapshot converges to the correct result.
-
-For an all-or-nothing merge, use a single transaction:
+To commit the data changes together on a transactional backend:
 
 ```python
 with DBMerge(engine=engine, data=data, table_name="Facts", delete_mode='delete') as merge:
     result = merge.exec(commit_all_steps=False)
 ```
 
-Any failure then rolls the whole merge back. The cost is one large transaction holding locks longer and producing a bigger WAL/undo segment. ClickHouse has no transactions, so a merge there is never all-or-nothing: plan to re-run it. Choose per dataset size rather than by default — and note that even with per-step commits, a single bulk `UPDATE` or `DELETE` over millions of rows is still one large statement.
+A failure before the data commit rolls back the transactional data changes, not DDL. A later failure (for example, publishing the tracking journal) cannot undo a completed data commit. A single transaction can hold locks longer; even with step commits, each bulk phase may still be one large statement. `commit_all_steps=False` does not make ClickHouse merges atomic.
 
 ### Checklist before a production merge
 

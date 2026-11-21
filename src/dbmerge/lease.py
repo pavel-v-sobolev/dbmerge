@@ -205,7 +205,7 @@ class Lease:
             return bool(result.rowcount)
 
     def release(self, name: str) -> None:
-        """Free the name — only if this process still owns it."""
+        """Release this acquisition without freeing a newer holder's lease."""
         key = self.key(name)
         with self._lock:
             self._held.discard(name)
@@ -220,7 +220,7 @@ class Lease:
                          .values(owner=None))
 
     def still_mine(self, name: str, *, token: str | None = None) -> bool:
-        """Whether this process still owns the name with a fresh heartbeat."""
+        """Check that the held acquisition is still current and unexpired."""
         if self._closed.is_set():
             return False
         with self._lock:

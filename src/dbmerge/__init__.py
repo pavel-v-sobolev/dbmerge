@@ -1,4 +1,14 @@
 from importlib.metadata import version, PackageNotFoundError
+from warnings import filterwarnings as _filterwarnings
+
+# ClickHouse Connect can warn while SQLAlchemy creates the engine, before DBMerge
+# can validate its actual dialect. Ignore only the bare-alias notice, not other warnings.
+_filterwarnings(
+    'ignore',
+    message=(r"^The 'clickhouse://' URL remains registered to another SQLAlchemy dialect\. "
+             r"ClickHouse Connect is available through 'clickhousedb://' or 'clickhousedb\+connect://'\.$"),
+    category=UserWarning,
+)
 
 try:
     __version__ = version("dbmerge")

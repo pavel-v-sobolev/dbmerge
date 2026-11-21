@@ -4,6 +4,21 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-11-21
+
+### Added
+- `source_query` accepts a SQL string or SQLAlchemy SELECT and loads staging with `INSERT … SELECT`. A `source_condition` can filter the query output. When types cannot be determined for new columns, provide typed SQLAlchemy output or `data_types`.
+- PostgreSQL's built-in planar `point` supports reflection, binding, COPY and NULL-safe change detection. PostGIS types are not covered.
+
+### Fixed
+- ClickHouse staging loads containing a native `Point` use the native client instead of Arrow.
+
+### Tests
+- Exercise numeric latitude/longitude in the shared merge suite and native points on PostgreSQL and ClickHouse. Add SQL-query input and documentation regression checks.
+
+### Documentation
+- Add full and scoped snapshot recipes, SQL-source examples, and a bilingual PostgreSQL-to-ClickHouse guide. Clarify data commit boundaries, staging cleanup, and mart watermarks.
+
 ## [2.6.0] - 2026-11-17
 
 Tracking, leases and marts remain **beta**. Stop existing workers before rollout;

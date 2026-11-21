@@ -12,7 +12,7 @@ import decimal
 import pytest
 import logging
 
-from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_, cast, type_coerce, case
+from sqlalchemy import create_engine, text, select, schema, func, exists, and_, or_, cast, type_coerce, case, inspect
 from sqlalchemy import Table, MetaData, Column, String, Date, DateTime, Integer, Numeric, Double, JSON, Uuid, StaticPool, Computed
 from sqlalchemy import types
 from sqlalchemy.engine import make_url
@@ -133,6 +133,87 @@ def _final_on_clickhouse(engine, stmt, tbl):
         return final(stmt, tbl)
     return stmt
 
+
+
+def _coordinate_rows(merge):
+    stmt = _final_on_clickhouse(merge.engine, select(merge.table), merge.table)
+    with merge.engine.connect() as conn:
+        return [tuple(row) for row in conn.execute(stmt)]
+
+
+def _drop_coordinate_table(engine, name, schema=None):
+    # No reflection is needed to drop a point column. Check separately so
+    # CockroachDB executes DROP in a transaction of its own.
+    if inspect(engine).has_table(name, schema):
+        Table(name, MetaData(), schema=schema).drop(engine, checkfirst=False)
+
+
+@pytest.mark.parametrize('engine_name', list(engines))
+def test_portable_coordinates(engine_name):
+    engine = make_engine(engine_name)
+    name = 'geo_' + uuid.uuid4().hex[:10]
+    target_schema = None if engine.dialect.name == 'sqlite' else 'target'
+    coordinate_types = {'longitude': Numeric(11, 8), 'latitude': Numeric(11, 8)}
+    lon, lat = decimal.Decimal('-122.41940001'), decimal.Decimal('37.77490001')
+    moved = lon + decimal.Decimal('0.00000001')
+    try:
+        for x, y, inserted, updated in [(lon, lat, 1, 0), (moved, lat, 0, 1),
+                                         (moved, lat, 0, 0), (None, None, 0, 1)]:
+            with dbmerge(engine, name, schema=target_schema, key=['id'], data_types=coordinate_types,
+                         data=[{'id': 1, 'longitude': x, 'latitude': y}]) as merge:
+                result = merge.exec()
+            assert (result.inserted_row_count, result.updated_row_count) == (inserted, updated)
+            assert _coordinate_rows(merge) == [(1, x, y)]
+    finally:
+        _drop_coordinate_table(engine, name, target_schema)
+
+
+@pytest.mark.parametrize('engine_name', [name for name, url in engines.items()
+                                        if dialect_hook(make_url(url).get_backend_name(), 'native_point_type')])
+@pytest.mark.parametrize('bulk_load', [False, True])
+def test_native_point_coordinates(engine_name, bulk_load):
+    engine = make_engine(engine_name)
+    dialect = engine.dialect.name
+    point_type, nullable = dialect_hook(dialect, 'native_point_type')()
+    normalize = dialect_hook(dialect, 'normalize_point') or (lambda value: value)
+    source_query = dialect_hook(dialect, 'point_source_query')
+    name = 'geo_' + uuid.uuid4().hex[:10]
+    clone = name + '_copy'
+    original = (-122.4194, 37.7749)
+    moved = (original[0] + 1e-8, original[1])
+    steps = [(original, 1, 0), (moved, 0, 1), (moved, 0, 0)]
+    if nullable:
+        steps += [(None, 0, 1), (None, 0, 0), (moved, 0, 1)]
+
+    def assert_point(merge, value):
+        [(id_, point)] = _coordinate_rows(merge)
+        assert id_ == 1
+        if value is None:
+            assert point is None
+        else:
+            assert tuple(normalize(point)) == pytest.approx(value, rel=0, abs=1e-12)
+
+    try:
+        for value, inserted, updated in steps:
+            with dbmerge(engine, name, key=['id'], data_types={'location': point_type}, bulk_load=bulk_load,
+                         data=[{'id': 1, 'location': value}]) as merge:
+                result = merge.exec()
+            assert (result.inserted_row_count, result.updated_row_count) == (inserted, updated)
+            assert_point(merge, value)
+
+        with dbmerge(engine, clone, key=['id'], source_table_name=name,
+                     source_schema=merge.schema) as copy:
+            assert copy.exec().inserted_row_count == 1
+        assert_point(copy, moved)
+
+        query = source_query(engine, merge.table) if source_query else select(merge.table)
+        with dbmerge(engine, clone, source_query=query) as copy:
+            result = copy.exec()
+        assert (result.total_row_count, result.updated_row_count) == (1, 0)
+        assert_point(copy, moved)
+    finally:
+        _drop_coordinate_table(engine, clone)
+        _drop_coordinate_table(engine, name)
 
 
 def count_all_rows(engine, date_from=None, date_to=None):
@@ -1466,7 +1547,7 @@ def test_computed_target_column_is_not_written(engine_name):
 @pytest.mark.parametrize("engine_name", list(engines))
 def test_failed_cleanup_keeps_the_error_and_closes(engine_name, caplog):
     # A staging table that can not be dropped must neither hide the error of the merge nor leave the
-    # connection open (DB-12). After a merge that succeeded, it is only a warning: the data is committed.
+    # connection open (DB-12). Warn only if the staging table can outlive the session.
     logger.debug(f'TEST FAILED CLEANUP KEEPS THE ERROR AND CLOSES {engine_name}')
     engine = make_engine(engine_name)
     prepare_and_clean_data(engine)
@@ -1493,11 +1574,14 @@ def test_failed_cleanup_keeps_the_error_and_closes(engine_name, caplog):
     with caplog.at_level(logging.WARNING, logger='dbmerge'):
         with dbmerge(engine=engine, data=data, table_name='Facts', schema='target', temp_schema='tmp',
                      key=key, data_types=data_types) as merge:
+            session_temporary = (merge.dialect_name in ('postgresql', 'mariadb', 'sqlite', 'duckdb')
+                                 or getattr(engine.dialect, 'is_mariadb', False)
+                                 or (engine_name == 'clickhouse' and merge.temp_table.schema is None))
             failing_drop(merge)
             result = merge.exec()
     assert result.inserted_row_count == 1
     assert merge.conn.closed and merge.merge_finished
-    assert any('Could not drop the staging table' in r.getMessage() for r in caplog.records)
+    assert any('Could not drop the staging table' in r.getMessage() for r in caplog.records) == (not session_temporary)
 
 
 def test_exceptions_are_exported_from_the_package_root():

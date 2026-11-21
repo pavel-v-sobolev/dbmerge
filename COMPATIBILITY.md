@@ -1,6 +1,6 @@
 # DBMerge Compatibility
 
-The databases and drivers DBMerge is tested with, how each of them loads the staging table, and where they store the same data differently. A combination marked ✅ passes the full test suite: every merge mode, with each of the four kinds of input data (list of dicts, dict of lists, pandas and polars DataFrames).
+This matrix summarizes tested database and driver combinations, staging loaders and storage differences. A ✅ means the combination passed its applicable merge tests; it does not mean all database-specific types and features are portable.
 
 ---
 
@@ -25,13 +25,13 @@ The databases and drivers DBMerge is tested with, how each of them loads the sta
 | ClickHouse | clickhouse-connect | `clickhousedb://`, or a client | ✅ | ✅ | Arrow | 1M rows: 20 s → 1.3 s |
 | Oracle XE 21c | python-oracledb (Thin) | `oracle+oracledb://` | ⚠️ ⁴ | ⚠️ ⁴ | executemany (array DML) | 200k rows: 0.76 s → 0.33 s |
 
-✅ passes every test  ·  ⚠️ works, with the limitation in the note  ·  — no such combination
+✅ tested  ·  ⚠️ tested with the limitation in the note  ·  — unavailable or no specialized loader/measurement, depending on the column
 
 1. SQLAlchemy has the `mssql+mssqlpython` dialect only from 2.1 on.
 2. pymssql truncates microseconds to milliseconds, on every path: a `datetime` of `12:00:00.123456` is stored as `12:00:00.123`. Everything else works. It has no bulk load in DBMerge either — see [MS SQL Server](#ms-sql-server). For SQL Server, prefer pyodbc or mssql-python.
 3. sqlalchemy-cockroachdb 2.0.4 declares `SQLAlchemy<2.1`, so with SQLAlchemy 2.1 it has to be 2.0.3, the last release without that limit. The tests ran with 2.0.3 on SQLAlchemy 2.1 and with 2.0.4 on SQLAlchemy 2.0.
 
-4. Oracle runs in the shared `tests/test_all.py` matrix on SQLAlchemy 2.0 and 2.1: 79 passed, 17 skipped on XE 21.3. Four skips are the native-JSON scenario (one per input format); the rest are tests specific to other databases. Loader parity uses explicit JSON text instead of native JSON. Additional Oracle-specific tests cover LOBs and transaction cleanup, and verify that `bulk_load=True` drives the array-DML loader. Native JSON and LONG are not supported on 2.0; from 2.1 the dialect grows a native `JSON` type, but the shared suite still skips the native-JSON scenario. See [Oracle support](ORACLE.md) for setup and limitations.
+4. Oracle XE 21.3 runs the shared merge suite on SQLAlchemy 2.0 and 2.1. The native-JSON scenario is skipped; loader parity uses explicit JSON text. Additional Oracle tests cover LOBs, transaction cleanup and the array-DML loader. See [Oracle support](ORACLE.md) for limitations and test setup.
 
 **Not supported:**
 
@@ -41,11 +41,28 @@ The databases and drivers DBMerge is tested with, how each of them loads the sta
 
 ---
 
+## Geographic Coordinates
+
+The merge CI checks separate numeric latitude and longitude columns on all supported databases. Native GIS functionality offered by a database does not imply that DBMerge can reflect, stage and compare that type.
+
+| Database | Point / GIS representation available in the database | Native point verified in DBMerge |
+|---|---|---|
+| PostgreSQL | Built-in planar `point`; `geometry` / `geography` with PostGIS | Built-in `point` only |
+| ClickHouse | `Point` (`Tuple(Float64, Float64)`) | `Point` (not nullable) |
+| MySQL / MariaDB | `POINT`, among other spatial types | Not covered |
+| SQL Server | `geometry` / `geography` | Not covered |
+| CockroachDB | `GEOMETRY` / `GEOGRAPHY` | Not covered |
+| DuckDB | `GEOMETRY`, `POINT_2D` with the spatial extension | Not covered |
+| Oracle | `SDO_GEOMETRY` | Not covered |
+| SQLite | No built-in GIS type; extensions can provide GIS support | Not covered |
+
+See [geographic coordinate examples](DOCUMENTATION.md#geographic-coordinates) for the portable and native column formats.
+
 ## Bulk Staging Load
 
 Every merge first loads the data into a staging table (see [The Staging Table](DOCUMENTATION.md#the-staging-table)). By default this is SQLAlchemy's `INSERT` with many parameter sets, which most drivers send row by row. Where the database and its driver offer a faster way, `exec()` uses it, and stores exactly the same values as the row by row `INSERT` would — with one exception, values that do not fit their column on CockroachDB (see [CockroachDB](#cockroachdb)). `exec(bulk_load=False)` turns it off.
 
-The **last column of the table above** measures the staging load on the versions listed at the bottom of this document, as `bulk_load=False` → `bulk_load=True` in seconds. Row counts differ because each number comes from the dataset its test suite loads. PostgreSQL and CockroachDB share the same `COPY` drivers, so the same numbers apply; DuckDB is measured on a 200k-row table (and with pyarrow its whole test suite drops from about 10 minutes to 3.7). On Oracle both paths are array DML (`cursor.executemany`): the numbers show only the SQLAlchemy overhead that `bulk_load=True` skips, not a switch from row by row to a direct-path load.
+The last column reports sample staging-load timings, not whole-merge timings. Row counts differ by dataset. The ClickHouse comparison is native protocol → Arrow, not `bulk_load=False` → `True`. The CockroachDB figures reuse the corresponding PostgreSQL driver measurements. On Oracle both paths use array DML (`cursor.executemany`); the specialized path bypasses SQLAlchemy execution overhead, not Oracle's transaction model.
 
 **pyarrow** is optional everywhere, including ClickHouse. Without it:
 
@@ -55,7 +72,7 @@ The **last column of the table above** measures the staging load on the versions
 
 In these cases DBMerge logs a warning once per process: install pyarrow to load faster. mssql-python without pyarrow sends the bulk copy as tuples, with no warning.
 
-**ClickHouse always loads in bulk**, `bulk_load` has no effect there.
+**ClickHouse always loads in bulk**; `bulk_load` has no effect there. Python input with a `Point` column uses the native loader even with pyarrow installed. SQL sources use `INSERT … SELECT` regardless of `bulk_load` or `chunk_size`.
 
 Some data goes row by row even with `bulk_load=True`, so that what is stored does not change:
 
@@ -115,5 +132,5 @@ CockroachDB runs `SERIALIZABLE` transactions by default. A merge step over many 
 
 ClickHouse merges work differently from every other database; see [ClickHouse](DOCUMENTATION.md#clickhouse) in the documentation.
 
-- **23.8** is the oldest version DBMerge accepts; every merge works from there on.
+- **23.8** is the oldest supported version for built-in merge operations. User-supplied SQL can require a newer version; see [ClickHouse conditions](DOCUMENTATION.md#how-the-merge-runs).
 - `source_table_name` can name a table of a PostgreSQL or MySQL database attached to ClickHouse with its database engine. The tests cover PostgreSQL 16 and 18 with ClickHouse 23.8 and newer (CI workflow "ClickHouse from PostgreSQL"); MySQL 8.4 was checked by hand.

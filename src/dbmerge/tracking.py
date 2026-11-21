@@ -191,17 +191,19 @@ class MergeTracker:
 
         Args:
             engine: A SQLAlchemy ``Engine`` for the transactional database that holds the journal.
-                ClickHouse and DuckDB are rejected — they have no cross-process transactional
-                store; track merges into them by passing a PostgreSQL/CockroachDB engine here.
+                ClickHouse and DuckDB are not supported as journal backends.
+                Track merges into them through a separate transactional engine.
             table_name: The name of the journal table, prepared by this constructor.
                 Importing the package alone creates no table.
             schema: The schema (or database on MySQL/MariaDB) holding the journal table. Created if
-                it does not exist; ignored on SQLite, which has no schemas.
+                it does not exist where supported; ignored on SQLite.
             owner: A string identifying this process in the journal's ``owner`` column, for
                 diagnostics only. Defaults to ``host:pid:random``.
             heartbeat_period: How often a running merge refreshes its row's heartbeat, in seconds.
             heartbeat_ttl: How long a heartbeat may stay stale before a merge is considered
                 abandoned, in seconds.
+            heartbeat_engine: Optional caller-owned engine for heartbeat work; it must point
+                to the same journal store. Defaults to an independent pool for the journal engine.
         """
         if not isinstance(engine, Engine):
             raise IncorrectParameter(f"MergeTracker needs a SQLAlchemy Engine to write its journal to, "
@@ -348,11 +350,11 @@ class MergeTracker:
 
     def exec_merge(self, merge, *, scope: str | None = None,
                    lease_options=None, lease_handle=None, **exec_kwargs):
-        """Run a dbmerge instance through :meth:`exec`, returning its original merge result.
+        """Run a merge through :meth:`exec` and return ``(record, merge_result)``.
 
         Destination is inferred from the merge; change detection uses its inserted, updated and
         deleted row counters, not the truth value of the returned mergeResult. Additional keyword
-        arguments are forwarded to ``merge.exec``. There is no ``changed`` override.
+        arguments are forwarded to merge execution. There is no ``changed`` override.
         Bound merges execute without recursive journaling. Configure lease_options/lease_handle
         on the merge or adapter, not both. Omitted adapter arguments use merge configuration.
         """
@@ -595,12 +597,13 @@ class MergeTracker:
 
     def safe_boundary(self, table_names: str | Iterable[str],
                       schema: str | None = None) -> datetime:
-        """The upper bound of safe reading: min(now, earliest start of a live merge on these tables.
+        """Return min(database time, earliest start of a live tracked operation).
 
         ``table_names`` is a single name or an iterable of names. An unfinished merge whose
         heartbeat is stale does not hold the boundary, so a dead process blocks readers for at
         most heartbeat_ttl. The time and the minimum come from one connection, so "now" for the
-        cutoff and "now" for the bound are the same clock reading.
+        cutoff and "now" for the bound are the same clock reading. The boundary
+        is for consumer progress; it does not create a consistent source snapshot.
         """
         names = _as_names(table_names)
         if not names:
@@ -637,11 +640,11 @@ class MergeTracker:
 
     def watermark(self, table_names: str | Iterable[str],
                   schema: str | None = None) -> datetime | None:
-        """The watermark of the last successful merge over ``table_names`` — where the next update starts.
+        """Return the greatest saved consumer watermark, or None if none is present.
 
-        ``table_names`` is a single name or an iterable of names (for a mart, its one table). Only
-        successful finishes carry a watermark; a recovered (crashed) row has none, so a crash never
-        advances the watermark. Returns None when there is no successful run yet.
+        ``table_names`` is a single name or an iterable of names (normally one mart
+        destination). Ordinary merges and crash recovery do not advance progress;
+        reads also include watermarks stored in legacy operation rows.
         """
         names = _as_names(table_names)
         if not names:
@@ -710,7 +713,11 @@ class MergeTracker:
         return recovered
 
     def reset(self, table_name: str, schema: str | None = None) -> int:
-        """Drop the finished row(s) of a table, so its next mart update starts from the beginning."""
+        """Clear finished operations, saved watermarks and change marks for a table.
+
+        Active operations and rebuild requests/cursors are not reset. Use
+        ``request_rebuild()`` to ask an existing mart to rebuild.
+        """
         t = self.table
         with self.engine.begin() as conn:
             conds = [or_(_operation_rows(t), t.c.row_kind == "watermark"),

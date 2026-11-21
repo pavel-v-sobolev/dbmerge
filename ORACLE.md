@@ -65,8 +65,9 @@ explicit user provisioning for the Oracle registry image.
 
 ## Limitations
 
-- Native JSON and LONG input columns are not supported. Serialize structured
-  values yourself and declare Text/CLOB. LOB keys are not supported.
+- Native JSON requires SQLAlchemy 2.1 for type creation and reflection, and is not
+  covered by the shared merge tests. Use Text/CLOB with serialized JSON for the
+  tested path. LONG input is unsupported. LOB, LONG and JSON cannot be merge keys.
 - Oracle schemas are users and must already exist; dbmerge never creates users,
   even with `can_create_schemas=True`. For a different target/staging schema the
   DBA must grant the necessary cross-schema privileges. These are not needed
@@ -101,12 +102,10 @@ per URL, handle unsupported scenarios, adapt parity input and select computed
 column options. No hook means the existing generic behavior. Shared assertions
 and merge scenarios remain in `tests/test_all.py`.
 
-On Oracle XE 21.3 / SQLAlchemy 2.0 and 2.1 the shared suite passes 79 tests and
-skips 17: four native-JSON inference cases and thirteen tests specific to other
-databases. Loader parity serializes structured values as explicit Text/CLOB because
-native JSON is unsupported on 2.0 (from 2.1 the dialect has a native `JSON` type,
-but the shared suite still skips that scenario). Oracle computed columns are tested
-as virtual, rather than requesting persisted computed columns.
+The shared suite skips native JSON on Oracle. Loader parity serializes structured
+values as explicit Text/CLOB. SQLAlchemy 2.1 has an Oracle `JSON` type, but the shared
+suite does not verify native JSON with it. Oracle computed columns are tested as
+virtual, rather than requesting persisted computed columns.
 
 Additional Oracle-specific tests can run under a minimally privileged user:
 

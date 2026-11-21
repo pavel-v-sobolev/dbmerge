@@ -4,7 +4,7 @@ This document describes using ClickHouse with `dbmerge`: connecting, preparing t
 
 ## How merge works
 
-`dbmerge` synchronizes source data with a ClickHouse target table. The source can be data in Python or a table or view accessible to ClickHouse. Data is loaded into a staging table, then ClickHouse runs bulk queries to find new, changed, and—if deletion is enabled—missing rows.
+`dbmerge` synchronizes source data with a ClickHouse target table. The source can be Python data, a table or view accessible to ClickHouse, or a SELECT query. Data is loaded into staging, then ClickHouse finds new, changed, and—if deletion is enabled—missing rows.
 
 Use the `clickhouse-connect` driver: either the SQLAlchemy URL `clickhousedb://` or a `clickhouse_connect` client. Install the optional dependency with `pip install 'dbmerge[clickhouse]'`.
 
@@ -42,53 +42,15 @@ Key capabilities:
 3. **Reports the outcome.** `result` provides counts of processed, inserted, updated, and deleted or marked rows, along with phase durations. In ClickHouse, an updated row is physically written as a new version with `INSERT` but is counted in `updated_row_count`. With concurrent writes, `deleted_row_count` in `delete` mode is an estimate.
 4. **Can prepare the target schema.** By default, `dbmerge` creates a missing target table and adds missing columns, inferring their types from the input data. Disable this with `can_create_table=False` and `can_create_columns=False` when schema changes are managed separately.
 
-> **Important:** automatic table creation does not remove the requirement for a `ReplacingMergeTree` target with the appropriate `ORDER BY` key. See the requirements below.
+> **Important:** DBMerge creates a `ReplacingMergeTree` target when table creation is enabled. An existing target must meet the requirements below.
 
 ## Reading from PostgreSQL through ClickHouse
 
-One way to connect the systems is to attach PostgreSQL to ClickHouse as a database using the `PostgreSQL` engine. Configure the address and credentials when creating the database; the ClickHouse server must be able to reach PostgreSQL over the network. Run this once in ClickHouse:
-
-```sql
-CREATE DATABASE shop_pg
-ENGINE = PostgreSQL('pg-host:5432', 'shop', 'reader', 'password', 'public');
-```
-
-The PostgreSQL table can then be used as a `dbmerge` source:
-
-```python
-from dbmerge import DBMerge
-
-with DBMerge(
-    engine=engine,                 # ClickHouse connection via clickhouse-connect
-    source_table_name="facts",   # PostgreSQL table exposed in ClickHouse
-    source_schema="shop_pg",     # attached ClickHouse database
-    table_name="Facts",          # ClickHouse target table
-    schema="target",
-    key=["shop", "product", "day"],
-    delete_mode="delete",
-) as merge:
-    result = merge.exec()
-```
-
-In this setup, the application running `dbmerge` connects to ClickHouse, and ClickHouse connects directly to PostgreSQL to read the source. PostgreSQL rows do not pass through the application.
-
-### Architecture
-
-```mermaid
-flowchart LR
-    APP[Application<br/>Python + dbmerge]
-    CH[ClickHouse<br/>target table]
-    PG[(PostgreSQL<br/>source tables / views)]
-
-    APP <-->|clickhouse-connect connection<br/>merge commands and results| CH
-    CH <-->|Direct ClickHouse → PostgreSQL connection<br/>PostgreSQL engine: read source| PG
-```
-
-> ClickHouse is the intermediary: `dbmerge` controls the operation through its ClickHouse connection, while the ClickHouse server is configured to connect directly to PostgreSQL.
+See [PostgreSQL to ClickHouse](POSTGRESQL_TO_CLICKHOUSE.md) for the complete setup and merge recipe.
 
 ## Target table requirements
 
-- The target must use the `ReplacingMergeTree` family and be ordered (`ORDER BY`) by the merge key. Specify `key` explicitly, especially when creating the target from a database-engine source, which has no sorting key to infer.
+- The target must use the `ReplacingMergeTree` family. Its `ORDER BY` must contain exactly the merge key columns. If the target is new and the source has no sorting key (for example, an attached PostgreSQL table), specify `key` explicitly.
 
 > **Note:** In `ReplacingMergeTree`, an update is written as a new row version. Older versions may remain visible until ClickHouse merges the parts; use `FINAL`, for example `SELECT * FROM target.Facts FINAL`, to read the current state.
 
@@ -98,9 +60,9 @@ flowchart LR
 
 The staging table is used for bulk loading and comparison with the target. It is normally temporary and visible only in the ClickHouse session; `temp_schema` does not apply in that case.
 
-> **Note:** With `delete_mode="delete"`, staging is a regular table because a `DELETE` mutation cannot read a temporary table. Such a staging table may remain if the process terminates unexpectedly.
+> **Note:** Staging is a regular table with `delete_mode="delete"` or a client without a session. It may remain if cleanup cannot run.
 
-ClickHouse loads data into staging in batches.
+Python data loads in batches: Arrow when available, or the native client when pyarrow is absent or staging contains `Point`. SQL sources load with `INSERT … SELECT`; for a custom query over `ReplacingMergeTree`, add `FINAL` explicitly if it should read only current versions.
 
 > **Note:** The default `chunk_size` is `1_000_000`. Very small batches can create many small table parts; choose a size appropriate for the data volume and available memory.
 
@@ -128,3 +90,5 @@ server metrics, so do not infer physical staging size from them in that case.
 
 - [Full API documentation](DOCUMENTATION.md#clickhouse)
 - [Compatibility and tested versions](COMPATIBILITY.md#clickhouse)
+
+[RU](CLICKHOUSE_RU.md)

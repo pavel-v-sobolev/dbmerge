@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbmerge"
-version = "2.6.0"
-description = "Database-agnostic UPSERT (insert/update/delete) for Python: merge pandas/polars DataFrames or dicts into PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB, ClickHouse and Oracle via SQLAlchemy."
+version = "2.7.0"
+description = "Bulk UPSERT and snapshot synchronization for Python and SQL sources across PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB, ClickHouse and Oracle."
 
 keywords = [
     "sql","database","etl","upsert","merge","dwh","python",
@@ -70,6 +70,9 @@ include = [
     "/ORACLE.md",
     "/CLICKHOUSE.md",
     "/CLICKHOUSE_RU.md",
+    "/GUIDES.md",
+    "/POSTGRESQL_TO_CLICKHOUSE.md",
+    "/POSTGRESQL_TO_CLICKHOUSE_RU.md",
     "/CHANGELOG.md",
     "/CONTRIBUTING.md",
     "/TRACKING_AND_MARTS.md",

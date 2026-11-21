@@ -7,7 +7,7 @@ Keep assertions and merge scenarios in test_all.py, not in these modules.
 from importlib import import_module
 
 
-DIALECT_MODULES = {'oracle': 'oracle'}
+DIALECT_MODULES = {'oracle': 'oracle', 'postgresql': 'postgresql', 'clickhousedb': 'clickhouse'}
 
 
 def dialect_hook(dialect_name, name):

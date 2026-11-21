@@ -139,7 +139,11 @@ def _marts_row_where(table, schema: str | None, table_name: str):
 
 @dataclass(frozen=True)
 class MartContext:
-    """What a mart handler receives. Data is not here: the handler does its own SELECT."""
+    """Pass state and a proposed progress boundary, not a source snapshot.
+
+    The handler reads and commits its own data. On resume, ``rebuild_from`` is
+    the last saved block label (an empty string means no block was saved yet).
+    """
 
     engine: Engine
     tracker: MergeTracker
@@ -147,7 +151,7 @@ class MartContext:
     sources: frozenset[tuple[str | None, str]]    # (schema, table) of each source
     watermark: datetime        # where to read changes from (EPOCH on the first run)
     next_watermark: datetime   # the watermark to record on success (the sources' safe upper boundary)
-    full_rebuild: bool         # True on the first run / after reset
+    full_rebuild: bool         # initial, requested, or resumed rebuild
     rebuild_from: str | None = None  # last completed rebuild block, None when not resuming
     lease_handle: LeaseHandle | None = None
     logger: Any = logger       # the dbmerge logger, for the handler's own messages

@@ -10,14 +10,14 @@ If you don't need them, dbmerge works exactly as before — both are opt-in.
 ## The big picture
 
 ```
-a merge ──► a row in the tracking table ──► MartLoop sees the change ──► rebuilds the mart
+a merge ──► a row in the tracking table ──► MartLoop sees the change ──► refreshes the mart
              (started/finished/changed/watermark)
 ```
 
-- Every merge executed through `tracker.exec_merge(...)` leaves a row in the tracking table.
+- A merge executed with `tracker=` or through `tracker.exec_merge(...)` is journaled when execution starts. The journal is not a complete history; newer operations can replace older finished rows.
 - While the merge runs, the row is "alive" (its heartbeat is refreshed) and holds the safe boundary.
 - When the merge finishes, the row gets `finished_at` and a `changed` flag ("did rows actually change").
-- `MartLoop` polls this table and rebuilds the mart only when the sources really changed.
+- `MartLoop` initializes a destination with no saved watermark, handles explicit rebuild requests, and otherwise refreshes it when tracked sources change.
 
 ## Tracking
 
@@ -26,19 +26,19 @@ a merge ──► a row in the tracking table ──► MartLoop sees the change
 Two programs run independently: one writes into tables (a replicator, a loader), the other builds reports from them (a mart). The second one needs to know:
 
 1. "Did table X change after moment Y?"
-2. "Is someone writing into X right now?" — so it doesn't read a half-written row.
+2. "How far can I advance consumer progress while tracked writers are still active?" This boundary does not make reads an atomic snapshot.
 
 Operation rows and durable last-change rows in one tracking table answer these questions.
 
 ### Where the journal lives
 
-The journal lives in a **transactional** database. `MergeTracker` refuses ClickHouse and DuckDB — they have no cross-process transactional store. A ClickHouse mart is tracked through PostgreSQL:
+The journal needs a shared transactional store. `MergeTracker` does not accept ClickHouse or DuckDB as its journal backend. For a ClickHouse destination, use a separate journal engine, for example PostgreSQL:
 
 ```python
-tracker = MergeTracker(postgres_engine)              # the journal in PostgreSQL
-with DBMerge(clickhouse_engine, table_name="mart",   # the merge itself in ClickHouse
-             data=rows, key=["id"]) as merge:
-    tracker.exec_merge(merge)
+with MergeTracker(postgres_engine) as tracker:
+    with DBMerge(clickhouse_engine, table_name="mart", data=rows, key=["id"],
+                 tracker=tracker) as merge:
+        result = merge.exec()
 ```
 
 Every journal row records the schema of the merged table together with its name — `schema` + `table_name` is the identity. The read methods take a `schema=...` filter; two databases with a conflicting name need separate tracking tables.
@@ -312,13 +312,10 @@ a source change; plan the initial rebuild load when deploying the new behavior.
 Each pass (every `poll_interval` seconds):
 
 1. Recovers abandoned merges (`recover_abandoned`).
-2. Claims the destination-derived lease to coordinate competing workers (not a fencing guarantee).
-3. Reads its watermark: `watermark = tracker.watermark(destination)` (the first run starts from the beginning).
-4. Computes the next watermark: `next_watermark = tracker.safe_boundary(sources)`.
-5. For initialized, incremental passes, asks: `tracker.is_changed_since(sources, since=watermark)`.
-   - no change → skip (not applicable to initial/explicit/resumed rebuilds);
-   - a change, but `next_watermark <= watermark` → wait (a source is still being written).
-6. Otherwise calls `process_changes(ctx)`.
+2. Reads saved progress, the rebuild request and cursor, and the current source boundary.
+3. For incremental work, skips the pass if the boundary has not advanced or no source has changed since the saved watermark. Initial, requested and resumed rebuilds do not require a change signal.
+4. Claims the pass lease if configured and rechecks progress before starting work. Leases coordinate cooperating workers but are not a fencing guarantee for all writes.
+5. Runs the rebuild or `process_changes(ctx)` and saves progress after successful work.
 
 The key point: **"should I update" is decided from timestamps, not from a signal**. An event that was "lost" (a crash, a switched-off mart) is not lost — the next pass sees it through `is_changed_since`. Therefore `process_changes` must be **idempotent**: it may run again.
 
@@ -347,8 +344,9 @@ class MartContext:
     sources: frozenset[tuple[str | None, str]]
     watermark: datetime        # where to read changes from
     next_watermark: datetime   # where to move the watermark on success (not a read cap)
-    full_rebuild: bool         # True on the first run / after reset
+    full_rebuild: bool         # True during an initial, requested, or resumed rebuild
     lease_handle: LeaseHandle | None  # borrowed pass acquisition
+    rebuild_from: str | None  # last saved block label, if resuming
 ```
 
 ## Reliability tests and CI
@@ -458,10 +456,10 @@ handler or overwrite existing progress. The primary key is the pair
 | `exec_merge(merge, *, scope=None, lease_options=None, lease_handle=None, **exec_kwargs)` | adapts a merge to `exec`, inferring destination and changes from row counters; preserves the merge result |
 | `safe_boundary(table_names, schema=None)` | the safe upper boundary over these tables (`table_names` is one name or a list) |
 | `last_merge(table_name, schema=None)` | the last finished row of one table, or `None` |
-| `watermark(table_names, schema=None)` | the watermark of the last successful merge over these tables, or `None` (`table_names` is one name or a list) |
+| `watermark(table_names, schema=None)` | the greatest saved consumer watermark across the named destinations, or `None`; ordinary merges do not publish it |
 | `is_changed_since(table_names, since, schema=None, *, scope=None)` | whether there was a real change after `since`, optionally filtered by scope (`None` reads all scopes) |
 | `recover_abandoned()` | marks stale unfinished rows as changed |
-| `reset(table_name, schema=None)` | deletes the finished row (rebuild from scratch) |
+| `reset(table_name, schema=None)` | clears finished operations, saved watermarks and change marks, but not mart rebuild state; use `request_rebuild` to request a rebuild |
 | `mark_watermark(table_name, watermark, schema=None)` | persists a monotonic consumer watermark independently of operation rows; MartLoop calls it with a transactionally checked lease |
 
 The table name and schema together are the identity; pass the `schema=` to the read methods. Two databases with a conflicting name need separate tracking tables. The destination-derived lease is a `Lease` row in the same tracking table.
@@ -630,10 +628,7 @@ correctness guarantee.
 
 ## Reliability limits
 
-The current implementation is at-least-once scheduling, not an atomic snapshot or exactly-once
-pipeline. Durable change marks now survive later no-ops; the audit's no-op-loss finding is fixed.
-Lease expiration alone cannot stop a stalled writer; rebuilds do not automatically remove obsolete destination keys. See
-`audit/tracking-and-marts-2026-11-14.md` for the detailed audit, reproductions and prioritized work.
+The loop may replay a window or rebuild block; it does not provide an atomic snapshot or exactly-once delivery. Durable change marks survive later no-ops. Lease expiration alone cannot stop a stalled writer, and a rebuild does not automatically remove obsolete destination keys. The handler must implement that reconciliation when needed.
 
 
 ## Consumer, lease and shutdown contracts

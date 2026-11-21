@@ -6,15 +6,34 @@ import re
 import runpy
 import textwrap
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
+from sqlalchemy import create_engine
 
 from dbmerge import DBMerge
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY = 'https://github.com/pavel-v-sobolev/dbmerge/blob/main/'
 GUIDES = ['README.md', 'DOCUMENTATION.md', 'TRACKING_AND_MARTS.md',
-          'CLICKHOUSE.md', 'CLICKHOUSE_RU.md', 'ORACLE.md', 'COMPATIBILITY.md', 'llms.txt']
+          'CLICKHOUSE.md', 'CLICKHOUSE_RU.md', 'GUIDES.md',
+          'POSTGRESQL_TO_CLICKHOUSE.md', 'POSTGRESQL_TO_CLICKHOUSE_RU.md',
+          'ORACLE.md', 'COMPATIBILITY.md', 'CONTRIBUTING.md', 'CHANGELOG.md', 'llms.txt']
+
+
+def _heading_anchors(content):
+    # ATX headings used by our guides; ignore headings in code and handle repeats.
+    seen = set()
+    content = re.sub(r'^```[^\n]*\n.*?^```[^\n]*$', '', content, flags=re.M | re.S)
+    for heading in re.findall(r'^#{1,6} (.+)$', content, re.M):
+        base = re.sub(r'[^\w -]', '', heading.lower()).replace(' ', '-')
+        anchor, suffix = base, 0
+        while anchor in seen:
+            suffix += 1
+            anchor = f'{base}-{suffix}'
+        seen.add(anchor)
+    return seen
 
 
 @pytest.mark.parametrize('name', GUIDES)
@@ -24,9 +43,17 @@ def test_python_examples_and_local_links(name):
     for number, block in enumerate(re.findall(r'```python\n(.*?)```', content, re.S), 1):
         ast.parse(textwrap.dedent(block), filename=f'{name}:python-block-{number}')
     for target in re.findall(r'\]\(([^)]+)\)', content):
-        if target.startswith(('http:', 'https:', '#', 'mailto:')):
+        if target.startswith(REPOSITORY):
+            base, target = ROOT, target.removeprefix(REPOSITORY)
+        elif target.startswith(('http:', 'https:', 'mailto:')):
             continue
-        assert (path.parent / target.split('#')[0]).exists(), f'{name}: {target}'
+        else:
+            base = path.parent
+        filename, _, anchor = target.partition('#')
+        destination = base / unquote(filename) if filename else path
+        assert destination.exists(), f'{name}: {target}'
+        if anchor and destination.suffix == '.md':
+            assert unquote(anchor) in _heading_anchors(destination.read_text()), f'{name}: {target}'
 
 
 def test_constructor_parameters_are_documented():
@@ -39,12 +66,50 @@ def test_readme_links_work_outside_the_repository():
     content = (ROOT / 'README.md').read_text()
     targets = re.findall(r'\]\(([^)]+)\)', content)
     targets += re.findall(r'(?:href|src|srcset)="([^"]+)"', content)
-    repository = 'https://github.com/pavel-v-sobolev/dbmerge/blob/main/'
     for target in targets:
         assert target.startswith('https://'), f'README link must be absolute: {target}'
-        if target.startswith(repository):
-            local = target[len(repository):].split('#', 1)[0]
+        if target.startswith(REPOSITORY):
+            local = target[len(REPOSITORY):].split('#', 1)[0]
             assert (ROOT / local).is_file(), f'README links to a missing repository file: {target}'
+
+
+def _recipe_snippet(heading):
+    guide = (ROOT / 'GUIDES.md').read_text()
+    section = re.search(rf'^## {re.escape(heading)}\n(.*?)(?=^## |\Z)', guide, re.M | re.S)
+    assert section, heading
+    return re.search(r'```python\n(.*?)```', section[1], re.S)[1]
+
+
+@pytest.mark.parametrize('heading, query, expected', [
+    ('Full snapshot', 'SELECT * FROM products ORDER BY id', [(1, 'Dark roast'), (3, 'Cocoa')]),
+    ('Scoped snapshot', 'SELECT * FROM sales ORDER BY month, product_id',
+     [(202501, 1, 4), (202502, 1, 8), (202502, 3, 2)]),
+])
+def test_snapshot_recipes_execute(heading, query, expected):
+    namespace = {}
+    try:
+        exec(_recipe_snippet(heading), namespace)
+        with namespace['engine'].connect() as conn:
+            assert conn.exec_driver_sql(query).all() == expected
+    finally:
+        if 'engine' in namespace:
+            namespace['engine'].dispose()
+
+
+def test_sql_sources_recipe_preserves_missing_rows():
+    engine = create_engine('sqlite://')
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql('CREATE TABLE orders (customer_id INTEGER, status VARCHAR(10))')
+            conn.exec_driver_sql("INSERT INTO orders VALUES (1, 'paid'), (1, 'paid'), (2, 'new')")
+            conn.exec_driver_sql('CREATE TABLE customer_order_counts '
+                                 '(customer_id INTEGER PRIMARY KEY, order_count INTEGER)')
+            conn.exec_driver_sql('INSERT INTO customer_order_counts VALUES (2, 5)')
+        exec(_recipe_snippet('SQL sources'), {'engine': engine})
+        with engine.connect() as conn:
+            assert conn.exec_driver_sql('SELECT * FROM customer_order_counts ORDER BY customer_id').all() == [(1, 2), (2, 5)]
+    finally:
+        engine.dispose()
 
 
 def test_owned_runtime_templates_do_not_contain_cyrillic():

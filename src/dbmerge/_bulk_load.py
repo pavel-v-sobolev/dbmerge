@@ -131,8 +131,11 @@ def _postgres_copy(merge: DBMerge):
            f'FROM STDIN WITH (FORMAT csv)')
 
     processors = _json_processors(merge)
+    from .postgresql import Point
     for f in fields:
-        if isinstance(merge.temp_table.c[f].type, LargeBinary):
+        if isinstance(merge.temp_table.c[f].type, Point):
+            processors[f] = Point.to_text
+        elif isinstance(merge.temp_table.c[f].type, LargeBinary):
             # bytea is read from text in its hex form
             processors[f] = lambda v: None if v is None else '\\x' + bytes(v).hex()
 

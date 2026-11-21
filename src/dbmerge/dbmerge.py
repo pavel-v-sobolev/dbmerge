@@ -28,6 +28,10 @@ from sqlalchemy import inspect, and_, or_, not_, insert, select, update, delete,
 from sqlalchemy import Engine, Table, MetaData, Column, ColumnElement
 from sqlalchemy import String, Text, Integer, BigInteger, Numeric, Double, Boolean, DateTime, Date, Time, JSON, Uuid, LargeBinary
 from sqlalchemy import types, dialects, func, schema
+from sqlalchemy.sql.elements import TextClause
+from sqlalchemy.sql.selectable import SelectBase
+
+from . import _source_query
 
 POLARS_TO_SQLALCHEMY_TYPE_MAP = {
     'Int8': BigInteger(),
@@ -194,10 +198,13 @@ ALEMBIC_DEFAULT_IMPL_DIALECTS = ('duckdb',)
 # engine counts as the clickhousedb dialect.
 CLICKHOUSE_DIALECT = 'clickhousedb'
 DIALECT_MODULES = {CLICKHOUSE_DIALECT: 'clickhouse', 'duckdb': 'duckdb', 'cockroachdb': 'cockroach',
+                   'postgresql': 'postgresql',
                    'oracle': 'oracle'}
 
 @dataclass
 class mergeResult:
+    """Execution statistics and target schema changes reported by one merge."""
+
     total_row_count: int
     inserted_row_count: int 
     updated_row_count: int 
@@ -251,6 +258,13 @@ class LeaseOptions:
 
 
 class DBMerge:
+    """Reconcile one Python or SQL source with a database table by key.
+
+    Construction prepares the target and staging tables; ``exec()`` loads rows
+    and applies changes. Use a context manager for cleanup. Missing target rows
+    are only deleted or marked if explicitly requested.
+    """
+
     def __init__(self,
                  engine: Engine, 
                  table_name: str, 
@@ -277,24 +291,25 @@ class DBMerge:
                  tracker: MergeTracker | None = None,
                  lease_options: LeaseOptions | None = None,
                  lease_handle: LeaseHandle | None = None,
-                 use_safe_border: bool = False) -> None:
+                 use_safe_border: bool = False,
+                 *, source_query: str | SelectBase | TextClause | None = None) -> None:
         """
         Init function prepares the database and internal structures before the merge operation.
         
         Key Preparation Steps:
-        - Verifies the existence of the target table and creates it if it does not exist.
-        - Inspects existing table fields and automatically creates missing columns based on the provided or auto-detected data types.
-        - Creates a temporary staging table to ensure the merge operation executes with optimal performance. The temporary table is safely dropped upon exiting the context.
+        - Prepares the target, creating the table or missing columns only when enabled.
+        - Creates staging. Constructor DDL is committed independently of data execution.
+        - Use a context manager to ensure cleanup even if exec() is not called.
 
         Preferable usage (Context Manager):
         ```python
-        with DBMerge(engine=engine, data=data, table_name="YourTable") as merge:
+        with DBMerge(engine=engine, data=data, table_name="YourTable", key=["id"]) as merge:
             result = merge.exec()
         ```
 
         Args:
             engine (Engine): The SQLAlchemy engine connected to your database. Tested with PostgreSQL, MariaDB/MySQL, SQLite, MS SQL,
-                CockroachDB, DuckDB and ClickHouse; COMPATIBILITY.md lists the drivers and versions.
+                CockroachDB, DuckDB, ClickHouse and Oracle; COMPATIBILITY.md lists the drivers and versions.
                 For ClickHouse, a "clickhousedb://" engine (clickhouse-connect) or a clickhouse_connect client; the target
                 table must be a ReplacingMergeTree.
             table_name (str): The name of the target table where data will be merged.
@@ -315,9 +330,9 @@ class DBMerge:
                 - 'no' (default): Retain existing target rows.
                 - 'delete': Hard delete rows from the target table.
                 - 'mark': Soft delete rows by setting a flag in `delete_mark_field`.
-                Warning: with 'delete' or 'mark', every target row missing from the source is affected. If the source covers only part
-                of the table (or is empty), restrict the scope with the delete_condition argument of exec(), otherwise
-                an empty source with delete_mode='delete' wipes the entire table.
+                Use 'delete' or 'mark' only when the source is complete for the intended scope.
+                For a complete slice, pass delete_condition to exec(); for a batch of changes,
+                keep 'no'. An accepted empty source affects all rows in the deletion scope.
             delete_mark_field (str, optional): The column used to flag a record as deleted. Must be a Boolean or Integer column.
                 A row missing from the source is set to True/1; inserted or resurrected (reappeared) rows are set to False/0.
                 If this column is present in the incoming data, the supplied value is used as-is.
@@ -351,13 +366,14 @@ class DBMerge:
             temp_schema (str | None, optional): The database schema where the temporary staging table will be created.
                 Defaults to schema. The staging table is named tmp_<yymmddHHMMSS>_<table>_<hex8>: a fixed prefix marking it
                 as disposable, the moment of creation by the database clock (first, so that a listing sorts by age), the target
-                table name (truncated to fit the identifier limit) and a random suffix. On PostgreSQL, SQLite, MariaDB and DuckDB it is a
-                TEMPORARY table: session-scoped, kept out of shared_buffers, and removed by the database when the session ends, so a
-                crashed process leaves nothing behind. PostgreSQL and DuckDB keep temporary tables in a schema of their own, so temp_schema
-                does not apply there and is quietly dropped. MySQL, MS SQL Server and CockroachDB get a regular table that can be left
-                over (MySQL can not open a temporary table twice in one statement, which a condition of exec() may need).
-            source_table_name (str | None, optional): If provided, data will be sourced directly from another existing database table or view. Mutually exclusive with the "data" argument (passing both raises IncorrectParameter).
-            source_schema (str | None, optional): The database schema of the source table or view.
+                table name (truncated to fit the identifier limit) and a random suffix.
+                PostgreSQL and DuckDB ignore temp_schema; so does ClickHouse with session-local staging.
+                Regular staging tables and Oracle global temporary table definitions can outlive the session.
+                See DOCUMENTATION.md for backend-specific staging rules.
+            source_table_name (str | None, optional): Read directly from an existing table or view. Mutually exclusive with data and source_query.
+            source_schema (str | None, optional): Schema of the source table or view; only for source_table_name.
+            source_query (str | SelectBase | TextClause | None, optional): Read from a SELECT query on the same
+                database. Mutually exclusive with data and source_table_name. Name the output columns as in the target.
             can_create_table (bool, optional): Allows the module to automatically create the target table if it does not exist (default is True).
             can_create_columns (bool, optional): Allows the module to append missing columns to the target table (default is True).
             can_create_schemas (bool, optional): Allows the module to automatically create target and temp schema if they don't exist (default is True).
@@ -412,6 +428,7 @@ class DBMerge:
                                skip_compare_fields=skip_compare_fields, key=key, data_types=data_types,
                                schema=schema, temp_schema=temp_schema,
                                source_table_name=source_table_name, source_schema=source_schema,
+                               source_query=source_query,
                                can_create_table=can_create_table, can_create_columns=can_create_columns,
                                can_create_schemas=can_create_schemas,
                                commit_all_steps=commit_all_steps, chunk_size=chunk_size,
@@ -435,6 +452,7 @@ class DBMerge:
             self.temp_schema = temp_schema
 
             self.source_table_name = source_table_name
+            self.source_query = _source_query.normalize(source_query) if source_query is not None else None
             self.source_schema = source_schema
             self.source_table = None
             self.can_create_columns = can_create_columns
@@ -578,6 +596,12 @@ class DBMerge:
                     raise IncorrectParameter(f'Table "{self.source_table_full_name}" not found in the database')
                 self._get_fields_from_source_table()
 
+            elif self.source_query is not None:
+                self.type_of_data = 'query'
+                self.total_row_count = 0
+                self.source_table = _source_query.as_source(self, self.source_query)
+                self._get_fields_from_source_table()
+
             # LIST OF DICT
             elif isinstance(self.data,list):
                 self.type_of_data = 'list of dict'
@@ -674,7 +698,9 @@ class DBMerge:
                 if can_create_table:
                     logger.info(f'Table "{self.table_full_name}" does not exist. Creating.')
                     self._check_given_types()    
-                    if self.type_of_data in ['list of dict','dict of list','pandas','polars']: #data types from source table are already known
+                    if self.source_query is not None:
+                        _source_query.resolve_types(self)
+                    elif self.type_of_data != 'table':
                         self._detect_missing_data_types()
                     self._adapt_types_to_dialect()
                     self._create_table()
@@ -687,7 +713,9 @@ class DBMerge:
                 if len(self.new_fields)>0:
                     if can_create_columns:
                         self._check_given_types()
-                        if self.type_of_data in ['list of dict','dict of list','pandas','polars']:
+                        if self.source_query is not None:
+                            _source_query.resolve_types(self)
+                        elif self.type_of_data != 'table':
                             self._detect_missing_data_types()
                         self._adapt_types_to_dialect()
                         self._create_new_fields()
@@ -717,15 +745,15 @@ class DBMerge:
              commit_all_steps: bool | None = None, chunk_size: int | None = None,
              bulk_load: bool | None = None) -> mergeResult:
         """
-        Executes the merge operation. It returns a mergeResult class with statistical information.
-
-        This method triggers the actual merge operation based on the configurations passed during initialization.
+        Run the merge and return its statistics. Open a new instance to run again
+        after the merge phases finish or fail. If acquisition raises LeaseBusy before
+        execution starts, the still-open instance can be retried.
         
         Execution Workflow:
         1) Inserts the source data into the temporary staging table.
         2) Update: Updates existing rows in the target table where field values differ from the temporary table.
         3) Insert: Copies rows from the temporary table to the target table that do not currently exist.
-        4) Delete / Mark: Deletes or marks rows in the target table that are entirely missing from the temporary staging data.
+        4) Delete / Mark (opt-in): Deletes or marks target rows whose keys are absent from staging, within the deletion scope.
 
         If your data comes in portions (e.g., monthly snapshots), you can set a delete_condition argument 
         to restrict the deletion scope so that it only affects the relevant timeframe.
@@ -735,9 +763,9 @@ class DBMerge:
 
         Args:
             delete_condition (ColumnElement, optional): An SQLAlchemy binary expression used in the WHERE clause
-                during the delete/mark phase. Essential for chunked or partitioned data syncs.
+                during the delete/mark phase. It does not filter staging, updates or inserts.
             source_condition (ColumnElement, optional): An SQLAlchemy binary expression used to filter the SELECT statement
-                when loading data from a source_table_name.
+                when loading data from source_table_name or source_query. Reference merge.source_table.c.
             update_condition (ColumnElement, optional): An SQLAlchemy binary expression added to the WHERE clause of the
                 UPDATE phase, so a target row is updated only when this condition also holds (on top of "some field differs").
                 Build it on the target and staging tables exposed as `merge.table` and `merge.temp_table`. Rows that do not
@@ -759,7 +787,7 @@ class DBMerge:
                 the value given to the constructor. Must be a real boolean: a string such as 'false' is rejected instead of
                 being treated as truthy. It applies to the data only - schema changes (creating the target table, adding
                 columns, creating and dropping the staging table) are always committed on their own and never roll back with
-                the data.
+                the data. Has no effect on ClickHouse.
             chunk_size (int, optional): Defines the batch size when inserting raw data (from lists of dicts, dicts of lists
                 or Pandas/Polars DataFrames) into the temporary table to avoid memory/query-size limits. None (default) takes
                 the value given to the constructor, and that in turn defaults to 10000, to 100,000 for the bulk copy of
@@ -767,10 +795,12 @@ class DBMerge:
                 a part of the table there, and small ones are costly.
             bulk_load (bool, optional): Load the staging table in bulk where the engine and its driver allow it
                 (COPY FROM STDIN on PostgreSQL and CockroachDB, bulk copy with mssql-python, fast_executemany with
-                pyodbc, Arrow on DuckDB), instead of the row by row INSERT of SQLAlchemy. None (default) takes the value
+                pyodbc, Arrow on DuckDB, array DML on Oracle), instead of SQLAlchemy's generic insert path.
+                None (default) takes the value
                 given to the constructor. The data stored is the same
                 either way, except on CockroachDB, whose COPY does not apply the limits of column types (VARCHAR(n),
-                DECIMAL(p,s)); False falls back to the row by row INSERT. ClickHouse always loads in bulk.
+                DECIMAL(p,s)); False selects the generic path. ClickHouse always loads in bulk.
+                SQL sources are loaded with INSERT ... SELECT regardless of this setting.
 
         Returns:
             mergeResult: A dataclass object containing execution statistics (e.g., inserted_row_count, total_time)
@@ -797,8 +827,7 @@ class DBMerge:
         if self.merge_finished:
             raise IncorrectParameter(f'Merge exec already finished on table {self.table_full_name}')
 
-        # The constructor carries the defaults (a merge run through MergeTracker can not pass these
-        # to exec); an explicit argument here overrides them for this call only.
+        # Explicit execution arguments override the defaults supplied at construction.
         if commit_all_steps is None:
             commit_all_steps = self._commit_all_steps
         if chunk_size is None:
@@ -882,7 +911,7 @@ class DBMerge:
 
     def _exec_steps(self, commit_all_steps: bool) -> mergeResult:
         """Run merge steps without validation or connection cleanup (for dialect retry hooks)."""
-        if self.source_table_name is None:
+        if self.source_table is None:
             self._insert_data_to_temp()
         else:
             self._insert_source_table_to_temp()
@@ -940,8 +969,8 @@ class DBMerge:
     def _close(self):
         """
         Drops the staging table and closes the connection. Never raises: a failure here must not hide the
-        error of the merge, and after a merge that succeeded its data is committed already - so a staging
-        table that can not be dropped is reported as a warning.
+        error of the merge, and after a merge that succeeded its data is committed already. Warn only if
+        the staging table can outlive the database session.
         """
         temp_table = getattr(self, 'temp_table', None)
         try:
@@ -955,9 +984,9 @@ class DBMerge:
                     try:
                         self._drop_temp_table()
                     except Exception:
-                        logger.warning(f'Could not drop the staging table "{temp_table.fullname}": {e}. A TEMPORARY '
-                                       f'table goes with its session, a regular one is left behind and has to be '
-                                       f'dropped by hand.')
+                        if not temp_table.info.get('session_temporary'):
+                            logger.warning(f'Could not drop the staging table "{temp_table.fullname}": {e}. '
+                                           f'It may have to be dropped by hand.')
                         self.temp_table = None
         finally:
             self._close_connection()
@@ -1093,7 +1122,7 @@ class DBMerge:
             raise IncorrectParameter(f'Columns {computed} of table "{self.table_full_name}" are computed by the '
                                      f'database and can not be written. Leave them out of "data".')
         logger.info(f'Columns {computed} are computed by the database in table "{self.table_full_name}", '
-                    f'they are not merged from the source table.')
+                    f'they are not merged from the source.')
         for f in computed:
             del self.data_fields[f]
 
@@ -1409,7 +1438,7 @@ class DBMerge:
     def _validate_init_params(self, engine, table_name, data, delete_mode, delete_mark_field,
                               delete_mark_values, merged_on_field, inserted_on_field,
                               skip_update_fields, skip_compare_fields, key,
-                              data_types, schema, temp_schema, source_table_name, source_schema,
+                              data_types, schema, temp_schema, source_table_name, source_schema, source_query,
                               can_create_table, can_create_columns, can_create_schemas,
                               commit_all_steps, chunk_size, bulk_load):
         """Validate user-supplied arguments up front so that a wrong type raises a
@@ -1495,6 +1524,9 @@ class DBMerge:
         if data is not None and source_table_name is not None:
             raise IncorrectParameter('Provide either "data" or "source_table_name", not both '
                                      '("data" is ignored when a source table is given).')
+
+        if source_query is not None and (data is not None or source_table_name is not None):
+            raise IncorrectParameter('"source_query" is mutually exclusive with "data" and "source_table_name".')
 
         if source_schema is not None and source_table_name is None:
             raise IncorrectParameter('"source_schema" is set, but "source_table_name" is not. '
@@ -1677,12 +1709,13 @@ class DBMerge:
         # update_values below), but are left out of the comparison, so a difference in them alone
         # does not make the row "changed" and does not get it updated.
         where_conditions = []
+        differs = self._dialect_hook('differs')
         for c in non_key_cols:
             if c in self.skip_compare_fields:
                 continue
             col = self.table.c[c]
             temp_col = self.temp_table.c[c]
-            where_conditions.append(col.is_distinct_from(temp_col))
+            where_conditions.append(differs(col, temp_col) if differs else col.is_distinct_from(temp_col))
 
         # When the flag is auto-managed (not supplied in the data), a row currently marked as
         # deleted must be picked up for update so it gets reset back to the active value.
@@ -1813,10 +1846,9 @@ class DBMerge:
 
     def _temp_table_timestamp(self) -> str:
         """
-        Creation time for the staging table name, taken from the database clock - the same clock
-        that stamps merged_on. Whoever reads these names later compares them against rows in the
-        database and against other processes' tables, and the hosts running them need not agree on
-        the time; the database is the one clock all of them share.
+        Timestamp for the staging table name, normally from the destination clock.
+
+        Fall back to the local clock if the driver returns no usable timestamp.
         """
         value = self._database_time()
         if isinstance(value, str):
@@ -1863,7 +1895,7 @@ class DBMerge:
         is_mariadb = getattr(self.conn.dialect, 'is_mariadb', False)
         if self.dialect_name in TEMPORARY_STAGING_DIALECTS or is_mariadb:
             self.temp_table = Table(temp_table_name, self.metadata, *cols, schema = self.temp_schema, 
-                                    prefixes=['TEMPORARY'])
+                                    prefixes=['TEMPORARY'], info={'session_temporary': True})
             self.temp_table.create(bind=self.conn, checkfirst=False)
         
         else:
@@ -1926,18 +1958,19 @@ class DBMerge:
 
         start_time = time.perf_counter()
 
-        source_fields = [self.source_table.c[f] for f in self.data_fields]
         target_fields = [self.temp_table.c[f] for f in self.data_fields]
-
-        if self.source_condition is None:
-            select_stmt = select(*source_fields)
+        if self.source_query is not None:
+            select_stmt = _source_query.select_rows(self)
         else:
-            select_stmt = select(*source_fields).where(self.source_condition)
-
-        from ._source_select import validate_source_select
-        validate_source_select(select_stmt)
+            select_stmt = select(*[self.source_table.c[f] for f in self.data_fields])
+            if self.source_condition is not None:
+                select_stmt = select_stmt.where(self.source_condition)
+            from ._source_select import validate_source_select
+            validate_source_select(select_stmt)
         insert_stmt = insert(self.temp_table).from_select(target_fields,select_stmt)
         self.total_row_count = self._execute_dml(insert_stmt)
+        if self.source_query is not None and self.total_row_count < 0:
+            self.total_row_count = self.conn.scalar(select(func.count()).select_from(self.temp_table))
 
         end_time = time.perf_counter()
         self.temp_insert_time = end_time - start_time  
@@ -2003,6 +2036,7 @@ def drop_table_if_exists(engine,table_name,schema=None):
 
   
 def format_ms(seconds):
+    """Format seconds as a duration rounded to milliseconds; negative values show '-'."""
 
     milliseconds = round(seconds * 1000)
     if milliseconds < 0:

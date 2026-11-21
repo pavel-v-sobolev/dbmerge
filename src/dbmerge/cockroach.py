@@ -39,8 +39,8 @@ def _reset_statistics(merge):
 def execute_merge(merge, run_steps):
     """Retry the whole merge after a CockroachDB serialization failure.
 
-    On retry, use a fresh session and staging table. Previously committed stages (when
-    commit_all_steps=True) are idempotent merge operations and are safely recomputed.
+    On retry, use a fresh session and staging table. With step commits enabled,
+    earlier writes remain committed; retry re-runs the phases rather than undoing them.
     """
     for attempt in range(MAX_RETRIES + 1):
         try:
