@@ -2,7 +2,7 @@
 
 import warnings
 
-from sqlalchemy import Table, cast, func, text
+from sqlalchemy import Table, cast, event, func, text
 from sqlalchemy.exc import SAWarning
 from sqlalchemy.types import NullType, UserDefinedType
 
@@ -71,7 +71,11 @@ def reflect_table(merge, name, schema):
         if is_point:
             info['type'] = Point()
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message=r"Did not recognize type 'point' of column", category=SAWarning)
-        return Table(name, merge.metadata, autoload_with=merge.conn, schema=schema,
-                     extend_existing=True, listeners=[('column_reflect', reflect_point)])
+    # Table's listeners argument is only for construction, not extend_existing.
+    event.listen(merge.metadata, 'column_reflect', reflect_point)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message=r"Did not recognize type 'point' of column", category=SAWarning)
+            return Table(name, merge.metadata, autoload_with=merge.conn, schema=schema, extend_existing=True)
+    finally:
+        event.remove(merge.metadata, 'column_reflect', reflect_point)
