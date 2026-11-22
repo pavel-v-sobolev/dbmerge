@@ -411,7 +411,7 @@ change and watermark rows are kept independently.
 | `id` | `String(64)`, PK | Internal unique row identifier. Operation rows receive individual IDs; change, watermark and lease rows use stable IDs derived from their identity. Do not use it as a time or ordering key. |
 | `row_kind` | `String(16)`, NULL | Row purpose: `operation`, `change`, `watermark` or `lease` (see below). `NULL` is supported for legacy rows. |
 | `owner` | `String(255)`, NULL | Tracker/process owner identifier for operation and newly created watermark rows; current holder for leases. A lease with `owner IS NULL` is free. Change rows do not need an owner. |
-| `table_name` | `String(255)`, NOT NULL | Source/destination table name or logical destination identifier. On lease rows this is the internal lock key prefixed with `lease:`, not a physical table name. |
+| `table_name` | `String(255)`, NOT NULL | Source/destination table name or logical destination identifier. Mart leases show the destination and phase, e.g. `sales.daily_sales:rebuild`; standalone and legacy leases keep their `lease:`-prefixed key. |
 | `schema` | `String(255)`, NULL | Schema of the tracked source/destination. Together with `table_name`, identifies it within the tracker. No schema is normally stored as `""` (Oracle stores this as `NULL`); lease rows do not use this column. |
 | `scope` | `String(255)`, NULL | Operation category, such as `changes` or `rebuild`; change signals are also separated by scope. `NULL` means no category. On lease rows, instead holds a unique token for the current acquisition, preventing an old holder from renewing or releasing a newer acquisition. |
 | `changed_at` | `DateTime(timezone=True)`, NULL | Durable, monotonically advancing change timestamp on `change` rows. Published when an operation changes data or is recovered as abandoned. Remains available even after the corresponding operation row is replaced. `NULL` means no published signal (or a reset signal). |
@@ -428,6 +428,12 @@ change and watermark rows are kept independently.
 | `watermark` | Independent consumer progress per `(schema, table_name)`. Updated only after successful processing, separately from operation-row retention. |
 | `lease` | Reusable coordination row for a named lock. Ownership is determined by `owner`, the acquisition token in `scope`, and a fresh `heartbeat_at`. |
 | `NULL` | Legacy format: treated as an operation unless its reserved `lease:` name identifies a legacy lease. |
+
+New mart leases are located by their stable `id`, derived from the destination schema, name,
+and phase (`setup`, `changes` or `rebuild`). The displayed `table_name` omits the schema when
+none was supplied, escapes literal `\`, `.` and `:` within identifiers with a backslash, and
+shortens overlong labels while preserving the phase suffix. It is not a unique identifier.
+Filter by `row_kind = 'lease'`, not by a name prefix, to list all lease rows.
 
 ### `dbmerge_marts`
 
@@ -552,6 +558,11 @@ This is a breaking API change:
 
 Every loop creates its own lease by default. A borrowed handle remains caller-owned:
 closing the loop neither releases that acquisition nor stops its heartbeat.
+When upgrading from DBMerge 2.7.0, stop all old mart workers and wait for their passes to finish
+before starting new mart workers on the same journal. The two versions use different lease rows
+and do not coordinate with each other. No schema change or progress migration is needed. Existing
+watermarks, rebuild state and old `lease:mart:…` rows are left intact. Standalone lease keys do not change.
+
 The handler run methods close their loop, not the supplied tracker. For a ClickHouse
 destination, construct the tracker on PostgreSQL. To supply a lease, use
 `MyMart(engine, tracker=tracker, lease_handle=handle)`. Rebuild state is stored through `handler.tracker.engine`.

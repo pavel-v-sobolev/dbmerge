@@ -157,6 +157,37 @@ class MartContext:
     logger: Any = logger       # the dbmerge logger, for the handler's own messages
 
 
+def _mart_lease_label(destination: tuple[str | None, str]) -> str:
+    # Escape separators within components, including a literal "lease:" at the start.
+    # Such a label must never look like a reserved key to an ordinary Lease reader.
+    return '.'.join(part.replace('\\', '\\\\').replace('.', '\\.').replace(':', '\\:')
+                    for part in destination if part is not None)
+
+
+class _MartLease(Lease):
+    """A mart-scoped lease; the human-readable label is not its SQL identity."""
+
+    def __init__(self, *args, destination: tuple[str | None, str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self._destination = destination
+
+    @staticmethod
+    def key(name: str) -> str:
+        if len(name) <= 255:
+            return name
+        label, _, phase = name.rpartition(':')
+        return label[:255 - len(phase) - 4] + '...:' + phase
+
+    def _row_id(self, name: str) -> str:
+        phase = name.rsplit(':', 1)[-1]
+        identity = json.dumps((*self._destination, phase))
+        return 'mart-lease:' + hashlib.sha256(identity.encode()).hexdigest()[:53]
+
+    def _row_condition(self, name: str):
+        t = self.table
+        return (t.c.id == self._row_id(name)) & (t.c.row_kind == 'lease')
+
+
 class MartLoop:
     """Register a mart, initialize it, then refresh it when its sources change."""
 
@@ -183,8 +214,7 @@ class MartLoop:
         self.tracker = tracker
         self.destination = _split_name(destination)
         self.sources = _sources(sources)
-        # A bounded, unambiguous lease key derived solely from the destination identity.
-        self._lease_prefix = "mart:" + hashlib.sha256(json.dumps(self.destination).encode()).hexdigest()[:40]
+        self._lease_prefix = _mart_lease_label(self.destination)
         self.name = self._lease_prefix + ":rebuild"
         self.process_changes = process_changes
         self.poll_interval = poll_interval
@@ -202,8 +232,9 @@ class MartLoop:
             self._source_groups.setdefault(source_schema or "", []).append(source_name)
 
         self._owns_lease = lease_options is not None
-        self._lease = (Lease(
+        self._lease = (_MartLease(
             tracker.engine, tracker.table, f"mart:{uuid.uuid4().hex}",
+            destination=self.destination,
             period=tracker.heartbeat_period, ttl=tracker.heartbeat_ttl,
             heartbeat_engine=tracker.heartbeat_engine)) if self._owns_lease else (
                 lease_handle._lease if lease_handle is not None else None)

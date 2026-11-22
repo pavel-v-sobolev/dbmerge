@@ -244,7 +244,7 @@ def test_lease_loss_does_not_commit_watermark(engine, tracker):
     def process_changes(ctx):
         with engine.begin() as conn:
             conn.execute(update(tracker.table).where(
-                tracker.table.c.table_name == loop._lease.key(loop.name)).values(owner="successor"))
+                tracker.table.c.id == loop._lease._row_id(loop.name)).values(owner="successor"))
 
     loop = MartLoop(engine, tracker, destination, ["source"], process_changes)
     try:
@@ -668,6 +668,89 @@ def test_default_lease_is_destination_scoped(engine, tracker):
         first.close()
         second.close()
         other.close()
+
+
+@pytest.mark.parametrize('destination, qualified_name', [
+    ((None, 'daily_sales'), 'daily_sales'),
+    (('sales', 'daily_sales'), 'sales.daily_sales'),
+])
+def test_mart_lease_names_in_tracking_table(engine, tracker, destination, qualified_name):
+    from sqlalchemy import select
+
+    loop = MartLoop(engine, tracker, destination, ['orders'], lambda ctx: None,
+                    setup=lambda ctx: None)
+    try:
+        assert loop.run_if_pending()
+        t = tracker.table
+        with engine.connect() as conn:
+            rows = conn.execute(select(t.c.id, t.c.table_name, t.c.owner)
+                                .where(t.c.row_kind == 'lease')).all()
+        assert {row.table_name for row in rows} == {
+            f'{qualified_name}:{phase}' for phase in ('rebuild', 'changes', 'setup')}
+        assert len({row.id for row in rows}) == 3
+        assert all(row.owner is None for row in rows)
+    finally:
+        loop.close()
+
+
+def test_mart_lease_does_not_acquire_an_operation_row_with_the_same_name(engine, tracker):
+    from datetime import datetime
+    from unittest.mock import patch
+    from sqlalchemy import select, update
+
+    t = tracker.table
+    label = 'daily_sales:rebuild'
+    # Prevent a pending operation heartbeat from racing the deliberate backdate below.
+    with patch.object(MergeTracker, '_ensure_heartbeat'):
+        tracker.exec(lambda: False, destination=label)
+    operation = (t.c.row_kind == 'operation') & (t.c.table_name == label)
+
+    with engine.begin() as conn:
+        # An expired heartbeat would let a table_name-only acquisition modify the operation.
+        conn.execute(update(t).where(operation).values(heartbeat_at=datetime(2000, 1, 1)))
+        before = conn.execute(select(t).where(operation)).one()
+
+    loop = MartLoop(engine, tracker, 'daily_sales', ['orders'], lambda ctx: None)
+    try:
+        assert loop._lease.acquire(loop.name)
+        handle = loop._lease.handle(loop.name)
+        assert loop._lease.renew(loop.name)
+        with engine.begin() as conn:
+            assert conn.scalar(select(1).where(handle.sql_condition())) == 1
+            handle.guard_progress(conn)
+        loop._lease.release(loop.name)
+        with engine.connect() as conn:
+            assert conn.execute(select(t).where(operation)).one() == before
+            assert conn.scalar(select(1).where(handle.sql_condition())) is None
+    finally:
+        loop.close()
+
+
+def test_mart_leases_with_truncated_equal_labels_have_distinct_ids(engine, tracker):
+    from sqlalchemy import select
+
+    # Each component fits in dbmerge_marts; the qualified label does not fit in the journal.
+    schema = 's' * 200
+    prefix = 'a' * 100
+    first = MartLoop(engine, tracker, (schema, prefix + 'x'), ['orders'], lambda ctx: None)
+    second = MartLoop(engine, tracker, (schema, prefix + 'y'), ['orders'], lambda ctx: None)
+    try:
+        assert first._lease.acquire(first.name)
+        assert second._lease.acquire(second.name)
+        assert first._lease.still_mine(first.name)
+        assert second._lease.still_mine(second.name)
+        t = tracker.table
+        with engine.connect() as conn:
+            rows = conn.execute(select(t.c.id, t.c.table_name).where(
+                t.c.row_kind == 'lease', t.c.owner.is_not(None))).all()
+        assert len(rows) == 2
+        assert rows[0].id != rows[1].id
+        assert rows[0].table_name == rows[1].table_name
+        assert rows[0].table_name.endswith('...:rebuild')
+        assert len(rows[0].table_name) == 255
+    finally:
+        first.close()
+        second.close()
 
 
 def test_handler_constructor_no_lease(engine, tracker):

@@ -1,10 +1,9 @@
 """A named lease stored in the tracking table: one process owns a key at a time.
 
-The lease reuses the tracking table instead of adding another system table. A lease row is an
-ordinary row whose ``table_name`` is a reserved ``lease:<name>`` key: "free" is ``owner IS NULL``,
-"held" is ``owner`` set with a fresh ``heartbeat_at``. ``finished_at`` stays NULL for lease rows, so
-they never look like a finished merge to the tracker's own readers (which filter by real table names
-anyway).
+The lease reuses the tracking table instead of adding another system table. Ordinary leases are
+addressed by their reserved ``lease:<name>`` in ``table_name``; mart leases use their primary key
+and store a readable name in ``table_name``. For either kind, "free" is ``owner IS NULL``, "held"
+is ``owner`` set with a fresh ``heartbeat_at``, and ``finished_at`` stays NULL.
 
 Acquisition is a nonreentrant conditional UPDATE: the row must be free or have
 an expired heartbeat. The check and the change are one statement, so two processes can not both win.
@@ -74,7 +73,7 @@ class LeaseHandle:
         t = lease.table
         now = _coerce_datetime(conn.scalar(select(_now_expr(lease.engine))))
         result = conn.execute(update(t).where(
-            t.c.table_name == lease.key(self.name), t.c.owner == lease.owner,
+            lease._row_condition(self.name), t.c.owner == lease.owner,
             t.c.scope == self.token,
             t.c.heartbeat_at >= now - timedelta(seconds=lease.ttl)).values(heartbeat_at=now))
         if not result.rowcount:
@@ -135,19 +134,25 @@ class Lease:
     def key(name: str) -> str:
         return LEASE_PREFIX + name
 
+    def _row_id(self, name: str) -> str:
+        key = self.key(name)
+        # Keep existing short IDs, but do not truncate distinct long names to one PK.
+        return key if len(key) <= 64 else LEASE_PREFIX + hashlib.sha256(key.encode()).hexdigest()[:58]
+
+    def _row_condition(self, name: str):
+        return self.table.c.table_name == self.key(name)
+
     def ensure(self, name: str) -> None:
         """Create the lease row for a name if it does not exist yet. Idempotent."""
         key = self.key(name)
         t = self.table
-        # Keep existing short IDs, but do not truncate distinct long names to one PK.
-        row_id = key if len(key) <= 64 else 'lease:' + hashlib.sha256(key.encode()).hexdigest()[:58]
         with self.engine.connect() as conn:
-            if len(key) > 64 and conn.scalar(select(t.c.id).where(t.c.table_name == key)) is not None:
+            if len(key) > 64 and conn.scalar(select(t.c.id).where(self._row_condition(name))) is not None:
                 # A pre-upgrade row may use the truncated ID. Reuse it, even while held.
                 return
             try:
                 conn.execute(insert(t).values(
-                    id=row_id, row_kind="lease", owner=None, table_name=key,
+                    id=self._row_id(name), row_kind="lease", owner=None, table_name=key,
                     started_at=func.now(), heartbeat_at=func.now()))
                 conn.commit()
             except IntegrityError:
@@ -162,13 +167,12 @@ class Lease:
                 raise IncorrectParameter("Cannot acquire a closed lease")
             if name in self._held:
                 return False
-            key = self.key(name)
             t = self.table
             token = uuid.uuid4().hex
             with self.engine.begin() as conn:
                 now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
                 result = conn.execute(update(t).where(
-                    t.c.table_name == key,
+                    self._row_condition(name),
                     or_(t.c.owner.is_(None), t.c.heartbeat_at < now - timedelta(seconds=self.ttl)))
                     .values(owner=self.owner, heartbeat_at=now, scope=token))
             if result.rowcount:
@@ -196,7 +200,7 @@ class Lease:
             with self.heartbeat_engine.begin() as conn:
                 now = _coerce_datetime(conn.scalar(select(_now_expr(self.heartbeat_engine))))
                 result = conn.execute(update(t).where(
-                    t.c.table_name == self.key(name), t.c.owner == self.owner,
+                    self._row_condition(name), t.c.owner == self.owner,
                     t.c.scope == self._tokens.get(name),
                     t.c.heartbeat_at >= now - timedelta(seconds=self.ttl))
                     .values(heartbeat_at=now))
@@ -206,7 +210,6 @@ class Lease:
 
     def release(self, name: str) -> None:
         """Release this acquisition without freeing a newer holder's lease."""
-        key = self.key(name)
         with self._lock:
             self._held.discard(name)
             token = self._tokens.pop(name, None)
@@ -216,7 +219,7 @@ class Lease:
         with self.engine.begin() as conn:
             # Free = owner IS NULL; heartbeat_at stays (it is NOT NULL) and no longer matters.
             conn.execute(update(t)
-                         .where(t.c.table_name == key, t.c.owner == self.owner, t.c.scope == token)
+                         .where(self._row_condition(name), t.c.owner == self.owner, t.c.scope == token)
                          .values(owner=None))
 
     def still_mine(self, name: str, *, token: str | None = None) -> bool:
@@ -229,13 +232,12 @@ class Lease:
             token = token or self._tokens.get(name)
             if token != self._tokens.get(name):
                 return False
-        key = self.key(name)
         t = self.table
         with self.heartbeat_engine.connect() as conn:
             now = _coerce_datetime(conn.scalar(select(_now_expr(self.engine))))
             cutoff = now - timedelta(seconds=self.ttl)
             found = conn.scalar(
-                select(t.c.id).where(t.c.table_name == key,
+                select(t.c.id).where(self._row_condition(name),
                                      t.c.owner == self.owner,
                                      t.c.scope == token,
                                      t.c.heartbeat_at >= cutoff))
@@ -258,7 +260,7 @@ class Lease:
         else:
             cutoff = now - timedelta(seconds=self.ttl)
         t = self.table
-        return exists().where(t.c.table_name == self.key(name), t.c.owner == self.owner,
+        return exists().where(self._row_condition(name), t.c.owner == self.owner,
                               t.c.scope == (token or self._tokens.get(name)),
                               t.c.heartbeat_at >= cutoff)
 

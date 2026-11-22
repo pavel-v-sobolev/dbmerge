@@ -4,6 +4,15 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+## [2.7.1] - 2026-11-22
+
+### Changed
+- **Tracking and marts (beta):** mart lease rows display `schema.destination:phase` in
+  `table_name` and are addressed by a stable internal ID. Standalone lease keys are unchanged.
+- **Upgrade:** stop old mart workers and wait for their passes to finish before starting new
+  workers on the same journal. The versions use different lease rows. No schema migration is
+  needed; watermarks and rebuild state are preserved.
+
 ## [2.7.0] - 2026-11-21
 
 ### Added
