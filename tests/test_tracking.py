@@ -467,6 +467,9 @@ def test_recover_abandoned_marks_changed(engine, tracker):
 
 
 def test_safe_boundary_holds_in_progress_merge(tracker):
+    # With a one-second TTL and whole-second database timestamps, crossing a clock
+    # tick before the first heartbeat can make a live merge look abandoned.
+    tracker.heartbeat_ttl = 30.0
     seen = {}
 
     class SlowMerge:

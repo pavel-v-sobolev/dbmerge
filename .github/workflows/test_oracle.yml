@@ -34,10 +34,21 @@ jobs:
       # background while the dependencies install below.
       - name: Start Oracle XE
         run: |
-          docker run -d --name oracle --shm-size=1g \
+          image=container-registry.oracle.com/database/express:21.3.0-xe
+          # Retry transient registry failures without retrying container startup.
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep "$((attempt * 10))"
+          done
+          docker run --pull=never -d --name oracle --shm-size=1g \
             -p 1521:1521 \
             -e ORACLE_PWD=oracle \
-            container-registry.oracle.com/database/express:21.3.0-xe
+            "$image"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
