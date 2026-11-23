@@ -39,8 +39,10 @@ def engine(request):
 @pytest.fixture()
 def tracker(engine):
     # One tracking table per test, so the shared database stays isolated.
+    # Keep active leases alive across coarse database clock ticks and CI stalls.
+    # Expiry tests explicitly age heartbeat_at instead of waiting for the TTL.
     tr = MergeTracker(engine, table_name=f"tracking_{uuid.uuid4().hex[:8]}",
-                      schema=_schema(engine), heartbeat_period=0.05, heartbeat_ttl=1.0)
+                      schema=_schema(engine), heartbeat_period=0.05, heartbeat_ttl=30.0)
     yield tr
     tr.close()
 
@@ -467,9 +469,6 @@ def test_recover_abandoned_marks_changed(engine, tracker):
 
 
 def test_safe_boundary_holds_in_progress_merge(tracker):
-    # With a one-second TTL and whole-second database timestamps, crossing a clock
-    # tick before the first heartbeat can make a live merge look abandoned.
-    tracker.heartbeat_ttl = 30.0
     seen = {}
 
     class SlowMerge:
@@ -579,9 +578,9 @@ def test_exec_with_lease_raises_and_waits(engine):
     table_name = f"tracking_{uuid.uuid4().hex[:8]}"
     schema = _schema(engine)
     tracker_a = MergeTracker(engine, table_name=table_name, schema=schema,
-                             owner="a", heartbeat_period=0.05, heartbeat_ttl=1.0)
+                             owner="a", heartbeat_period=0.05)
     tracker_b = MergeTracker(engine, table_name=table_name, schema=schema,
-                             owner="b", heartbeat_period=0.05, heartbeat_ttl=1.0)
+                             owner="b", heartbeat_period=0.05)
 
     a_started = threading.Event()
 
@@ -779,9 +778,6 @@ def test_dbmerge_lease_busy_and_adapter(engine, tracker):
     from dbmerge import LeaseOptions, LeaseBusy
     from unittest.mock import patch
 
-    # This checks busy/retry delegation, not expiry. Oracle's coarse clock can
-    # exhaust the fixture's one-second TTL before the guarded INSERT runs.
-    tracker.heartbeat_ttl = 30.0
     with _dbmerge(engine, tracker=tracker, lease_options=LeaseOptions(wait_lease=True, wait_timeout=0),
                   table_name='orders', data=_rows(), key=['id']) as merge:
         with patch.object(tracker, '_acquire_lease', return_value=False) as acquire:
@@ -819,9 +815,6 @@ def test_dbmerge_tracker_validation_and_failure(engine, tracker):
     from dbmerge import LeaseOptions
     from unittest.mock import patch
 
-    # This validates API configuration, not expiry; Oracle's coarse clock can
-    # exhaust a one-second lease between its acquisition and SQL guard.
-    tracker.heartbeat_ttl = 30.0
     for kwargs in ({'tracker': object()}, {'lease_options': LeaseOptions()},
                    {'tracker': tracker, 'lease_options': True}):
         with pytest.raises(IncorrectParameter):
@@ -906,10 +899,6 @@ def test_exec_merge_preserves_exact_result_and_detects_updated_deleted_counts(tr
 
 
 def test_safe_boundary_includes_active_operations_of_every_scope(tracker):
-    # This tests scope selection, not heartbeat expiry. Oracle stores heartbeat
-    # timestamps at second precision; a one-second TTL can expire at a boundary
-    # before the first background heartbeat runs on a busy CI runner.
-    tracker.heartbeat_ttl = 60.0
     for scope in ("full_load", "changes"):
         def operation():
             with tracker.engine.connect() as conn:
