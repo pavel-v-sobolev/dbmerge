@@ -368,6 +368,10 @@ def create_temp_table(merge: DBMerge, temp_table_name):
 def insert_data_to_temp(merge: DBMerge):
     start_time = time.perf_counter()
     fields = list(merge.data_fields)
+    # The client treats a dotted argument as already qualified. Quote each raw name before handing
+    # it over, so a literal dot in a temporary table name is not interpreted as a database separator.
+    staging = (_quote(merge, merge.temp_table.name) if merge.temp_schema is None else
+               _table_name(merge, merge.temp_schema, merge.temp_table.name))
     # dicts and lists headed for a string column go there as JSON text
     json_fields = {f for f in fields if _base_type_name(merge.temp_table.c[f].type.name) == 'String'}
 
@@ -380,7 +384,7 @@ def insert_data_to_temp(merge: DBMerge):
             end = min(begin + merge.chunk_size, merge.total_row_count)
             chunk = _localize_naive_timestamps(arrow_table(merge, begin, end, nested_as_json=json_fields), time_zones)
             chunk = _nulls_without_nan(merge, chunk)
-            merge.client.insert_arrow(merge.temp_table.name, chunk, database=merge.temp_schema, settings=LOAD_SETTINGS)
+            merge.client.insert_arrow(staging, chunk, settings=LOAD_SETTINGS)
     else:
         # The native protocol refuses a None for a non-nullable column on the client side. A naive datetime it
         # converts by the time zone of the client, so it is pinned to that of the column first, as above.
@@ -390,8 +394,8 @@ def insert_data_to_temp(merge: DBMerge):
         for begin in range(0, merge.total_row_count, merge.chunk_size):
             end = min(begin + merge.chunk_size, merge.total_row_count)
             columns = python_columns(merge, begin, end, nested_as_json=json_fields, processors=processors)
-            merge.client.insert(merge.temp_table.name, [columns[f] for f in fields], column_names=fields,
-                                column_oriented=True, database=merge.temp_schema, settings=LOAD_SETTINGS)
+            merge.client.insert(staging, [columns[f] for f in fields], column_names=fields,
+                                column_oriented=True, settings=LOAD_SETTINGS)
     merge.temp_insert_time = time.perf_counter() - start_time
 
 
@@ -694,6 +698,9 @@ def _prepared(merge: DBMerge, statement, settings=None):
         if isinstance(value, datetime):
             sql = sql.replace(f'%({name})s', f'toDateTime64(%({name})s, 6)')
             parameters[name] = DT64Param(value)
+    # Without parameters the client skips Python's % formatting altogether.
+    if not parameters and merge.ch_dialect.paramstyle in ('format', 'pyformat'):
+        sql = sql.replace('%%', '%')
     # The values of a long in_() list go into the text of the statement, which ClickHouse refuses beyond
     # max_query_size (256 KiB by default): a few thousand keys, as a merge from a PostgreSQL source gets them
     # (see _subqueries_as_values).

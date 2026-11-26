@@ -4,6 +4,12 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+### Fixed
+- Preserve literal `%` in PostgreSQL and CockroachDB `COPY` identifiers, and literal dots in ClickHouse staging table names on both Arrow and native loads.
+
+### Tests
+- Check special characters in table and column names on the shared database CI matrix and fail if supported bulk loaders fall back to ordinary inserts.
+
 ## [2.7.1] - 2026-11-22
 
 ### Changed

@@ -116,6 +116,7 @@ def _postgres_copy(merge: DBMerge):
     # COPY ... FROM STDIN through the connection the merge already holds, so the staging table - a TEMPORARY
     # one, seen only by its own session - is there, and the load belongs to the same transaction.
     from sqlalchemy import DateTime, Integer, LargeBinary
+    from sqlalchemy.dialects.postgresql.base import PGDialect
     from zoneinfo import ZoneInfo
 
     start_time = time.perf_counter()
@@ -125,7 +126,9 @@ def _postgres_copy(merge: DBMerge):
     # "current transaction is aborted", in place of the error that COPY raised.
     if not merge.conn.in_transaction():
         merge.conn.begin()
-    preparer = merge.conn.dialect.identifier_preparer
+    # COPY is sent directly, without SQLAlchemy's format/pyformat parameter pass. In particular,
+    # percent signs in identifiers must not be doubled, even on a driver whose INSERTs require it.
+    preparer = PGDialect(paramstyle='named').identifier_preparer
     fields = list(merge.data_fields)
     sql = (f'COPY {preparer.format_table(merge.temp_table)} ({", ".join(preparer.quote(f) for f in fields)}) '
            f'FROM STDIN WITH (FORMAT csv)')

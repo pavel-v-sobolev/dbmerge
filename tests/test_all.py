@@ -1457,6 +1457,92 @@ def test_bulk_load_stores_what_row_by_row_stores(engine_name, type_of_data):
     _assert_same_rows(engine, engine_name, 'row by row', 'bulk')
 
 
+_IDENTIFIER_BULK_LOADERS = {
+    'postgres': '_postgres_copy', 'postgres-psycopg': '_postgres_copy', 'postgres-pg8000': '_postgres_copy',
+    'cockroachdb': '_postgres_copy', 'cockroachdb-psycopg': '_postgres_copy', 'duckdb': '_duckdb_from_arrow',
+    'mssql': '_pyodbc_fast_executemany', 'mssql-python': '_mssql_python_bulkcopy', 'oracle': '_oracle_executemany',
+}
+
+
+@pytest.mark.parametrize('engine_name,path', [
+    (name, path) for name in engines
+    for path in (('arrow', 'native') if name == 'clickhouse' else ('generic', 'bulk'))
+])
+def test_special_identifiers_in_staging_load(engine_name, path, monkeypatch):
+    from dbmerge import _bulk_load
+
+    engine = make_engine(engine_name)
+    dialect = engine.dialect.name
+    table_schema = None if dialect == 'sqlite' else 'target'
+    # Keep the punctuation in the part of the target name inherited by staging.
+    table_name = ('Sp è%`' if dialect in ('mysql', 'mariadb') else
+                  'Sp è%]' if dialect == 'mssql' else
+                  'Sp è%.' if dialect == 'oracle' else 'Sp è%".`') + uuid.uuid4().hex[:8]
+    key_field = 'Key "]' if dialect != 'oracle' else 'Key ]'
+    # Keep distinct bind names on SQLAlchemy 2.0: e.g. a.b and a]b would both become a_b.
+    fields = ['select', 'Space 名', 'a.b', 'a,b', "a'b", 'a`b', 'bracket]name', 'a%b', 'a:b', 'a\\b', 'a?b']
+    if dialect != 'oracle':  # Oracle does not allow double quotes in object names.
+        fields.append('a"b')
+    if dialect in ('postgresql', 'cockroachdb', 'sqlite', 'duckdb', 'clickhousedb'):
+        fields.append('a\nb')
+    data = [{key_field: i, **{field: i * 100 + j for j, field in enumerate(fields)}} for i in (1, 2)]
+    try:
+        with dbmerge(engine, table_name, data=data, schema=table_schema, key=[key_field]) as merge:
+            table = merge.table
+            expected_loader = _IDENTIFIER_BULK_LOADERS.get(engine_name)
+            # The Python CI matrix deliberately includes environments without pyarrow.
+            if not _bulk_load._has_pyarrow() and (engine_name == 'duckdb' or (
+                expected_loader == '_postgres_copy' and sys.version_info < (3, 12)
+            )):
+                expected_loader = None
+            calls = []
+
+            def spy(obj, name):
+                original = getattr(obj, name)
+
+                def wrapped(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    calls.append(name)
+                    return result
+
+                monkeypatch.setattr(obj, name, wrapped)
+
+            if engine_name == 'clickhouse':
+                if path == 'native':
+                    monkeypatch.setattr(sys.modules['dbmerge.clickhouse'], 'pa', None)
+                expected_loader = 'insert_arrow' if path == 'arrow' else 'insert'
+                spy(merge.client, expected_loader)
+            elif expected_loader:
+                spy(_bulk_load, expected_loader)
+
+            if path != 'generic' and expected_loader:
+                def unexpected_fallback(*args, **kwargs):
+                    pytest.fail('Special identifiers must not cause a fallback to ordinary INSERT')
+
+                monkeypatch.setattr(merge, '_insert_rows_to_temp', unexpected_fallback)
+            else:
+                spy(merge, '_insert_rows_to_temp')
+
+            merge.exec(bulk_load=path != 'generic', chunk_size=1)
+            if path != 'generic' and expected_loader:
+                assert calls == [expected_loader] * (2 if engine_name == 'clickhouse' else 1)
+            else:
+                assert calls == ['_insert_rows_to_temp'] * 2
+            columns = [table.c[name] for name in (key_field, *fields)]
+            with engine.connect() as conn:
+                assert conn.execute(select(*columns).order_by(columns[0])).all() == [
+                    tuple(row.values()) for row in data
+                ]
+    finally:
+        target = Table(table_name, MetaData(), schema=table_schema)
+        if dialect == 'cockroachdb':
+            # Keep the DROP alone in its transaction under READ COMMITTED.
+            with engine.begin() as conn:
+                conn.execute(schema.DropTable(target, if_exists=True))
+        else:
+            target.drop(engine, checkfirst=True)
+
+
 @pytest.mark.parametrize("type_of_data", ('list of dict', 'dict of list', 'pandas', 'polars'))
 def test_clickhouse_without_pyarrow_stores_what_arrow_stores(type_of_data, monkeypatch):
     # Without pyarrow ClickHouse loads the staging table through the native protocol of the client. It must

@@ -74,6 +74,14 @@ In these cases DBMerge logs a warning once per process: install pyarrow to load 
 
 **ClickHouse always loads in bulk**; `bulk_load` has no effect there. Python input with a `Point` column uses the native loader even with pyarrow installed. SQL sources use `INSERT … SELECT` regardless of `bulk_load` or `chunk_size`.
 
+### Special characters in identifiers
+
+Pass table, schema and column names as raw names, not as SQL-quoted strings. Pass the schema separately instead of prepending it to the table name. Special characters in valid identifiers do not by themselves switch off the bulk loader. PostgreSQL/CockroachDB `COPY` quotes its SQL identifiers separately from the CSV values and preserves literal `%` characters. ClickHouse quotes the staging table name before passing it to either the Arrow or native loader, so a dot in the name is not treated as a database separator.
+
+The database still decides which names are valid. For example, PostgreSQL normally limits names to 63 bytes and disallows NUL; Oracle disallows a literal double quote inside a name. A name accepted by one database is not necessarily portable to another. The shared merge CI tests names with spaces, Unicode, reserved words, quotes and punctuation accepted by each backend, and checks that the applicable bulk loader is used rather than an ordinary insert.
+
+### Loader fallbacks
+
 Some data goes row by row even with `bulk_load=True`, so that what is stored does not change:
 
 - PostgreSQL and CockroachDB: a staging table with an `ARRAY` or `Interval` column; a chunk the CSV can not carry as the driver would send it (a column of mixed types, an integer beyond 64 bits); a timestamp column without time zone when the session `TimeZone` is unknown to Python.
