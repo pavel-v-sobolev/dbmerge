@@ -4,11 +4,15 @@ All notable changes to DBMerge. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+## [2.7.2] - 2026-11-27
+
 ### Fixed
-- Preserve literal `%` in PostgreSQL and CockroachDB `COPY` identifiers, and literal dots in ClickHouse staging table names on both Arrow and native loads.
+- Preserve literal `%` in PostgreSQL and CockroachDB `COPY` identifiers without falling back to ordinary inserts.
+- Preserve literal dots in ClickHouse staging table names on both Arrow and native loads, and literal `%` in ClickHouse statements sent without parameters.
 
 ### Tests
 - Check special characters in table and column names on the shared database CI matrix and fail if supported bulk loaders fall back to ordinary inserts.
+- Use MariaDB Connector/Python 1.1.15 on Python 3.11+ in the development lockfile to avoid a driver error on parameterized inserts into quoted identifiers containing quote characters.
 
 ## [2.7.1] - 2026-11-22
 

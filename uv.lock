@@ -757,7 +757,7 @@ wheels = [
 
 [[package]]
 name = "dbmerge"
-version = "2.7.1"
+version = "2.7.2"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },

@@ -169,6 +169,8 @@ which can include materialized-view side effects rather than only physical stagi
 
 Each merge stages its data in a table named `tmp_<yymmddHHMMSS>_<table>_<hex8>`. The timestamp normally comes from the destination clock; the random suffix reduces collisions. Do not drop staging based on age alone: an active merge may still use it.
 
+Since 2.7.2, PostgreSQL and CockroachDB `COPY` preserves literal `%` in identifiers, and both ClickHouse bulk loaders preserve literal dots in staging table names. Pass raw names and supply schemas separately.
+
 DBMerge attempts cleanup after execution or on context exit. PostgreSQL, SQLite, MariaDB and DuckDB use session-scoped temporary tables. MS SQL Server, CockroachDB and MySQL use regular staging. ClickHouse uses regular staging for hard deletion or a sessionless client; Oracle uses a global temporary table whose definition can survive a crash. See [staging lifetime](https://github.com/pavel-v-sobolev/dbmerge/blob/main/DOCUMENTATION.md#the-staging-table).
 
 ## Database-specific notes

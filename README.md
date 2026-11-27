@@ -24,7 +24,7 @@
 **DBMerge accepts multiple data sources as input:**
 - Pandas/Polars DataFrame
 - Lists of dictionaries / Dictionary of Lists
-- Database table, view, or SQL query (`source_query`, since 2.7.0)
+- Database table, view, or SQL query
 
 DBMerge automates data update process by comparing your source data against the target table and automatically performing the required operations.
 
@@ -65,11 +65,6 @@ pip install 'dbmerge[clickhouse]'  # clickhouse-connect + pyarrow
 
 The library uses a context manager to handle database connections and ensure resources are safely released.
 
-**Version note:** Starting with **2.6.0**, `DBMerge` is the preferred class name.
-Released versions through 2.5.0 use `from dbmerge import dbmerge`; when trying
-these examples with 2.5.0, use `from dbmerge import dbmerge as DBMerge`.
-Version 2.6.0 supports both names as aliases of the same class. The package
-name (`pip install dbmerge`) and logger (`logging.getLogger('dbmerge')`) do not change.
 
 ```python
 from sqlalchemy import create_engine, text

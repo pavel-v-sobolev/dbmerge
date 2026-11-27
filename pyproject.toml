@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbmerge"
-version = "2.7.1"
+version = "2.7.2"
 description = "Bulk UPSERT and snapshot synchronization for Python and SQL sources across PostgreSQL, MySQL/MariaDB, SQLite, MS SQL Server, CockroachDB, DuckDB, ClickHouse and Oracle."
 
 keywords = [
